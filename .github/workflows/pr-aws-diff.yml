@@ -1,0 +1,179 @@
+# Read-only `cdk diff` on every pull request, posted as ONE sticky PR comment so reviewers can see
+# what is about to change in AWS. Nothing here can mutate the account: the role
+# (enshrouded-github-actions-cdk-diff) may only assume the cdk-enshrd1 LOOKUP role, and
+# `--method template` compares templates without creating a CloudFormation change set.
+#
+# Also the diff-time half of the foreign-stack guard (ARCHITECTURE 6.2 measure 6): the job FAILS if
+# the diff names any stack that is not Enshrouded*. (WP-19's ci.yml does the same at synth time.)
+#
+# Limits: fork PRs and Dependabot PRs get no OIDC credentials and a read-only token, so for those
+# the job skips the diff and says so in the run summary rather than failing confusingly.
+#
+# Repo variables (not secrets): AWS_REGION, CDK_DIFF_ROLE_ARN, ENSHROUDED_OIDC_PROVIDER_ARN,
+# DISCORD_PUBLIC_KEY, DISCORD_APPLICATION_ID. See docs/RUNBOOK.md section 1.5.
+name: pr-aws-diff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-aws-diff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  diff:
+    name: cdk diff (read-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write # GitHub OIDC -> AWS (read-only role)
+      contents: read
+      pull-requests: write # create/update the sticky diff comment
+    defaults:
+      run:
+        working-directory: infrastructure
+    env:
+      MARKER: "<!-- enshrouded-cdk-diff -->"
+      # Read by lib/enshrouded-server-stack.ts. GitHub forbids repo variables that start with
+      # GITHUB_, so the variable is ENSHROUDED_OIDC_PROVIDER_ARN and is mapped here. Must match
+      # deploy.yml or the diff would not reflect what deploy will do.
+      GITHUB_OIDC_PROVIDER_ARN: ${{ vars.ENSHROUDED_OIDC_PROVIDER_ARN }}
+      DISCORD_PUBLIC_KEY: ${{ vars.DISCORD_PUBLIC_KEY }}
+      DISCORD_APPLICATION_ID: ${{ vars.DISCORD_APPLICATION_ID }}
+    steps:
+      - name: Decide whether the diff can run
+        id: gate
+        working-directory: . # no checkout yet, so ./infrastructure does not exist
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          ACTOR: ${{ github.actor }}
+          DIFF_ROLE: ${{ vars.CDK_DIFF_ROLE_ARN }}
+          AWS_REGION_VAR: ${{ vars.AWS_REGION }}
+        run: |
+          # mode: run | readonly (cannot get creds or comment) | unconfigured (variables not set yet)
+          if [ "$IS_FORK" = "true" ]; then
+            echo "mode=readonly" >> "$GITHUB_OUTPUT"
+            echo "reason=this PR is from a fork, which GitHub gives no AWS (OIDC) credentials and a read-only token" >> "$GITHUB_OUTPUT"
+          elif [ "$ACTOR" = "dependabot[bot]" ]; then
+            echo "mode=readonly" >> "$GITHUB_OUTPUT"
+            echo "reason=Dependabot PRs get a read-only token and no AWS (OIDC) credentials" >> "$GITHUB_OUTPUT"
+          elif [ -z "$DIFF_ROLE" ] || [ -z "$AWS_REGION_VAR" ]; then
+            echo "mode=unconfigured" >> "$GITHUB_OUTPUT"
+            echo "reason=repository variables CDK_DIFF_ROLE_ARN and/or AWS_REGION are not set (docs/RUNBOOK.md section 1.5)" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=run" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Explain the skip (no comment possible)
+        if: steps.gate.outputs.mode == 'readonly'
+        working-directory: .
+        env:
+          REASON: ${{ steps.gate.outputs.reason }}
+        run: |
+          echo "::notice::cdk diff skipped: $REASON"
+          {
+            echo "## CDK diff skipped"
+            echo
+            echo "The AWS diff did not run because $REASON."
+            echo "It runs automatically on PRs opened from a branch in this repository."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.mode == 'run'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.gate.outputs.mode == 'run'
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+        if: steps.gate.outputs.mode == 'run'
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.gate.outputs.mode == 'run'
+        with:
+          role-to-assume: ${{ vars.CDK_DIFF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: enshrouded-cdk-diff
+
+      # --fail: exit 1 when there are differences (0 = none). Never fails the step itself; the
+      # verdict step at the end decides, so the comment is always posted first.
+      - name: cdk diff (named stacks, read-only)
+        id: diff
+        if: steps.gate.outputs.mode == 'run'
+        run: |
+          set +e
+          npx cdk diff EnshroudedOidcStack EnshroudedServerStack --exclusively --method template --fail --no-color > "$RUNNER_TEMP/cdk-diff.txt" 2>&1
+          rc=$?
+          set -e
+          # Exit 1 means "differences" ONLY if cdk got far enough to print a `Stack <name>` header;
+          # otherwise it is a real failure (bad credentials, synth error, ...): report it as 2.
+          if [ "$rc" -ne 0 ] && ! grep -q '^Stack ' "$RUNNER_TEMP/cdk-diff.txt"; then rc=2; fi
+          echo "cdk diff exit code: $rc"
+          cat "$RUNNER_TEMP/cdk-diff.txt"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Foreign-stack guard (diff-time)
+        id: guard
+        if: steps.gate.outputs.mode == 'run'
+        working-directory: .
+        run: |
+          set +e
+          python3 -I .github/scripts/check-diff-stacks.py "$RUNNER_TEMP/cdk-diff.txt"
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Render comment
+        if: steps.gate.outputs.mode != 'readonly'
+        working-directory: .
+        env:
+          DIFF_FILE: ${{ runner.temp }}/cdk-diff.txt
+          DIFF_RC: ${{ steps.diff.outputs.rc }}
+          GUARD_RC: ${{ steps.guard.outputs.rc }}
+          SKIP_REASON: ${{ steps.gate.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I .github/scripts/render-diff-comment.py > "$RUNNER_TEMP/comment.md"
+
+      # One sticky comment: find ours by the hidden marker, PATCH it, else POST a new one.
+      - name: Post or update the PR comment
+        if: steps.gate.outputs.mode != 'readonly'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$MARKER\"))) | .id" | sed -n 1p)"
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$id" -F "body=@$RUNNER_TEMP/comment.md" --silent
+            echo "updated comment $id"
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -F "body=@$RUNNER_TEMP/comment.md" --silent
+            echo "created comment"
+          fi
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verdict
+        if: always() && steps.gate.outputs.mode == 'run'
+        env:
+          DIFF_RC: ${{ steps.diff.outputs.rc }}
+          GUARD_RC: ${{ steps.guard.outputs.rc }}
+        run: |
+          if [ "$GUARD_RC" != "0" ]; then
+            echo "::error::cdk diff touches a stack that is not Enshrouded* - refusing (see the guard step)"
+            exit 1
+          fi
+          # 0 = no differences, 1 = differences. Anything else (2 = cdk failed) is a hard failure.
+          case "$DIFF_RC" in
+            0|1) ;;
+            *) echo "::error::cdk diff exited $DIFF_RC"; exit 1 ;;
+          esac

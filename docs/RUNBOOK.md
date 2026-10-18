@@ -231,7 +231,7 @@ with both registered shows duplicates.
 gh variable set AWS_REGION                 --body us-east-2
 gh variable set DISCORD_APPLICATION_ID     --body 1561358999863955538
 gh variable set DISCORD_PUBLIC_KEY         --body 2223e306f481c8079b23ac6d07ef72ce2ebdc638464d4ec97d043d5af444605d
-gh variable set GITHUB_OIDC_PROVIDER_ARN   --body arn:aws:iam::334953720182:oidc-provider/token.actions.githubusercontent.com
+gh variable set ENSHROUDED_OIDC_PROVIDER_ARN --body arn:aws:iam::334953720182:oidc-provider/token.actions.githubusercontent.com
 # After the first deploy, from EnshroudedServerStack outputs:
 gh variable set ENSHROUDED_DEPLOY_ROLE_ARN --body <output>
 gh variable set ENSHROUDED_INSTANCE_ID     --body <output>
@@ -239,7 +239,35 @@ gh variable set ENSHROUDED_INSTANCE_ID     --body <output>
 
 The OIDC provider already exists in the account (created by the UO project). Our stack
 **imports** it by ARN — creating a second one fails with `EntityAlreadyExists`. The
-game-deploy role is only created when `GITHUB_OIDC_PROVIDER_ARN` is supplied.
+game-deploy role is only created when `ENSHROUDED_OIDC_PROVIDER_ARN` is supplied.
+
+**Naming note.** GitHub rejects repository variables whose names start with `GITHUB_`, so the
+variable is `ENSHROUDED_OIDC_PROVIDER_ARN`; `deploy.yml` / `pr-aws-diff.yml` map it onto the
+`GITHUB_OIDC_PROVIDER_ARN` environment variable the CDK code reads.
+
+#### CDK CI variables (WP-02: `deploy.yml` and `pr-aws-diff.yml`)
+
+Set these once `EnshroudedOidcStack` exists (its `CdkDeployRoleArn` / `CdkDiffRoleArn` outputs):
+
+```powershell
+gh variable set CDK_DEPLOY_ROLE_ARN --body arn:aws:iam::334953720182:role/enshrouded-github-actions-cdk-deploy
+gh variable set CDK_DIFF_ROLE_ARN   --body arn:aws:iam::334953720182:role/enshrouded-github-actions-cdk-diff
+```
+
+| Variable | Used by | Notes |
+| --- | --- | --- |
+| `AWS_REGION` | both | `us-east-2` |
+| `CDK_DEPLOY_ROLE_ARN` | `deploy.yml` | Trust: `repo:pinkcognito/enshroudedproj:ref:refs/heads/main` only. Assumes the `cdk-enshrd1-*` roles. |
+| `CDK_DIFF_ROLE_ARN` | `pr-aws-diff.yml` | Trust: any ref of this repo. Assumes only `cdk-enshrd1-lookup-role-*`. |
+| `ENSHROUDED_OIDC_PROVIDER_ARN` | both | See above. |
+| `DISCORD_PUBLIC_KEY`, `DISCORD_APPLICATION_ID` | both | Without them synth falls back to placeholders and `cdk diff` would show a spurious change. |
+
+These are identifiers, not secrets. If `CDK_DIFF_ROLE_ARN` or `AWS_REGION` is unset, the PR diff
+workflow posts a comment saying the diff was skipped rather than failing.
+
+**First-deploy ordering (open item).** `deploy.yml` authenticates as a role that
+`EnshroudedOidcStack` itself creates, so the first deploy of that stack cannot come from CI.
+How to seed it is an operator decision; it is not covered by this runbook yet.
 
 ---
 
