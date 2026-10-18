@@ -36,6 +36,7 @@ die()  { echo "[deploy-game-server] FATAL: $*" >&2; exit 1; }
 # 0600 from the first byte (python opens it O_EXCL with 0600). The SSM response arrives on stdin
 # and is never printed; errors name the parameter, never its value. Whole-string "${TOKEN}"
 # values only, so a password containing quotes or backslashes is JSON-escaped correctly.
+# shellcheck disable=SC2016  # deliberate: this is Python source, not shell; nothing here should expand
 RENDER_PY='
 import json, os, re, sys
 
@@ -130,8 +131,7 @@ run_steamcmd() {
 }
 
 wait_ready() {
-  local i
-  for i in $(seq 1 "$READY_TIMEOUT"); do
+  for _ in $(seq 1 "$READY_TIMEOUT"); do
     if systemctl is-active --quiet enshrouded.service \
        && pgrep -f '[e]nshrouded_server\.exe' >/dev/null 2>&1 \
        && ss -H -uln "sport = :${QUERY_PORT}" 2>/dev/null | grep -q .; then

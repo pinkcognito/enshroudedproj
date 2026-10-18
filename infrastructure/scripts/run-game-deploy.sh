@@ -35,8 +35,8 @@ cleanup() {
   trap - EXIT
   if [ -n "$PARAMS_FILE" ]; then rm -f "$PARAMS_FILE"; fi
   if [ "$MAINT_SET" -eq 1 ]; then
-    local i cleared=0
-    for i in 1 2 3; do
+    local cleared=0
+    for _ in 1 2 3; do
       if set_maintenance false; then cleared=1; break; fi
       sleep "$POLL_SECONDS"
     done

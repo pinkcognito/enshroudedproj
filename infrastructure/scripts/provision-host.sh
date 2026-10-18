@@ -56,14 +56,13 @@ GAME_LOG_FILE="${DATA_MOUNT}/logs/enshrouded_server.log"
 # BEGIN SSM-AGENT-BOOTSTRAP
 ensure_ssm_agent() {
   local snap_unit="snap.amazon-ssm-agent.amazon-ssm-agent.service"
-  local i
   agent_active() {
     systemctl is-active --quiet "$snap_unit" || systemctl is-active --quiet amazon-ssm-agent.service
   }
   if ! agent_active; then
     if ! snap list amazon-ssm-agent >/dev/null 2>&1 && ! dpkg -s amazon-ssm-agent >/dev/null 2>&1; then
       snap wait system seed.loaded || true
-      for i in 1 2 3 4 5; do
+      for _ in 1 2 3 4 5; do
         snap install amazon-ssm-agent && break
         sleep 10
       done
@@ -71,7 +70,7 @@ ensure_ssm_agent() {
     snap start amazon-ssm-agent || true
     systemctl enable --now "$snap_unit" || true
     systemctl enable --now amazon-ssm-agent.service || true
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
       agent_active && break
       sleep 5
     done
@@ -82,7 +81,7 @@ ensure_ssm_agent() {
       && dpkg -i /tmp/amazon-ssm-agent.deb || true
     systemctl enable --now amazon-ssm-agent.service || true
   fi
-  for i in 1 2 3 4 5 6; do
+  for _ in 1 2 3 4 5 6; do
     agent_active && return 0
     sleep 5
   done
@@ -184,8 +183,8 @@ find_data_device() {
 }
 
 wait_for_data_device() {
-  local i dev
-  for i in $(seq 1 30); do
+  local dev
+  for _ in $(seq 1 30); do
     if dev="$(find_data_device)"; then echo "$dev"; return 0; fi
     sleep 2
   done

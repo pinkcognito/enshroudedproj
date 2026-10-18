@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # CDK app dependencies (aws-cdk-lib, constructs, jest, eslint, typescript, ...).
+  - package-ecosystem: npm
+    directory: /infrastructure
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # Minor/patch bumps arrive as one PR per ecosystem; majors stay separate so they get a real review.
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # Keeps the full-SHA pins in .github/workflows/*.yml current (the `# vX.Y.Z` comment is updated too).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]

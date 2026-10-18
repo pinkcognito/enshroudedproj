@@ -1,0 +1,27 @@
+# Trivy suppressions - one entry per finding, each with a written reason.
+# NEVER add a blanket ignore (no severity-wide, no path-wide-without-id). Review these when the
+# design changes.
+#
+# Used by the "IaC / config scan" job in .github/workflows/security.yml (scans the CDK-synthesised
+# CloudFormation in infrastructure/cdk.out).
+misconfigurations:
+  # Server security group: CDK's default "allow all outbound" rule. The game host must reach
+  # SteamCMD/Steam CDNs (dynamic IP ranges), GitHub/ProtonGE downloads, apt mirrors, and the
+  # regional S3/SSM/EC2 endpoints (no NAT gateway or VPC endpoints - cost). Egress cannot be
+  # enumerated by CIDR. Ingress is separately restricted to the game UDP ports.
+  - id: AWS-0104
+    paths:
+      - "EnshroudedServerStack.template.json"
+    statement: >-
+      Deliberate: the host needs outbound internet (Steam, GitHub, apt, AWS endpoints) and there
+      is no NAT/VPC-endpoint layer; egress cannot be narrowed to a CIDR list.
+
+  # World-backup S3 bucket uses SSE-S3 (AES256), not a customer-managed KMS key. The bucket holds
+  # only game save files; a CMK adds a standing monthly cost and a second thing that can lock us
+  # out of the data we are trying to protect. Public access is blocked and versioning is on.
+  - id: AWS-0132
+    paths:
+      - "EnshroudedServerStack.template.json"
+    statement: >-
+      Deliberate: SSE-S3 is sufficient for non-sensitive save data; a CMK adds cost and
+      key-loss risk for the world backups with no threat-model benefit.

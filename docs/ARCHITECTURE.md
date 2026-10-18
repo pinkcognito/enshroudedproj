@@ -91,7 +91,8 @@ happens to this architecture under each way WP-07 could come back.
 7. **Admin access is SSM Session Manager only.** No SSH, no RDP, no management port open.
    Only UDP 15636/15637 inbound.
 8. **Deploys happen only via merge-to-main GitHub Actions with GitHub OIDC.** Never local
-   `cdk deploy`. PRs run read-only `cdk diff`.
+   `cdk deploy`. PRs run read-only `cdk diff`. **The CI quality gates are advisory, not
+   enforcing** — see §11.1; nothing in GitHub currently *blocks* a merge.
 9. **Secrets live in SSM SecureString.** Never in git, never in CI variables, never in a
    CDK context value.
 10. **Every resource is tagged** `project=enshroudedproj`, `repo=<owner>/enshroudedproj`.
@@ -976,6 +977,14 @@ and we take its *recipe*, but not its *lifecycle*:
    robust fallback for M3's Wine-attribution problem.
 4. One fewer moving part to install, update and debug over SSM on a box with no SSH.
 
+**A side effect worth recording, because it later looks like a gap.** Choosing bare
+systemd over the container also removed a **container-image supply-chain surface**: there
+is no base image to rebase, no registry to trust, and no image layers to scan. The
+project's dependency-scanning posture is therefore npm packages, GitHub Actions and the
+two pinned binaries (§6.1.3) — **not** container images. When someone later asks why CI
+has no image scanning (WP-19), the answer is that there is deliberately no image, not
+that the scan was forgotten.
+
 The container remains the reference implementation to consult whenever something does not
 work, and WP-05 should diff its behaviour against ours if the save path misbehaves.
 
@@ -987,8 +996,29 @@ Therefore:
 - **GE-Proton is pinned to an exact version** (start at `10-26`, matching the reference
   container's current pin) and **recorded in CDK/config as a constant**, never "latest".
 - The tarball is **SHA256-checksummed** on download and **mirrored into the project's S3
-  bucket** on first install, so a deleted or retagged upstream GitHub release cannot break
-  a rebuild or silently substitute different bits.
+  bucket**, so a deleted or retagged upstream GitHub release cannot break a rebuild or
+  silently substitute different bits.
+  **The mirror is populated out of band and the instance reads it read-only.** WP-05's
+  first implementation had the box upload the tarball, which fails: the instance role may
+  write only `savegame/*` (§6.6, WP-04). Rather than widen the most exposed component's
+  S3 write scope for a once-per-version operation, the operator (or a CI job) uploads the
+  verified tarball once and the instance gets `s3:GetObject` on `mirror/*` only. Fewer
+  privileges where they are riskiest, same resilience. **Owner: WP-04** (bucket + grants),
+  with a one-line WP-05 edit to drop the upload attempt.
+- **Scope of this pin-and-checksum discipline — three categories, so it is not
+  re-litigated per download:**
+  1. **Pin anything in the save path or the boot-critical path.** GE-Proton qualifies: the
+     world save passes through it.
+  2. **Pin third-party GitHub Actions to commit SHAs**, never floating tags like `@v4`. A
+     tag is mutable and an action runs with the CI token and the repository contents, so
+     an action reference is a supply-chain dependency in the same sense GE-Proton is a
+     runtime one. Dependabot (WP-19) keeps the SHAs current, which is what makes pinning
+     sustainable rather than a slow drift into stale actions.
+  3. **Accept, deliberately and for stated reasons:** the CloudWatch agent `.deb` (AWS
+     bucket over TLS; a bad version degrades logging, not data) and SteamCMD (Valve's CDN
+     serves a self-updating bootstrap that re-updates on every run — it *cannot* be
+     meaningfully pinned, and we already extend that trust by running `app_update`).
+     Accepted by decision, not by omission.
 - Upgrading Proton is a **deliberate PR** that runs the WP-16 restore drill afterwards —
   never an incidental side effect of a rebuild.
 - **ASSUMED — needs validation (WP-05):** that `proton run` requires
@@ -1988,11 +2018,19 @@ enshroudedproj/
 │   ├── FINDINGS-detection.md            # output of WP-07 — the empirical ground truth
 │   └── RUNBOOK.md                       # restore, manual stop, update, incident response
 ├── .github/workflows/
-│   ├── lint.yml                         # tsc + eslint + jest on every push
+│   ├── ci.yml                           # WP-19: typecheck, lint, test+coverage, cdk synth,
+│   │                                    # shellcheck, systemd-analyze, actionlint, CRLF
+│   │                                    # check, project-invariant greps. No AWS creds.
+│   ├── security.yml                     # WP-19: npm audit, Trivy (fs + cdk.out IaC),
+│   │                                    # gitleaks, weekly. SARIF upload is best-effort:
+│   │                                    # code scanning needs GHAS, which we lack (§11.1)
 │   ├── pr-aws-diff.yml                  # read-only cdk diff, posted as a PR comment
 │   ├── deploy.yml                       # merge-to-main: cdk deploy EnshroudedServerStack
 │   └── deploy-game-server.yml           # workflow_dispatch + on config change: SSM-push the
 │                                        # game config/scripts to the box
+├── .github/dependabot.yml               # WP-19: npm + github-actions. Keeping the action
+│                                        # SHA pins current is what makes §6.1.3 category 2
+│                                        # sustainable rather than a drift into stale actions
 └── infrastructure/
     ├── CLAUDE.md
     ├── cdk.json  cdk.context.json  package.json  tsconfig.json  jest.config.js
@@ -2060,12 +2098,46 @@ Sizing: **R** = routine, suitable for a Sonnet coding subagent given this docume
 named reference files. **A** = needs architect involvement (judgement, data-loss risk, or a
 decision this document deliberately left open).
 
+### 11.1 CI quality gates are ADVISORY, not enforcing — a stated limitation
+
+**VERIFIED:** the repository is **private on GitHub Free**, where branch protection and
+rulesets are not available —
+`gh api repos/pinkcognito/enshroudedproj/rulesets` returns
+`403 Upgrade to GitHub Pro or make this repository public`.
+
+The practical consequence, stated plainly because it defeats the literal intent of
+"quality gates": **WP-19's workflows run on every PR and show red when they fail, but
+cannot be marked required. Nothing prevents a merge with a failing build, a failing test,
+or a tripped project invariant.** The §6.2 isolation checks are in the same position —
+the diff guard is a *signal*, not a *gate*. A reader who assumes CI is blocking will
+over-trust it; that assumption is the thing this section exists to prevent.
+
+The same entitlement gap removes **GitHub Advanced Security**, so **CodeQL / code
+scanning is unavailable**. WP-19 therefore uses **Trivy** (filesystem + IaC/config scan of
+`cdk.out`) and **gitleaks** instead, and makes SARIF upload `continue-on-error` — because
+the upload target is itself a paid feature and must not fail the job.
+
+Three options, for the user to choose (§12 Q11):
+
+| Option | Cost | Effect |
+| --- | --- | --- |
+| **Make the repository public** | free | Branch protection, rulesets *and* CodeQL all become available. But this repo contains the live AWS account id, the UO instance id, stack names and the full isolation design — all of which are discoverability aids for an attacker, even though none is a credential. Would need a scrub first, and §6.2.4 argues the account is worth being quiet about. |
+| **Upgrade to GitHub Pro** | ~$4/user/month | Branch protection and rulesets on private repos. ~$48/yr against a ~$24/mo infrastructure bill — material in proportion, trivial in absolute terms. Does **not** include Advanced Security, so CodeQL stays unavailable and Trivy/gitleaks remain the right tools. |
+| **Rely on convention** (status quo) | free | Red checks are visible on the PR; the discipline is "do not merge red". Adequate for a single-maintainer hobby project, and consistent with how this repo already relies on convention for "never commit to main". |
+
+**Recommendation: Pro if the user wants the gate to be real, status quo otherwise — but
+do not make the repository public merely to obtain branch protection.** That trades a
+genuine (if modest) security property for a process convenience, which is the wrong
+direction for a repo whose whole §6.2 story is about limiting blast radius in a shared
+account.
+
 ### Phase 0 — foundations
 
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
-| **WP-01** | Repo + CDK app skeleton. App-level tags. Empty `EnshroudedServerStack` with explicit `stackName`. Jest + eslint + tsconfig. `CLAUDE.md` × 2 adapted from the reference. | `infrastructure/{package.json,tsconfig.json,cdk.json,jest.config.js}`, `bin/enshrouded.ts`, `lib/enshrouded-server-stack.ts`, `test/stack-naming.test.ts`, `CLAUDE.md`, `infrastructure/CLAUDE.md`, `.github/workflows/lint.yml` | — | `npm run build && npx cdk synth` clean. `stack-naming.test.ts` passes and fails if a stack is renamed to `InfrastructureStack`. | R |
-| **WP-02** | **CI/CD identity, plus the CDK-side half of the §6.2 guardrails.** `EnshroudedOidcStack` that **imports** the existing OIDC provider (measure 2) with `enshrouded-`-prefixed role names (measure 3) trusting only the `cdk-enshrd1-*` bootstrap roles (measure 4). Deploy workflow naming stacks explicitly; PR-diff workflow with the **fail-on-foreign-stack grep** (measure 6). `cdk.json` pinned to qualifier `enshrd1`. Transcribe the §6.2.1 operator sequence and the §6.2.2 five-step verification into `docs/RUNBOOK.md` verbatim. **Note the scope change: the `EnshroudedUoGuardrail` Deny policy (measure 5) is NOT built by this WP** — it is a human prerequisite that must already exist and be attached to both bootstrap roles before this WP's output can safely deploy (§6.2.1a explains why it cannot live in CDK: it must constrain roles that CDK bootstrap itself creates). | `lib/enshrouded-oidc-stack.ts`, `.github/workflows/deploy.yml`, `.github/workflows/pr-aws-diff.yml`, `cdk.json` (qualifier), `docs/RUNBOOK.md` (bootstrap + verification sections) | WP-01, **human prerequisite §6.2.1 steps 1–4, verified by §6.2.2** | `cdk synth` emits no `AWS::IAM::OIDCProvider` and contains **zero** occurrences of `hnb659fds`. Every IAM `roleName` starts with `enshrouded-`. Deploy workflow never uses `--all`. A deliberately-planted diff against a non-`Enshrouded*` stack **fails** the PR job. **All five §6.2.2 simulation checks are run and their raw output pasted into the runbook — including the step-5 positive control.** | **A** — the only line of defence protecting a live server in a shared account (§6.2.4). |
+| **WP-01** | Repo + CDK app skeleton. App-level tags. Empty `EnshroudedServerStack` with explicit `stackName`. Jest + eslint + tsconfig. `CLAUDE.md` × 2 adapted from the reference. | `infrastructure/{package.json,tsconfig.json,cdk.json,jest.config.js}`, `bin/enshrouded.ts`, `lib/enshrouded-server-stack.ts`, `test/stack-naming.test.ts`, `CLAUDE.md`, `infrastructure/CLAUDE.md` (CI workflows are WP-19) | — | `npm run build && npx cdk synth` clean. `stack-naming.test.ts` passes and fails if a stack is renamed to `InfrastructureStack`. | R |
+| **WP-02** | **CI/CD identity, plus the CDK-side half of the §6.2 guardrails.** `EnshroudedOidcStack` that **imports** the existing OIDC provider (measure 2) with `enshrouded-`-prefixed role names (measure 3) trusting only the `cdk-enshrd1-*` bootstrap roles (measure 4). Deploy workflow naming stacks explicitly; PR-diff workflow with the **fail-on-foreign-stack grep over `cdk diff` output** (measure 6). **Scope boundary with WP-19, so the two do not duplicate or drift:** WP-19 owns the **synth-time** invariant greps (the synthesised template must contain no `hnb659fds`, no `InfrastructureStack`/`AdminUiStack`/`GithubOidcStack`, and no un-prefixed IAM role name) — those need no AWS credentials and run today. **WP-02 owns only the `cdk diff`-time check**, which needs credentials and is blocked on the operator bootstrap. WP-02 **extends** WP-19's job rather than reimplementing the greps: same invariant, two points in the pipeline (before AWS is contacted, and against real account state). `cdk.json` pinned to qualifier `enshrd1`. Transcribe the §6.2.1 operator sequence and the §6.2.2 five-step verification into `docs/RUNBOOK.md` verbatim. **Note the scope change: the `EnshroudedUoGuardrail` Deny policy (measure 5) is NOT built by this WP** — it is a human prerequisite that must already exist and be attached to both bootstrap roles before this WP's output can safely deploy (§6.2.1a explains why it cannot live in CDK: it must constrain roles that CDK bootstrap itself creates). | `lib/enshrouded-oidc-stack.ts`, `.github/workflows/deploy.yml`, `.github/workflows/pr-aws-diff.yml`, `cdk.json` (qualifier), `docs/RUNBOOK.md` (bootstrap + verification sections) | WP-01, **human prerequisite §6.2.1 steps 1–4, verified by §6.2.2** | `cdk synth` emits no `AWS::IAM::OIDCProvider` and contains **zero** occurrences of `hnb659fds`. Every IAM `roleName` starts with `enshrouded-`. Deploy workflow never uses `--all`. A deliberately-planted diff against a non-`Enshrouded*` stack **fails** the PR job. **All five §6.2.2 simulation checks are run and their raw output pasted into the runbook — including the step-5 positive control.** | **A** — the only line of defence protecting a live server in a shared account (§6.2.4). |
+| **WP-19** | **CI quality gates (added at the user's request, out of original sequence).** `ci.yml` with parallel jobs: typecheck, lint, unit tests + coverage, `cdk synth`, shellcheck, `systemd-analyze verify`, actionlint, a **CR-byte line-endings check** (the §10 `.gitattributes` failure mode, checked bytewise), and **project-invariant greps over the synthesised template** (no `hnb659fds`; none of the three UO stack names; every IAM `roleName` prefixed `enshrouded-`). `security.yml`: npm audit, Trivy filesystem + IaC/config scan of `cdk.out`, gitleaks, weekly schedule, SARIF upload `continue-on-error` (§11.1). `dependabot.yml` for npm + github-actions. Replaces the monolithic `lint.yml`. **All third-party actions pinned to commit SHAs** (§6.1.3 category 2). Least-privilege `permissions:` on every job. **No AWS credentials anywhere**, which is what lets the whole suite run before the operator bootstrap. A container-image scan job exists but is **conditional and dormant by design** — §6.1.2 removed the image surface, so the job must stay dormant rather than be satisfied by inventing a Dockerfile. | `.github/workflows/ci.yml`, `.github/workflows/security.yml`, `.github/dependabot.yml`; deletes `.github/workflows/lint.yml` | WP-01 | All jobs green on a clean tree. A planted `hnb659fds`, a planted forbidden stack name, an un-prefixed role name and a planted CRLF byte each **fail** the relevant job. No job requests AWS credentials. Every third-party action is referenced by a 40-character SHA. **§11.1 is linked from the PR template or the README so nobody mistakes a red check for a blocked merge.** | R |
 
 ### Phase 1 — the host
 
@@ -2289,7 +2361,14 @@ Still open. These block or materially change the design, and only the user can a
     until someone bumps it. Is same-day turnaround expected, or is "down for a few days
     until someone looks" acceptable? This sets how loudly WP-15 should alarm on a failed
     boot, and whether the runbook needs a one-command Proton bump.
-11. **If WP-07 returns outcome (e)** — no automatic detection works — **is the session-lease
+11. **Do you want the CI gates to actually block merges?** The repo is private on GitHub
+    Free, so branch protection, rulesets and CodeQL are all unavailable — checks run and
+    show red but cannot be required (§11.1). Options are make it public (free, but
+    publishes the account id, the UO instance id and the isolation design — **not
+    recommended**), upgrade to Pro (~$4/user/month, enables branch protection but still
+    not CodeQL), or keep relying on convention. **No action needed to proceed**; this only
+    determines whether "CI is green" is a guarantee or a habit.
+12. **If WP-07 returns outcome (e)** — no automatic detection works — **is the session-lease
     UX acceptable** (a 2-hour lease with a one-click "extend" button, §5.6)? Worth a
     provisional answer now, because it is the difference between shipping a degraded
     automatic design and shipping a different, honest one.

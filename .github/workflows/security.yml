@@ -1,0 +1,307 @@
+# Vulnerability / secret / misconfiguration scanning.
+#
+# Runs on PRs, pushes to main, and weekly (new CVEs are published against code that has not changed).
+# No job has AWS credentials. Every third-party action is pinned to a full commit SHA; downloaded
+# tool binaries (gitleaks) are pinned by version AND sha256. Dependabot tracks the action SHAs but
+# NOT the pinned tool versions (gitleaks, trivy `version:`) - bump those by hand.
+#
+# SARIF / GitHub code scanning: uploading SARIF requires GitHub Code Scanning, which on a PRIVATE
+# repository needs GitHub Advanced Security (a paid entitlement). Every SARIF upload below is
+# therefore `continue-on-error: true` so a missing entitlement can never block the gate. The
+# gating decision always comes from the scanner's own exit code, never from the upload.
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC (runs on the default branch only)
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+permissions:
+  contents: read
+
+jobs:
+  npm-audit:
+    name: npm audit (high/critical)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      # Gate: any HIGH or CRITICAL advisory in the full tree (dev + prod) fails the build.
+      - run: npm audit --audit-level=high
+      # Supply-chain integrity: verify registry signatures / provenance of every installed package.
+      - run: npm audit signatures
+
+  trivy-fs:
+    name: trivy filesystem (deps + secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # SARIF upload only; harmless if Code Scanning is unavailable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Gating scan. Dependencies (package-lock.json), hard-coded secrets, and IaC/Dockerfile
+      # misconfiguration in the committed source. node_modules does not exist here (no npm ci).
+      - name: Trivy fs (gating)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.0
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+      - name: Trivy fs (SARIF for code scanning)
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.0
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          format: sarif
+          output: trivy-fs.sarif
+          skip-setup-trivy: true
+      - name: Upload SARIF (needs Advanced Security on private repos; non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  trivy-iac:
+    name: trivy IaC (synthesised CloudFormation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write # SARIF upload only; harmless if Code Scanning is unavailable
+    defaults:
+      run:
+        working-directory: infrastructure
+    env:
+      # Credential-less synth from the committed cdk.context.json lookup cache - see ci.yml `synth`.
+      CDK_DEFAULT_ACCOUNT: "334953720182"
+      CDK_DEFAULT_REGION: us-east-2
+      AWS_REGION: us-east-2
+      AWS_DEFAULT_REGION: us-east-2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      - run: npx cdk synth --quiet
+      # Scans the real CloudFormation that would be deployed. Deliberate findings are suppressed
+      # one-by-one, each with a written reason, in /.trivyignore.yaml - never wholesale.
+      - name: Trivy config (gating)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.0
+          scan-type: config
+          scan-ref: infrastructure/cdk.out
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+          trivyignores: .trivyignore.yaml
+      - name: Trivy config (SARIF for code scanning)
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.0
+          scan-type: config
+          scan-ref: infrastructure/cdk.out
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          format: sarif
+          output: trivy-iac.sarif
+          trivyignores: .trivyignore.yaml
+          skip-setup-trivy: true
+      - name: Upload SARIF (needs Advanced Security on private repos; non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+  gitleaks:
+    name: gitleaks (secret scan, full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # SARIF upload only; harmless if Code Scanning is unavailable
+    env:
+      # Binary downloaded directly rather than via gitleaks-action, which is under a commercial
+      # EULA (licence key required for organisation accounts). Pinned by version + sha256.
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history: a secret deleted in a later commit is still leaked
+          persist-credentials: false
+      - name: Install gitleaks (version + sha256 pinned)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+      # --redact: never print the secret itself into the CI log.
+      - name: gitleaks (gating)
+        run: >-
+          "$RUNNER_TEMP/gitleaks" git .
+          --redact --no-banner --exit-code 1
+          --report-format sarif --report-path "$RUNNER_TEMP/gitleaks.sarif"
+      - name: Upload SARIF (needs Advanced Security on private repos; non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ runner.temp }}/gitleaks.sarif
+          category: gitleaks
+
+  # ---------------------------------------------------------------------------------------------
+  # CONTAINER SCAN - DORMANT BY DESIGN, NOT BROKEN.
+  # This project has NO Dockerfile, compose file or container image: ARCHITECTURE section 6.1.2
+  # deliberately chose bare systemd + GE-Proton over containers. So today `detect-containers`
+  # reports found=false and `container-scan` is SKIPPED (it shows as "skipped", not a pass).
+  # The moment someone adds a Dockerfile / compose file, the scan switches on automatically and
+  # gates HIGH/CRITICAL findings, so container support cannot be added without being scanned.
+  # The real supply-chain surface here is covered above: npm deps (audit + trivy), GitHub Actions
+  # (SHA-pinned + Dependabot), and the two downloaded binaries (GE-Proton sha256 pin in
+  # provision-host.sh, checked by ci.yml project-invariants; SteamCMD).
+  # ---------------------------------------------------------------------------------------------
+  detect-containers:
+    name: detect containers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      found: ${{ steps.detect.outputs.found }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: detect
+        run: |
+          files="$(find . \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' -o -iname '*.dockerfile' \
+            -o -name 'docker-compose*.y*ml' -o -name 'compose*.y*ml' -o -name 'Containerfile' \) \
+            -not -path '*/node_modules/*' -not -path '*/cdk.out/*' -not -path './.git/*' | sort)"
+          if [ -n "$files" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Container definitions found:"; echo "$files"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfile/compose file in repo - container scan is dormant (by design)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  container-scan:
+    name: container scan (conditional)
+    needs: detect-containers
+    if: needs.detect-containers.outputs.found == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Misconfiguration scan of Dockerfiles / compose files.
+      - name: Trivy config (Dockerfile / compose)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.0
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+          skip-dirs: infrastructure/node_modules,infrastructure/cdk.out
+      # Build each Dockerfile (context = its own directory) and scan the resulting image.
+      - name: Build images
+        run: |
+          set -euo pipefail
+          n=0
+          while IFS= read -r df; do
+            n=$((n + 1))
+            tag="scan-image-$n:ci"
+            echo "::group::build $df"
+            docker build -f "$df" -t "$tag" "$(dirname "$df")"
+            echo "$tag" >> "$RUNNER_TEMP/images.txt"
+            echo "::endgroup::"
+          done < <(find . \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' -o -iname '*.dockerfile' \) \
+                     -not -path '*/node_modules/*' -not -path '*/cdk.out/*' -not -path './.git/*' | sort)
+          echo "built $n image(s)"
+      - name: Install trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.76.0
+      - name: Trivy image scan (gating)
+        run: |
+          set -euo pipefail
+          [ -f "$RUNNER_TEMP/images.txt" ] || { echo "no Dockerfile images to scan"; exit 0; }
+          while IFS= read -r img; do
+            trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$img"
+          done < "$RUNNER_TEMP/images.txt"
+
+  # Single required status check for branch protection. A skipped container-scan is expected.
+  security-gate:
+    name: security-gate
+    if: always()
+    needs: [npm-audit, trivy-fs, trivy-iac, gitleaks, detect-containers, container-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - name: Require every scan to have succeeded (container-scan may be skipped)
+        env:
+          NPM_AUDIT: ${{ needs.npm-audit.result }}
+          TRIVY_FS: ${{ needs.trivy-fs.result }}
+          TRIVY_IAC: ${{ needs.trivy-iac.result }}
+          GITLEAKS: ${{ needs.gitleaks.result }}
+          DETECT: ${{ needs.detect-containers.result }}
+          CONTAINER: ${{ needs.container-scan.result }}
+        run: |
+          echo "npm-audit=$NPM_AUDIT trivy-fs=$TRIVY_FS trivy-iac=$TRIVY_IAC gitleaks=$GITLEAKS detect=$DETECT container-scan=$CONTAINER"
+          for r in "$NPM_AUDIT" "$TRIVY_FS" "$TRIVY_IAC" "$GITLEAKS" "$DETECT"; do
+            if [ "$r" != "success" ]; then echo "::error::a required security job did not succeed ($r)"; exit 1; fi
+          done
+          if [ "$CONTAINER" != "success" ] && [ "$CONTAINER" != "skipped" ]; then
+            echo "::error::container-scan result: $CONTAINER"; exit 1
+          fi
