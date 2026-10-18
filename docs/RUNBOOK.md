@@ -151,6 +151,12 @@ Guardrail attached to **both** `cdk-enshrd1-deploy-role` and `cdk-enshrd1-cfn-ex
 
 ### 1.3 Seed the SSM parameters (§6.6) — ⬜ TODO (you must run this)
 
+> **The bot token is read from the clipboard, not typed.** `Read-Host -AsSecureString`
+> uses a raw key reader that swallows Ctrl+V in the Windows console, so a ~70-character
+> token cannot be pasted into it. Copy the token first, then run the block and press
+> Enter when prompted. The four group passwords are generated for the same reason, and
+> printed once so you can share them.
+
 The deploy **hard-fails** unless the required ones exist. That is deliberate, not defensive
 padding: the reference implementation's own example config ships a group with
 `"password": ""` and full `canEditWorld`/`canEditBase`, i.e. a wide-open, world-editable
@@ -176,35 +182,60 @@ and so CDK never overwrites an operator edit.
 | `/enshroudedproj/state/run-state` | String | *auto* | `starting`/`stopping`/empty |
 
 ```powershell
-# Paste this whole block into PowerShell at once (it defines a helper first).
+# Paste this whole block into PowerShell at once - it defines two helpers first.
 $Region = 'us-east-2'
 
-function Read-Secret($Prompt) {
-  $ss = Read-Host -AsSecureString $Prompt
-  [System.Net.NetworkCredential]::new('', $ss).Password
+# Reads a value from the CLIPBOARD rather than the keyboard. Read-Host
+# -AsSecureString uses a raw key reader that swallows Ctrl+V in the Windows
+# console, so a ~70-character token cannot be pasted into it. Nothing is typed
+# here, so there is no keystroke to swallow - and the value is never echoed.
+function Read-Pasted($Label) {
+  Write-Host ""
+  Write-Host "  $Label" -ForegroundColor Cyan
+  Write-Host "  Copy it to your clipboard, then press Enter here: " -NoNewline
+  [void](Read-Host)
+  $v = Get-Clipboard -Raw
+  if ([string]::IsNullOrWhiteSpace($v)) { throw "Clipboard was empty - copy the value first, then re-run." }
+  $v = $v.Trim()
+  Write-Host ("  got {0} characters, starting '{1}...'" -f $v.Length, $v.Substring(0, [Math]::Min(4, $v.Length))) -ForegroundColor DarkGray
+  $v
+}
+
+# Generated, not prompted: same paste problem would apply, and random beats
+# invented. Swap in your own string if you want something memorable to share.
+function New-GamePassword {
+  -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
 }
 
 # --- non-secret values -----------------------------------------------------
 aws ssm put-parameter --region $Region --name /enshroudedproj/server/name `
-  --type String --value "Dave's Enshrouded Server" --overwrite
+  --type String --value "Dave's Enshrouded Server" --overwrite | Out-Null
 
 aws ssm put-parameter --region $Region --name /enshroudedproj/server/slot-count `
-  --type String --value "16" --overwrite
+  --type String --value "16" --overwrite | Out-Null
 
-# --- the four group passwords (prompted; never echoed, never in history) ---
+# --- the four group passwords ----------------------------------------------
+$pw = [ordered]@{}
 foreach ($g in 'admin', 'friend', 'guest', 'visitor') {
-  $pw = Read-Secret "Password for the $g group (min 4 chars)"
+  $pw[$g] = New-GamePassword
   aws ssm put-parameter --region $Region `
     --name "/enshroudedproj/server/user-groups/$g-password" `
-    --type SecureString --value $pw --overwrite
+    --type SecureString --value $pw[$g] --overwrite | Out-Null
 }
+Write-Host "`nGroup passwords - save these now, they are not shown again:" -ForegroundColor Yellow
+$pw.GetEnumerator() | Format-Table @{L = 'Group'; E = { $_.Key } }, @{L = 'Password'; E = { $_.Value } } -AutoSize
 
 # --- Discord bot token: Developer Portal > your app > Bot > Reset Token -----
-$tok = Read-Secret "Discord bot token"
+$tok = Read-Pasted "Discord bot token"
 aws ssm put-parameter --region $Region --name /enshroudedproj/discord/bot-token `
-  --type SecureString --value $tok --overwrite
+  --type SecureString --value $tok --overwrite | Out-Null
+
+# --- tidy up: do not leave the token sitting on the clipboard --------------
+Set-Clipboard -Value ' '
+Remove-Variable tok -ErrorAction SilentlyContinue
 
 # --- verify: names and types only, never values ----------------------------
+Write-Host "`nStored parameters:" -ForegroundColor Green
 aws ssm describe-parameters --region $Region `
   --parameter-filters "Key=Name,Option=BeginsWith,Values=/enshroudedproj/" `
   --query "Parameters[].{Name:Name,Type:Type}" --output table
