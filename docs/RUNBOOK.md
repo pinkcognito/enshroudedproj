@@ -40,31 +40,30 @@ deny-only policy is what removes that capability. See §6.2.4 for the blast radi
 > our own guardrail deliberately denies `iam:*` on `cdk-hnb659fds-*`. Tracked as an open
 > question; not a blocker, since both projects are operated by the same person.
 
-```sh
-cd infrastructure/policies
+```powershell
+cd infrastructure\policies
 
 # 1. Create the deny-only guardrail.
-aws iam create-policy \
-  --policy-name EnshroudedUoGuardrail \
-  --description "Deny-only guardrail: Enshrouded CI cannot touch UOPrivateServer resources" \
+aws iam create-policy `
+  --policy-name EnshroudedUoGuardrail `
+  --description "Deny-only guardrail: Enshrouded CI cannot touch UOPrivateServer resources" `
   --policy-document file://uo-guardrail.json
 
-# 2. Bootstrap a SEPARATE toolkit stack referencing it.
-#    AdministratorAccess + the guardrail: Deny beats Allow, so AWS maintains the Allow half
-#    and all our judgement sits in one small reviewable Deny document.
-#    (PowerUserAccess does NOT work here — it excludes iam:*, and our stacks create the EC2
-#    instance role and seven Lambda roles. See §6.2.1 step 0.)
-cdk bootstrap \
-  --qualifier enshrd1 \
-  --toolkit-stack-name CDKToolkitEnshrouded \
-  --cloudformation-execution-policies "arn:aws:iam::aws:policy/AdministratorAccess,arn:aws:iam::334953720182:policy/EnshroudedUoGuardrail" \
+# 2. Bootstrap a SEPARATE toolkit stack referencing it. This creates a complete
+#    separate role set (cdk-enshrd1-*); it does NOT reuse UO's cdk-hnb659fds-*.
+#    AdministratorAccess + the guardrail: Deny beats Allow, so AWS maintains the
+#    Allow half and all our judgement sits in one small reviewable Deny document.
+#    (PowerUserAccess does NOT work here - it excludes iam:*, and our stacks
+#    create the EC2 instance role and seven Lambda roles. See section 6.2.1 step 0.)
+cdk bootstrap --qualifier enshrd1 --toolkit-stack-name CDKToolkitEnshrouded `
+  --cloudformation-execution-policies "arn:aws:iam::aws:policy/AdministratorAccess,arn:aws:iam::334953720182:policy/EnshroudedUoGuardrail" `
   aws://334953720182/us-east-2
 
 # 3. Close the deploy-role hole. `cdk bootstrap` does NOT do this, and
-#    --custom-permissions-boundary cannot reach it (the bootstrap template applies the
-#    boundary to the execution role only).
-aws iam attach-role-policy \
-  --role-name cdk-enshrd1-deploy-role-334953720182-us-east-2 \
+#    --custom-permissions-boundary cannot reach it (the bootstrap template
+#    applies the boundary to the execution role only).
+aws iam attach-role-policy `
+  --role-name cdk-enshrd1-deploy-role-334953720182-us-east-2 `
   --policy-arn arn:aws:iam::334953720182:policy/EnshroudedUoGuardrail
 ```
 
@@ -81,28 +80,29 @@ stack coexists with it.
 
 An untested control is an assumption, not a control. All read-only.
 
-```sh
-# a. No synth may reference the shared toolkit. Expect ZERO hits.
-cd infrastructure && npx cdk synth | grep -c hnb659fds
+```powershell
+# a. No synth may reference the shared toolkit. Expect 0.
+cd infrastructure
+(npx cdk synth | Select-String -Pattern 'hnb659fds').Count
 
-# b. Negative controls — the CI roles must NOT be able to touch UO resources.
-aws iam simulate-principal-policy \
-  --policy-source-arn arn:aws:iam::334953720182:role/cdk-enshrd1-cfn-exec-role-334953720182-us-east-2 \
-  --action-names ec2:TerminateInstances \
-  --resource-arns arn:aws:ec2:us-east-2:334953720182:instance/i-0d2f683b403536375 \
+# b. Negative controls - the CI roles must NOT reach UO resources.
+aws iam simulate-principal-policy `
+  --policy-source-arn arn:aws:iam::334953720182:role/cdk-enshrd1-cfn-exec-role-334953720182-us-east-2 `
+  --action-names ec2:TerminateInstances `
+  --resource-arns arn:aws:ec2:us-east-2:334953720182:instance/i-0d2f683b403536375 `
   --query 'EvaluationResults[].EvalDecision'      # expect: explicitDeny
 
-aws iam simulate-principal-policy \
-  --policy-source-arn arn:aws:iam::334953720182:role/cdk-enshrd1-deploy-role-334953720182-us-east-2 \
-  --action-names cloudformation:DeleteStack \
-  --resource-arns arn:aws:cloudformation:us-east-2:334953720182:stack/InfrastructureStack/* \
+aws iam simulate-principal-policy `
+  --policy-source-arn arn:aws:iam::334953720182:role/cdk-enshrd1-deploy-role-334953720182-us-east-2 `
+  --action-names cloudformation:DeleteStack `
+  --resource-arns 'arn:aws:cloudformation:us-east-2:334953720182:stack/InfrastructureStack/*' `
   --query 'EvaluationResults[].EvalDecision'      # expect: explicitDeny
 
-# c. POSITIVE control — the exec role must STILL be able to do its job.
-#    This is the check that catches an over-tightened policy before a failed deploy.
-aws iam simulate-principal-policy \
-  --policy-source-arn arn:aws:iam::334953720182:role/cdk-enshrd1-cfn-exec-role-334953720182-us-east-2 \
-  --action-names iam:CreateRole iam:AttachRolePolicy iam:PassRole ec2:RunInstances \
+# c. POSITIVE control - the exec role must STILL be able to do its job.
+#    This is what catches an over-tightened policy before a failed deploy.
+aws iam simulate-principal-policy `
+  --policy-source-arn arn:aws:iam::334953720182:role/cdk-enshrd1-cfn-exec-role-334953720182-us-east-2 `
+  --action-names iam:CreateRole iam:AttachRolePolicy iam:PassRole ec2:RunInstances `
   --query 'EvaluationResults[].{a:EvalActionName,d:EvalDecision}'   # expect: allowed
 ```
 
@@ -138,23 +138,32 @@ and so CDK never overwrites an operator edit.
 | `/enshroudedproj/state/last-active` | String | *auto* | Epoch ms |
 | `/enshroudedproj/state/run-state` | String | *auto* | `starting`/`stopping`/empty |
 
-```sh
-REGION=us-east-2
+```powershell
+$Region = 'us-east-2'
 
-aws ssm put-parameter --region $REGION --name /enshroudedproj/server/name \
+aws ssm put-parameter --region $Region --name /enshroudedproj/server/name `
   --type String --value "Your Server Name" --overwrite
-aws ssm put-parameter --region $REGION --name /enshroudedproj/server/slot-count \
+aws ssm put-parameter --region $Region --name /enshroudedproj/server/slot-count `
   --type String --value "16" --overwrite
 
-for g in admin friend guest visitor; do
-  aws ssm put-parameter --region $REGION \
-    --name /enshroudedproj/server/user-groups/$g-password \
-    --type SecureString --value "CHANGE-ME-$g" --overwrite
-done
+# Prompted so the passwords never land in PowerShell history.
+function Read-Plain($Prompt) {
+  $ss = Read-Host -AsSecureString $Prompt
+  [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss))
+}
 
-# Discord bot token — from the Developer Portal, Bot tab. NEVER commit this.
-aws ssm put-parameter --region $REGION --name /enshroudedproj/discord/bot-token \
-  --type SecureString --value "PASTE-BOT-TOKEN" --overwrite
+foreach ($g in 'admin', 'friend', 'guest', 'visitor') {
+  $pw = Read-Plain "Password for the $g group (min 4 chars)"
+  aws ssm put-parameter --region $Region `
+    --name "/enshroudedproj/server/user-groups/$g-password" `
+    --type SecureString --value $pw --overwrite
+}
+
+# Discord bot token - Developer Portal > Bot tab. NEVER commit this.
+$tok = Read-Plain "Discord bot token"
+aws ssm put-parameter --region $Region --name /enshroudedproj/discord/bot-token `
+  --type SecureString --value $tok --overwrite
 ```
 
 > Shell history: these commands put secrets on the command line. Prefer
@@ -180,10 +189,12 @@ credential. The **bot token** is the secret and lives only in SSM (§1.3).
 After the stack deploys, set the interactions endpoint in the Discord Developer Portal to the
 `DiscordBotInteractionsUrl` stack output, then register the commands:
 
-```sh
+```powershell
 cd infrastructure
-DISCORD_APPLICATION_ID=1561358999863955538 node scripts/register-discord-commands.js
-# add DISCORD_GUILD_ID=<guild id> for near-instant guild-scoped testing
+$env:DISCORD_APPLICATION_ID = '1561358999863955538'
+# Optional: near-instant guild-scoped registration for testing
+# $env:DISCORD_GUILD_ID = '<guild id>'
+node scripts/register-discord-commands.js
 ```
 
 Registration is a **manual step, not part of deploy**, and is a **bulk overwrite** —
@@ -193,7 +204,7 @@ with both registered shows duplicates.
 
 ### 1.5 GitHub repository variables
 
-```sh
+```powershell
 gh variable set AWS_REGION                 --body us-east-2
 gh variable set DISCORD_APPLICATION_ID     --body 1561358999863955538
 gh variable set DISCORD_PUBLIC_KEY         --body 2223e306f481c8079b23ac6d07ef72ce2ebdc638464d4ec97d043d5af444605d

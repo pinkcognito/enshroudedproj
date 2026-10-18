@@ -1116,6 +1116,18 @@ Required measures:
    `enshrouded-github-actions-cdk-diff`, `enshrouded-github-actions-server-deploy`.
    Reusing a name does not merely fail — a CloudFormation import or a `roleName` collision
    can rewrite the trust policy of a role the UO pipeline depends on.
+> **"Why not just create separate CDK roles?" — separate roles are necessary but NOT
+> sufficient, and this is the obvious reading that happens to be wrong.** `--qualifier
+> enshrd1` does provision a *complete* separate role set
+> (`cdk-enshrd1-{deploy,cfn-exec,file-publishing,image-publishing,lookup}-role-*`), its own
+> asset bucket `cdk-enshrd1-assets-…` and its own `/cdk-bootstrap/enshrd1/version`
+> parameter. Nothing is shared. **But separation alone changes nothing**, because the
+> bootstrap template gives *every* CDK deploy role `cloudformation:DeleteStack` on
+> `Resource: "*"` (§6.2.1a). A brand-new, perfectly separate `cdk-enshrd1-deploy-role`
+> could still delete `InfrastructureStack` on day one. **Separation decides *which*
+> credentials CI uses; only the `Deny` decides what they may reach.** Both are required
+> and neither substitutes for the other.
+
 4. **Separate CDK bootstrap qualifier — the load-bearing one.** The OIDC role only grants
    `sts:AssumeRole` onto the *bootstrap* roles, and the shared `cdk-hnb659fds-*` roles can
    modify **any** stack in the account, UO's included. Narrowing our own OIDC role achieves
@@ -1397,7 +1409,10 @@ block anything.
 
 #### 6.2.3 Residual risk, stated plainly
 
-Three things these measures do **not** cover, so nobody later believes they do:
+Four things these measures do **not** cover, so nobody later believes they do:
+
+- **They are one-directional.** Every control here constrains *our* credentials. UO's
+  deploy role can still delete our stacks (§6.2.3a). Open until WP-20.
 
 - **A human with console access.** Every guardrail here constrains the CI identity. The
   user's own admin credentials can still delete the UO stack by hand. Nothing in this repo
@@ -1412,10 +1427,90 @@ Three things these measures do **not** cover, so nobody later believes they do:
   project takes a second one) and the AWS bill are shared. An Enshrouded quota exhaustion
   could block a UO deploy without any IAM involvement at all.
 
+#### 6.2.3a The isolation is ONE-DIRECTIONAL — UO can still reach us
+
+Everything in §6.2 constrains *this* project's credentials. **Nothing constrains UO's.**
+Verified by simulation:
+
+```
+cdk-hnb659fds-deploy-role → cloudformation:DeleteStack
+  on arn:aws:cloudformation:us-east-2:334953720182:stack/EnshroudedServerStack/*
+→ allowed
+```
+
+UO's deploy role carries `DeleteStack` on `Resource: "*"` for exactly the reason ours does
+— it is what `cdk bootstrap` hands out. So a mistake in *that* repo's pipeline could
+delete `EnshroudedServerStack`.
+
+**What that would cost.** The world volume is `RETAIN` (§8) so **the data survives**, and
+the DLM snapshots and S3 `savegame/` copies are untouched. What is lost is the
+`CfnVolumeAttachment`, the EIP, the security group and the instance. Recovery is a
+redeploy plus a volume reattachment — an hour with the runbook, not a world loss. **This
+is an availability and annoyance risk, not a durability one**, and that framing should
+drive how much is spent closing it.
+
+**Likelihood is low.** UO's deploy workflow names its stacks explicitly, and `cdk deploy
+--all` deploys, it does not delete. The realistic path is a human running `cdk destroy`
+from the wrong directory, or a console delete on the wrong stack — a deliberate-ish act,
+not a typo.
+
+**Recommendation: close it, but not urgently, and not before our stacks exist.** See
+§6.2.3b. Note the asymmetry in how the two guardrails must be written: ours protects UO by
+**enumerating UO's fixed, known resources**; the mirror must protect us by **tag
+condition**, because our instance and volume ids are not known in advance and change on
+replacement.
+
+#### 6.2.3b Closing the reverse direction — WP-20
+
+**Not actionable from this repository.** Our own guardrail deliberately denies `iam:*` on
+`cdk-hnb659fds-*` (§6.2.1 step 1), which is correct and must not be relaxed to make this
+easier. It is a hand-run operator step, or a change in the UO repo, and **it modifies the
+live production system**, so it needs the user's explicit authorisation.
+
+**Recommended: do (b) and (c), in that order of importance.**
+
+- **(a) Accept and document — insufficient on its own.** Reasonable given the likelihood
+  above, and it is where we are today. Recorded so the gap is known rather than assumed
+  absent.
+- **(b) `UoCannotTouchEnshrouded` — a mirror Deny on `cdk-hnb659fds-deploy-role` and
+  `-cfn-exec-role`.** The actual control. Scope it:
+  - `cloudformation:*` on `stack/Enshrouded*/*` **and** `stack/CDKToolkitEnshrouded/*`
+    — here the name wildcard is wanted, unlike the `stack/CDKToolkit/*` case where the
+    trailing slash is load-bearing (§6.2.1);
+  - `ec2:*` conditioned on `aws:ResourceTag/project = enshroudedproj` — stable across
+    instance and volume replacement, which an ARN list would not be (invariant §1.10 is
+    what makes this work, so the tag discipline is now load-bearing for isolation too);
+  - `iam:*` on `role/enshrouded-*` and `role/cdk-enshrd1-*`;
+  - `ssm:*` on `parameter/enshroudedproj/*`.
+
+  **Sequencing: do this *after* Phase 1 has deployed and tagged our resources** — a
+  tag-conditioned deny protects nothing before the tagged resources exist.
+
+  **Mandatory verification, and the positive control is the important half.** Modifying
+  the live project's IAM is the one step here that could break something that currently
+  works, so after attaching, simulate **both** directions: UO's roles **denied** on
+  `stack/EnshroudedServerStack/*`, and UO's roles **still allowed** on
+  `stack/InfrastructureStack/*`. The second check is what catches a too-broad deny
+  breaking UO's pipeline, and it is the reason this is safe to do at all.
+
+  Known limitation: the tag-conditioned half **fails open** if a resource loses its tag.
+  Acceptable for a secondary control; it is not the primary protection for anything.
+- **(c) Termination protection on `EnshroudedServerStack`** — one API call, do it anyway.
+  **But it is a speed bump, not a control:** UO's deploy role also holds
+  `UpdateTerminationProtection` on `Resource: "*"`, so the same credentials that could
+  delete the stack could first turn the protection off. Worth having because it defeats
+  the *accidental* console delete, which is the likeliest path. Nobody should record it as
+  closing the gap.
+
 #### 6.2.4 Blast radius — what an escape would destroy
 
 Stated bluntly so it stays visible to whoever reads this in six months, long after the
-guardrails have become invisible background furniture:
+guardrails have become invisible background furniture.
+
+**Read this section together with §6.2.3a: the hazard flows both ways.** What follows is
+the Enshrouded → UO direction, which the §6.2 guardrails close. The UO → Enshrouded
+direction is *open* until WP-20 lands, and is much the less serious of the two — it costs
+availability and an hour of rebuild, not data.
 
 **The UO server in this account is live, in use, and holds a world that exists nowhere
 else in this project's backups.** A CDK app in *this* repo that escapes its namespace could:
@@ -2299,6 +2394,7 @@ account.
 | **WP-15** | Observability: grant the instance role CloudWatch Logs permissions (WP-05 installs and starts the agent but it **cannot publish** until this lands) and ship `enshrouded_server.log` to the log group **`/enshroudedproj/game-log`** — the name WP-05 already configured on the agent, so match it exactly rather than inventing another (**the game deletes the log on every launch**, so off-box shipping is the only way to keep crash forensics); alarms for `SaveVerificationFailed`, `DetectionIndeterminate`, `MaxUptimeCapHit`, `BootWatcherTimeout`; AWS Budgets alarm; all alarms routed to the Discord ops channel. | `lib/enshrouded/observability.ts` | WP-10, WP-14 | Forcing a save-verification failure produces a Discord message within 5 minutes. Last session's log is readable in CloudWatch after a restart. | R |
 | **WP-16** | `docs/RUNBOOK.md` + a **real restore drill, exercised cross-AZ** (§8.1): create a volume from a DLM snapshot in a **different AZ**, overlay the newest `<worldid>*` set from S3, attach to an instance in that AZ, boot, and confirm the world and a built structure are intact. Also do the simpler same-AZ `savegame/`-only restore. Record the exact steps and the elapsed time for both. | `docs/RUNBOOK.md` | WP-04, WP-09 | The drill is performed and documented, not described hypothetically. The cross-AZ elapsed time is recorded as the project's de facto recovery objective. Runbook also covers: **the GE-Proton bump procedure** (the only mitigation for a patch the pinned Proton cannot run, §7); **the warning that adding user data mutated the instance resource, so the first deploy after WP-05 may stop/start or replace it** — harmless for the world because the data volume is retained (§6.3.1), but it will interrupt a running session and should not be a surprise; re-applying the §6.2.1 step-3 Deny after a re-bootstrap; manual stop, clearing a stuck maintenance mode, forcing a game update, and rolling back a bad Keen patch. | **A**-light |
 | **WP-17** | **Permissions boundary (§6.2.1b).** Author an `EnshroudedPermissionsBoundary` customer-managed policy in the `Allow NotAction: ["organizations:*","account:*"]` + `Deny`-UO-resources shape (a boundary is an intersection, so it must contain Allows), re-bootstrap with `--custom-permissions-boundary`, and confirm every role our stacks create carries it. Covers the runtime-escape threat the deploy-time Deny does not. | `docs/RUNBOOK.md` (boundary section), `infrastructure/policies/permissions-boundary.json` | WP-02, and every WP that creates a role (WP-03, 09–15) | Every role in the deployed stacks shows the boundary in `iam:GetRole`. A `simulate-principal-policy` of the EC2 instance role against the UO instance returns `explicitDeny`. **A full deploy still succeeds** — a too-tight boundary fails `iam:CreateRole` mid-deploy, so the positive control matters more than the negative one here. | **A** — easy to get wrong in a way that wedges deploys. |
+| **WP-20** | **Close the reverse isolation direction (§6.2.3b)** — the UO → Enshrouded gap. Author `UoCannotTouchEnshrouded` (CFN on `stack/Enshrouded*/*` + `stack/CDKToolkitEnshrouded/*`; `ec2:*` conditioned on `aws:ResourceTag/project=enshroudedproj`; `iam:*` on `role/enshrouded-*` and `role/cdk-enshrd1-*`; `ssm:*` on `parameter/enshroudedproj/*`), attach it to `cdk-hnb659fds-deploy-role` and `-cfn-exec-role`, and enable termination protection on `EnshroudedServerStack`. **Cannot be done from this repo** — our own guardrail denies `iam:*` on `cdk-hnb659fds-*` and that must not be relaxed. Hand-run operator step or a UO-repo change, and it **modifies the live production system**, so it needs the user's explicit authorisation. | `infrastructure/policies/uo-cannot-touch-enshrouded.json` (checked in for review only), `docs/RUNBOOK.md` | **Phase 1 deployed and tagged** (a tag-conditioned deny protects nothing before the tagged resources exist), + user authorisation | Simulation in **both** directions: UO roles **denied** on `stack/EnshroudedServerStack/*`, **and still allowed** on `stack/InfrastructureStack/*`. The positive control is the important half — it is what catches a too-broad deny breaking UO's pipeline. Termination protection enabled and recorded in the runbook **as a speed bump, not a control**. | **A** — touches live production IAM; low urgency, high care. |
 
 **WP-18 is a scheduling exception.** It sits in Phase 1 (it edits Phase-1 code) but must
 land **before** the Phase 3/4/5 packages write their IAM grants — those six packages each
@@ -2361,14 +2457,21 @@ Still open. These block or materially change the design, and only the user can a
     until someone bumps it. Is same-day turnaround expected, or is "down for a few days
     until someone looks" acceptable? This sets how loudly WP-15 should alarm on a failed
     boot, and whether the runbook needs a one-command Proton bump.
-11. **Do you want the CI gates to actually block merges?** The repo is private on GitHub
+11. **May we modify the UO project's IAM roles to close the reverse isolation gap
+    (§6.2.3b / WP-20)?** Today UO's deploy role can delete `EnshroudedServerStack`. The
+    world data survives (retained volume + snapshots + S3), so this costs availability and
+    about an hour of rebuild, not a world — **low urgency**. Closing it means attaching a
+    narrow Deny to two live UO bootstrap roles, which is a change to the *more* valuable
+    system, verified in both directions before and after. **Not a blocker for anything**;
+    answer when convenient.
+12. **Do you want the CI gates to actually block merges?** The repo is private on GitHub
     Free, so branch protection, rulesets and CodeQL are all unavailable — checks run and
     show red but cannot be required (§11.1). Options are make it public (free, but
     publishes the account id, the UO instance id and the isolation design — **not
     recommended**), upgrade to Pro (~$4/user/month, enables branch protection but still
     not CodeQL), or keep relying on convention. **No action needed to proceed**; this only
     determines whether "CI is green" is a guarantee or a habit.
-12. **If WP-07 returns outcome (e)** — no automatic detection works — **is the session-lease
+13. **If WP-07 returns outcome (e)** — no automatic detection works — **is the session-lease
     UX acceptable** (a 2-hour lease with a one-click "extend" button, §5.6)? Worth a
     provisional answer now, because it is the difference between shipping a degraded
     automatic design and shipping a different, honest one.
