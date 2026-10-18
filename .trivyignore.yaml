@@ -16,12 +16,19 @@ misconfigurations:
       Deliberate: the host needs outbound internet (Steam, GitHub, apt, AWS endpoints) and there
       is no NAT/VPC-endpoint layer; egress cannot be narrowed to a CIDR list.
 
-  # World-backup S3 bucket uses SSE-S3 (AES256), not a customer-managed KMS key. The bucket holds
-  # only game save files; a CMK adds a standing monthly cost and a second thing that can lock us
-  # out of the data we are trying to protect. Public access is blocked and versioning is on.
+  # World-backup S3 bucket uses SSE-S3 (AES256), not a customer-managed KMS key.
+  #
+  # This is NOT a local judgement about one bucket. Customer-managed keys were evaluated
+  # project-wide (covering both these backups and the SSM SecureStrings) and declined by the
+  # user - see ARCHITECTURE.md section 6.6.5, which records the reasoning and the explicit
+  # triggers for revisiting: if the account gains non-admin principals, or the blast radius
+  # of a leaked secret grows, one CMK covering SSM + S3 becomes worth the ~$1/mo.
+  #
+  # Public access is blocked, versioning is on, and enforceSSL is set.
   - id: AWS-0132
     paths:
       - "EnshroudedServerStack.template.json"
     statement: >-
-      Deliberate: SSE-S3 is sufficient for non-sensitive save data; a CMK adds cost and
-      key-loss risk for the world backups with no threat-model benefit.
+      Deliberate, project-wide decision recorded in ARCHITECTURE.md section 6.6.5: SSE-S3 is
+      sufficient for save data under the current threat model (private account, admin-only
+      access). Revisit with that section's stated triggers, not in isolation.

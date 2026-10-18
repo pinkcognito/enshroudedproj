@@ -1757,7 +1757,8 @@ on SSM. Fewer privileges on the most exposed component, for no loss of function.
   grant on `*` with a `kms:ViaService: ssm.<region>.amazonaws.com` condition. That
   condition does **not** distinguish between parameters — the real boundary is the
   `ssm:GetParameter` resource scope. Do not "tighten" the KMS statement and assume the
-  namespace is enforced; it isn't, and the Deny above is what backs it up.
+  namespace is enforced; it isn't, and the Deny above is what backs it up. The `*` is
+  unavoidable while we use the AWS-managed key, which has no stable ARN — see §6.6.5.
 
 #### 6.6.4 Test
 
@@ -1772,6 +1773,65 @@ on SSM. Fewer privileges on the most exposed component, for no loss of function.
 Cheap, runs on every PR, and catches re-widening at review time rather than after a
 compromise. Worth it specifically because the failure is invisible: an over-broad grant
 never breaks a build and never shows up in testing.
+
+#### 6.6.5 Why SSM SecureString and not Secrets Manager — a user decision
+
+**Decided by the user after seeing the tradeoff. Recorded so it is not re-litigated,**
+because "shouldn't secrets be in Secrets Manager?" is a reasonable question that will be
+asked again.
+
+**Secrets Manager's differentiating feature is automatic rotation, and neither of our
+secret types can use it:**
+
+- **The Discord bot token** has no programmatic rotation API — it is reset by hand in the
+  Developer Portal. A rotation Lambda has nothing to call.
+- **An Enshrouded group password** cannot rotate in the background by definition: changing
+  it means re-rendering `enshrouded_server.json` on the box and restarting the game, which
+  **disconnects every player**. That is inherently a deliberate, announced act, not a
+  scheduled job.
+
+The remaining differentiators do not apply either: cross-region replication is irrelevant
+(single region, §0.1); resource-based policies are already covered by §6.6.2's per-ARN IAM
+scoping plus the explicit `Deny`; and staging labels only matter once rotation is
+automated. Cost would be 5 × $0.40 = **$2/month — about 8.5% of the ~$23.6 build** — for a
+capability we cannot exercise.
+
+SecureString still provides everything we actually rely on: **KMS encryption at rest,
+per-ARN IAM scoping (§6.6.2), CloudTrail on every read, and version history.**
+
+**Why the AWS-managed key rather than a customer-managed key.** **VERIFIED:**
+`alias/aws/ssm` resolves to an AWS-managed key (`KeyManager: AWS`), and the account
+currently holds **no customer-managed keys**. A CMK would add, for ~$1/month:
+
+- a **key policy** as a second authorisation layer independent of IAM, and
+- an **instant revocation kill switch** (disable the key, every SecureString read stops),
+- and, if one key covered both, it would resolve the suppressed Trivy **AWS-0132** finding
+  on the backup bucket.
+
+The user weighed this and declined: private account, admin-only access, backups already
+encrypted. **This is a deliberate, revisitable choice, not an oversight.** Revisit when
+either trigger fires: **the account gains non-admin principals**, or **the blast radius of
+a leaked parameter grows** (more secrets, more consumers, a shared operator). At that
+point the dollar is clearly worth it.
+
+**Two things a future reader must not conclude from this.**
+
+1. **A CMK would not have been the missing namespace control.** §6.6.3 already records
+   that `kms:Decrypt` with the `ViaService` condition **cannot distinguish between
+   parameters** — the real boundary is the `ssm:GetParameter` resource scope plus the
+   explicit `Deny` on `discord/*`. A CMK adds a *different* layer (key-policy
+   authorisation, revocation); it does **not** strengthen the namespace boundary, and
+   adopting one later would not let us relax §6.6.2.
+2. **The instance role's `kms:Decrypt` on `Resource: "*"` is a consequence of this
+   decision, not sloppiness.** The AWS-managed key has no stable ARN to scope to, so the
+   `ViaService` condition is the only available narrowing. **Adopting a CMK later would
+   let this be tightened to a specific key ARN** — worth listing as a concrete benefit
+   when the revisit triggers fire.
+
+**Cross-reference obligation:** `.trivyignore.yaml`'s **AWS-0132** suppression must cite
+**§6.6.5** by section number, so the suppression reads as "CMKs were considered
+project-wide and declined, with stated revisit triggers" rather than as a local shrug at
+one bucket.
 
 ---
 
