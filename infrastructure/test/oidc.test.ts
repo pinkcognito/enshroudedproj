@@ -34,30 +34,56 @@ describe('EnshroudedOidcStack', () => {
     }
   });
 
-  test('trust policies reference only pinkcognito/enshroudedproj', () => {
+  // GitHub issues ID-based immutable subjects
+  // (repo:<owner>@<owner_id>/<repo>@<repo_id>:<context>) as well as the documented
+  // name form, so both spellings are accepted. Either way it must be THIS repo.
+  const REPO_BY_NAME = 'pinkcognito/enshroudedproj';
+  const REPO_BY_ID = 'pinkcognito@7524041/enshroudedproj@1424007989';
+
+  interface RoleRes { Properties: { AssumeRolePolicyDocument: unknown } }
+
+  function subsOf(role: RoleRes): string[] {
+    const trust = JSON.stringify(role.Properties.AssumeRolePolicyDocument);
+    return [...trust.matchAll(/"(repo:[^"]+)"/g)].map((m) => m[1]);
+  }
+
+  function roleNamed(name: string) {
+    const found = template.findResources('AWS::IAM::Role', { Properties: { RoleName: name } });
+    const vals = Object.values(found);
+    expect(vals.length).toBe(1);
+    return vals[0] as unknown as RoleRes;
+  }
+
+  test('trust policies reference only this repo (either subject spelling)', () => {
     const roles = Object.values(template.findResources('AWS::IAM::Role'));
-    const subs: string[] = [];
-    for (const r of roles) {
-      const trust = JSON.stringify(r.Properties.AssumeRolePolicyDocument);
-      for (const m of trust.matchAll(/repo:([^:"]+)/g)) subs.push(m[1]);
+    const all: string[] = [];
+    for (const r of roles) all.push(...subsOf(r as unknown as RoleRes));
+    expect(all.length).toBeGreaterThan(0);
+    for (const s of all) {
+      const repo = s.replace(/^repo:/, '').replace(/:[^:]*$/, '').replace(/:ref\/.*$/, '');
+      const ok = s.startsWith(`repo:${REPO_BY_NAME}:`) || s.startsWith(`repo:${REPO_BY_ID}:`);
+      expect(ok).toBe(true);
+      expect(repo).not.toContain('*'); // never wildcard the repo itself
     }
-    expect(subs.length).toBeGreaterThan(0);
-    for (const s of subs) expect(s).toBe('pinkcognito/enshroudedproj');
   });
 
-  test('deploy role is main-only (StringEquals); diff role may run from any ref', () => {
-    const deploy = template.findResources('AWS::IAM::Role', {
-      Properties: { RoleName: 'enshrouded-github-actions-cdk-deploy' },
-    });
-    const diff = template.findResources('AWS::IAM::Role', {
-      Properties: { RoleName: 'enshrouded-github-actions-cdk-diff' },
-    });
-    const d = JSON.stringify(Object.values(deploy)[0].Properties.AssumeRolePolicyDocument);
-    expect(d).toContain('repo:pinkcognito/enshroudedproj:ref:refs/heads/main');
-    expect(d).not.toContain('StringLike');
-    const f = JSON.stringify(Object.values(diff)[0].Properties.AssumeRolePolicyDocument);
-    expect(f).toContain('"StringLike"');
-    expect(f).toContain('repo:pinkcognito/enshroudedproj:*');
+  test('deploy role is main-only; diff role may run from any ref', () => {
+    // The invariant is "deploy cannot be assumed from anything but main". The old
+    // test asserted "no StringLike" as a proxy, which broke the moment two subject
+    // spellings had to be ORed. Assert the invariant itself instead.
+    const deploySubs = subsOf(roleNamed('enshrouded-github-actions-cdk-deploy'));
+    expect(deploySubs.length).toBeGreaterThan(0);
+    for (const s of deploySubs) {
+      expect(s).not.toContain('*'); // no wildcard anywhere in a deploy subject
+      expect(s.endsWith(':ref:refs/heads/main')).toBe(true);
+    }
+    // Both spellings must be present, or a GitHub format flip locks deploys out.
+    expect(deploySubs).toContain(`repo:${REPO_BY_ID}:ref:refs/heads/main`);
+    expect(deploySubs).toContain(`repo:${REPO_BY_NAME}:ref:refs/heads/main`);
+
+    const diffSubs = subsOf(roleNamed('enshrouded-github-actions-cdk-diff'));
+    expect(diffSubs).toContain(`repo:${REPO_BY_ID}:*`);
+    expect(diffSubs).toContain(`repo:${REPO_BY_NAME}:*`);
   });
 
   test('roles only AssumeRole onto cdk-enshrd1-* bootstrap roles (never hnb659fds)', () => {

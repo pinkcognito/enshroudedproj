@@ -168,6 +168,16 @@ jobs:
           DIFF_RC: ${{ steps.diff.outputs.rc }}
           GUARD_RC: ${{ steps.guard.outputs.rc }}
         run: |
+          # An EMPTY rc means the step never ran, which happens when something
+          # earlier failed (a failed OIDC assume-role is the common one). Treating
+          # empty as "guard tripped" would report a foreign-stack violation that did
+          # not happen and bury the real cause - exactly what run 39137985935 did.
+          # Distinguish "did not run" from "ran and found a problem".
+          if [ -z "$DIFF_RC" ] || [ -z "$GUARD_RC" ]; then
+            echo "::error::cdk diff did not complete - an earlier step failed (check the"\
+                 "Configure AWS credentials and cdk diff steps). This is NOT a foreign-stack violation."
+            exit 1
+          fi
           if [ "$GUARD_RC" != "0" ]; then
             echo "::error::cdk diff touches a stack that is not Enshrouded* - refusing (see the guard step)"
             exit 1

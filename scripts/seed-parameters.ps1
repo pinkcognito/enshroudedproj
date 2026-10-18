@@ -206,17 +206,27 @@ if ($targets) {
 
 if (-not $DryRun) {
   Write-Step 'Stored parameters (names and types only - values are never printed)'
-  aws ssm describe-parameters --region $Region `
-    --parameter-filters "Key=Name,Option=BeginsWith,Values=$prefix/" `
-    --query 'Parameters[].{Name:Name,Type:Type}' --output table
+  # Filter CLIENT-SIDE rather than with --parameter-filters. Both server-side forms
+  # are broken from PowerShell: the CLI shorthand
+  # ("Key=Name,Option=BeginsWith,Values=...") silently returns ZERO matches even when
+  # the parameters exist, and the JSON form loses its double quotes to PowerShell's
+  # native-argument quoting, so the CLI receives invalid JSON. Both verified against a
+  # populated store. A silently-empty result would make this check report success-by-
+  # absence, so it is filtered here instead. Do not "simplify" this back.
+  $all = (aws ssm describe-parameters --region $Region `
+      --query 'Parameters[].[Name,Type]' --output text) -split "`n" |
+    Where-Object { $_ -match "^$prefix/" }
+
+  Write-Host ''
+  $all | ForEach-Object { Write-Host ("  {0}" -f ($_ -replace '\s+', '  ')) }
 
   $expected = @(
     "$prefix/server/name", "$prefix/server/slot-count", "$prefix/discord/bot-token"
   ) + ($allGroups | ForEach-Object { "$prefix/server/user-groups/$_-password" })
 
   $actual = (aws ssm describe-parameters --region $Region `
-      --parameter-filters "Key=Name,Option=BeginsWith,Values=$prefix/" `
-      --query 'Parameters[].Name' --output text) -split '\s+'
+      --query 'Parameters[].Name' --output text) -split '\s+' |
+    Where-Object { $_ -like "$prefix/*" }
 
   $missing = $expected | Where-Object { $_ -notin $actual }
   if ($missing) {
