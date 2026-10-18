@@ -151,20 +151,68 @@ Guardrail attached to **both** `cdk-enshrd1-deploy-role` and `cdk-enshrd1-cfn-ex
 
 ### 1.3 Seed the SSM parameters (§6.6) — ⬜ TODO (you must run this)
 
-> **The bot token is read from the clipboard, not typed.** `Read-Host -AsSecureString`
-> uses a raw key reader that swallows Ctrl+V in the Windows console, so a ~70-character
-> token cannot be pasted into it. Copy the token first, then run the block and press
-> Enter when prompted. The four group passwords are generated for the same reason, and
-> printed once so you can share them.
+**Run the script:**
 
-The deploy **hard-fails** unless the required ones exist. That is deliberate, not defensive
-padding: the reference implementation's own example config ships a group with
-`"password": ""` and full `canEditWorld`/`canEditBase`, i.e. a wide-open, world-editable
-public server. Any path that renders an empty password publishes exactly that. **No future
-change may make an empty password render successfully** (§7).
+```powershell
+cd C:\Users\Dave\github\enshroudedproj
+.\scripts\seed-parameters.ps1
+```
 
-Deliberately **not** created by CDK, so no secret ever lands in a CloudFormation template
-and so CDK never overwrites an operator edit.
+Copy the Discord bot token to your clipboard first (Developer Portal → your app →
+Bot → Reset Token → Copy). The script prompts you to press Enter, reads the token
+from the clipboard, generates the four group passwords, writes everything to SSM,
+and prints the passwords once so you can share them.
+
+It reads the clipboard rather than prompting for keyboard input because
+`Read-Host -AsSecureString` uses a raw key reader that swallows Ctrl+V in the
+Windows console — a ~70-character token cannot be pasted into it.
+
+**What it does for you:**
+- Refuses to run against the wrong AWS account.
+- Warns if the pasted value isn't shaped like a bot token — the common mistake is
+  copying the application *public key* or *client secret*, which sit next to it in
+  the portal.
+- Takes the token *before* writing anything, so an empty clipboard can't leave
+  Parameter Store half-populated.
+- Clears the clipboard afterwards, and never prints the token.
+- Verifies all seven parameters exist before reporting success.
+
+**Useful switches:**
+
+```powershell
+.\scripts\seed-parameters.ps1 -DryRun                      # show what it would write
+.\scripts\seed-parameters.ps1 -ServerName "The Shroud" -SlotCount 8
+.\scripts\seed-parameters.ps1 -KeepPasswords               # rotate only the bot token
+```
+
+Re-running regenerates the group passwords unless you pass `-KeepPasswords`, so
+anyone holding the old ones will need the new ones.
+
+#### Rotating group passwords
+
+`-RotatePassword` regenerates one or more group passwords and touches nothing
+else — no token needed, so you are not re-pasting it to change one password.
+
+```powershell
+.\scripts\seed-parameters.ps1 -RotatePassword guest          # one group
+.\scripts\seed-parameters.ps1 -RotatePassword admin,friend   # several
+.\scripts\seed-parameters.ps1 -RotatePassword all            # all four
+```
+
+Only `admin`, `friend`, `guest`, `visitor` and `all` are accepted; anything else
+is rejected before a write happens. `-RotatePassword` cannot be combined with
+`-Token`, `-ServerName`, `-SlotCount` or `-KeepPasswords` — PowerShell's
+parameter sets reject the combination, so a rotation can never silently rewrite
+your server name or token.
+
+**A rotation does not reach the running server by itself.** The config is
+rendered on the box at deploy time, so redeploy afterwards:
+
+```powershell
+gh workflow run deploy-game-server.yml
+```
+
+That restarts the game and disconnects anyone currently playing.
 
 | Parameter | Type | Required | Holds |
 | --- | --- | --- | --- |
@@ -181,73 +229,13 @@ and so CDK never overwrites an operator edit.
 | `/enshroudedproj/state/last-active` | String | *auto* | Epoch ms |
 | `/enshroudedproj/state/run-state` | String | *auto* | `starting`/`stopping`/empty |
 
-```powershell
-# Paste this whole block into PowerShell at once - it defines two helpers first.
-$Region = 'us-east-2'
-
-# Reads a value from the CLIPBOARD rather than the keyboard. Read-Host
-# -AsSecureString uses a raw key reader that swallows Ctrl+V in the Windows
-# console, so a ~70-character token cannot be pasted into it. Nothing is typed
-# here, so there is no keystroke to swallow - and the value is never echoed.
-function Read-Pasted($Label) {
-  Write-Host ""
-  Write-Host "  $Label" -ForegroundColor Cyan
-  Write-Host "  Copy it to your clipboard, then press Enter here: " -NoNewline
-  [void](Read-Host)
-  $v = Get-Clipboard -Raw
-  if ([string]::IsNullOrWhiteSpace($v)) { throw "Clipboard was empty - copy the value first, then re-run." }
-  $v = $v.Trim()
-  Write-Host ("  got {0} characters, starting '{1}...'" -f $v.Length, $v.Substring(0, [Math]::Min(4, $v.Length))) -ForegroundColor DarkGray
-  $v
-}
-
-# Generated, not prompted: same paste problem would apply, and random beats
-# invented. Swap in your own string if you want something memorable to share.
-function New-GamePassword {
-  -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
-}
-
-# --- non-secret values -----------------------------------------------------
-aws ssm put-parameter --region $Region --name /enshroudedproj/server/name `
-  --type String --value "Dave's Enshrouded Server" --overwrite | Out-Null
-
-aws ssm put-parameter --region $Region --name /enshroudedproj/server/slot-count `
-  --type String --value "16" --overwrite | Out-Null
-
-# --- the four group passwords ----------------------------------------------
-$pw = [ordered]@{}
-foreach ($g in 'admin', 'friend', 'guest', 'visitor') {
-  $pw[$g] = New-GamePassword
-  aws ssm put-parameter --region $Region `
-    --name "/enshroudedproj/server/user-groups/$g-password" `
-    --type SecureString --value $pw[$g] --overwrite | Out-Null
-}
-Write-Host "`nGroup passwords - save these now, they are not shown again:" -ForegroundColor Yellow
-$pw.GetEnumerator() | Format-Table @{L = 'Group'; E = { $_.Key } }, @{L = 'Password'; E = { $_.Value } } -AutoSize
-
-# --- Discord bot token: Developer Portal > your app > Bot > Reset Token -----
-$tok = Read-Pasted "Discord bot token"
-aws ssm put-parameter --region $Region --name /enshroudedproj/discord/bot-token `
-  --type SecureString --value $tok --overwrite | Out-Null
-
-# --- tidy up: do not leave the token sitting on the clipboard --------------
-Set-Clipboard -Value ' '
-Remove-Variable tok -ErrorAction SilentlyContinue
-
-# --- verify: names and types only, never values ----------------------------
-Write-Host "`nStored parameters:" -ForegroundColor Green
-aws ssm describe-parameters --region $Region `
-  --parameter-filters "Key=Name,Option=BeginsWith,Values=/enshroudedproj/" `
-  --query "Parameters[].{Name:Name,Type:Type}" --output table
-```
-
-> Shell history: these commands put secrets on the command line. Prefer
-> `--value "$(read -rs x; echo "$x")"`, or clear your history afterwards.
-
-The four group passwords map to `userGroups[].password` in the rendered config. The
-permission matrix for each group is fixed in `config/enshrouded_server.json.tmpl` per §7.1
-— **every permission key is set explicitly on every group; none is ever inherited from a
-default.**
+Deliberately not created by CDK, so no secret ever lands in a CloudFormation
+template and so CDK never overwrites an operator edit. The deploy **hard-fails**
+if these are missing: the reference implementation's own example config ships a
+group with `"password": ""` and full `canEditWorld`/`canEditBase`, i.e. a
+wide-open, world-editable public server. Any path that renders an empty password
+publishes exactly that. **No future change may make an empty password render
+successfully** (§7).
 
 ### 1.4 Discord application — ⬜ TODO after the first deploy
 
