@@ -20,10 +20,25 @@ third seeds secrets that must never pass through CloudFormation.
 **Why by hand:** CI cannot safely bootstrap the credentials it is currently using.
 
 **Why isolated:** a live, unrelated project (UOPrivateServer) runs in the same AWS account.
-The shared `cdk-hnb659fds-*` bootstrap roles can modify *any* stack, and the CDK **deploy
-role** additionally carries `cloudformation:DeleteStack` on `Resource: "*"` — a standing
-ability to delete `InfrastructureStack`. A separate qualifier plus a deny-only guardrail is
-what prevents that. See §6.2.4 for the blast radius.
+
+This project does **not** share UO's bootstrap roles. The `--qualifier enshrd1` below
+provisions its own complete set — `cdk-enshrd1-{deploy,cfn-exec,file-publishing,
+image-publishing,lookup}-role-334953720182-us-east-2`, plus its own asset bucket and version
+parameter — entirely separate from UO's `cdk-hnb659fds-*`. `cdk.json` pins the qualifier and
+a CI job fails on any `hnb659fds` reference in a synthesised template.
+
+Separate roles alone are not sufficient, which is why the guardrail exists: *any* CDK deploy
+role carries `cloudformation:DeleteStack` on `Resource: "*"`, so even our own fresh
+`cdk-enshrd1-deploy-role` could delete `InfrastructureStack` unless explicitly denied. The
+deny-only policy is what removes that capability. See §6.2.4 for the blast radius.
+
+> **Known asymmetry — the protection is one-directional.** This guardrail stops *our* roles
+> touching UO. Nothing stops UO's roles touching *us*: `cdk-hnb659fds-deploy-role` has
+> `cloudformation:DeleteStack` on `Resource: "*"`, which a policy simulation confirms is
+> `allowed` against `EnshroudedServerStack`. Closing it means attaching a mirror guardrail to
+> UO's roles, which is a change to the *other* project and cannot be done from this one —
+> our own guardrail deliberately denies `iam:*` on `cdk-hnb659fds-*`. Tracked as an open
+> question; not a blocker, since both projects are operated by the same person.
 
 ```sh
 cd infrastructure/policies
