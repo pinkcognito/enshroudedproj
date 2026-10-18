@@ -112,6 +112,29 @@ aws iam simulate-principal-policy `
 
 Paste the output of these into this file under a dated heading when you run them.
 
+#### Run 2026-10-18 — bootstrap applied and verified
+
+`CDKToolkitEnshrouded` created (12 resources, version 32) alongside the untouched
+`CDKToolkit` (also version 32). Separate asset buckets: `cdk-enshrd1-assets-…` vs
+`cdk-hnb659fds-assets-…`. Synth reports **0** occurrences of `hnb659fds`. UO's
+`cdk-hnb659fds-deploy-role` was **not** modified (still only `AWSCloudFormationReadOnlyAccess`).
+
+```
+NEGATIVE  exec role   -> ec2:TerminateInstances  on UO instance   explicitDeny
+NEGATIVE  exec role   -> ec2:StopInstances       on UO instance   explicitDeny
+NEGATIVE  deploy role -> cloudformation:DeleteStack
+            InfrastructureStack   explicitDeny
+            AdminUiStack          explicitDeny
+            GithubOidcStack       explicitDeny
+            CDKToolkit            explicitDeny
+POSITIVE  exec role still able to do its job:
+            iam:CreateRole        allowed     ec2:RunInstances      allowed
+            iam:AttachRolePolicy  allowed     s3:CreateBucket       allowed
+            iam:PassRole          allowed     lambda:CreateFunction allowed
+```
+
+Guardrail attached to **both** `cdk-enshrd1-deploy-role` and `cdk-enshrd1-cfn-exec-role`.
+
 ### 1.3 Seed the SSM parameters (§6.6)
 
 The deploy **hard-fails** unless the required ones exist. That is deliberate, not defensive

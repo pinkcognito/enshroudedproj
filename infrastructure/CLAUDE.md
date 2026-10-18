@@ -1,6 +1,6 @@
 # infrastructure/ — AWS CDK (TypeScript)
 
-CDK app for the Enshrouded server. **Deploys only via merge-to-main CI/CD** (GitHub OIDC) — **never `cdk deploy` or `cdk bootstrap` locally.**
+CDK app for the Enshrouded server. **Deploys only via the GitHub workflow on merge to `main`** (GitHub OIDC) — **never `cdk deploy` locally, no exceptions.** Every feature-branch PR must post its `cdk diff` as a PR comment. `cdk bootstrap` is permitted when needed (CI cannot bootstrap its own credentials); already done — qualifier `enshrd1`, stack `CDKToolkitEnshrouded`.
 
 ## Key files
 - `bin/enshrouded.ts` — app entry; applies the `project`/`repo` tags at App level.
@@ -10,7 +10,7 @@ CDK app for the Enshrouded server. **Deploys only via merge-to-main CI/CD** (Git
 ## Conventions / guardrails
 - **A live UO project shares this AWS account.** Forbidden stack names: `InfrastructureStack`, `AdminUiStack`, `GithubOidcStack`. Every stack passes an explicit `stackName` starting `Enshrouded`; a default (construct-id) name could adopt or destroy the running game server.
 - **Bootstrap qualifier is pinned to `enshrd1`** via `@aws-cdk/core:bootstrapQualifier` in `cdk.json`, so no synth ever defaults to the shared `hnb659fds` toolkit. Do not remove or change it.
-- **Never deploy locally.** Validate with `npm run build` then `npx cdk synth` / `npx cdk diff` — both read-only. Never use `--all`.
+- **Never `cdk deploy` locally.** Validate with `npm run build` then `npx cdk synth` / `npx cdk diff` — both read-only. Never use `--all`. `cdk bootstrap` is the one permitted exception (see above).
 - **Tag every resource** `project=enshroudedproj`, `repo=pinkcognito/enshroudedproj` (App-level `Tags.of(app)`).
 - Never commit to `main`; branch per task and open a PR.
 - **IAM least-privilege**; prefix every IAM role name `enshrouded-`.
