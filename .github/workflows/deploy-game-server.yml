@@ -1,0 +1,34 @@
+name: deploy-game-server
+
+# Installs/updates the Enshrouded server on the game instance and (re)renders its config.
+# Manual only: a deploy restarts the game, so it must be a deliberate act.
+on:
+  workflow_dispatch:
+
+# One deploy at a time; never cancel one midway (the driver script clears maintenance mode on exit).
+concurrency:
+  group: deploy-game-server
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role + instance id are repository variables (neither is a secret); see the
+          # DeployRoleArn / InstanceId outputs of EnshroudedServerStack.
+          role-to-assume: ${{ vars.ENSHROUDED_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+      # Sets maintenance mode, deploys over SSM, and clears maintenance mode on EXIT (trap) -
+      # success, failure, or cancel. No secret reaches this job: passwords are read from SSM
+      # and rendered on the box only.
+      - name: Deploy game server
+        env:
+          ENSHROUDED_INSTANCE_ID: ${{ vars.ENSHROUDED_INSTANCE_ID }}
+        run: bash infrastructure/scripts/run-game-deploy.sh

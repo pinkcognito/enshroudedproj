@@ -1,0 +1,10 @@
+node_modules/
+cdk.out/
+.env
+infrastructure/**/*.js
+infrastructure/**/*.d.ts
+!infrastructure/jest.config.js
+!infrastructure/eslint.config.js
+!infrastructure/lib/enshrouded/lambda/**/*.js
+!infrastructure/scripts/*.js
+!infrastructure/lib/enshrouded/lambda/**/*.d.ts

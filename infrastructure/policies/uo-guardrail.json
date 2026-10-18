@@ -1,0 +1,55 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectUoCloudFormationStacks",
+      "Effect": "Deny",
+      "Action": "cloudformation:*",
+      "Resource": [
+        "arn:aws:cloudformation:us-east-2:334953720182:stack/InfrastructureStack/*",
+        "arn:aws:cloudformation:us-east-2:334953720182:stack/AdminUiStack/*",
+        "arn:aws:cloudformation:us-east-2:334953720182:stack/GithubOidcStack/*",
+        "arn:aws:cloudformation:us-east-2:334953720182:stack/CDKToolkit/*"
+      ]
+    },
+    {
+      "Sid": "ProtectUoInstance",
+      "Effect": "Deny",
+      "Action": "ec2:*",
+      "Resource": "arn:aws:ec2:us-east-2:334953720182:instance/i-0d2f683b403536375"
+    },
+    {
+      "Sid": "ProtectUoIamRoles",
+      "Effect": "Deny",
+      "Action": "iam:*",
+      "Resource": [
+        "arn:aws:iam::334953720182:role/github-actions-cdk-deploy",
+        "arn:aws:iam::334953720182:role/github-actions-cdk-diff",
+        "arn:aws:iam::334953720182:role/github-actions-server-deploy",
+        "arn:aws:iam::334953720182:role/cdk-hnb659fds-*"
+      ]
+    },
+    {
+      "Sid": "ProtectSharedOidcProvider",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint",
+        "iam:RemoveClientIDFromOpenIDConnectProvider"
+      ],
+      "Resource": "arn:aws:iam::334953720182:oidc-provider/token.actions.githubusercontent.com"
+    },
+    {
+      "Sid": "NeverNeeded",
+      "Effect": "Deny",
+      "Action": [
+        "organizations:*",
+        "account:*",
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

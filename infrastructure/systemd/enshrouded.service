@@ -1,0 +1,43 @@
+[Unit]
+Description=Enshrouded dedicated server (GE-Proton 10-26)
+Documentation=file:///srv/enshrouded
+After=network-online.target enshrouded-update.service
+Wants=network-online.target enshrouded-update.service
+# The world lives on the retained data volume. If it is not mounted, REFUSE to start
+# rather than silently writing a brand-new world onto the root volume (fstab uses nofail).
+RequiresMountsFor=/srv/enshrouded
+
+[Service]
+Type=simple
+User=enshrouded
+Group=enshrouded
+WorkingDirectory=/srv/enshrouded
+
+Environment=WINEDEBUG=-all
+# Proton needs a client install path and a compat-data (Wine prefix) path.
+# The prefix MUST be on the retained data volume so it survives instance replacement.
+Environment=STEAM_COMPAT_CLIENT_INSTALL_PATH=/opt/steamcmd
+Environment=STEAM_COMPAT_DATA_PATH=/srv/enshrouded/compatdata
+
+# Loud failures, never a silent skip: wrong mount or missing binary must be an error.
+ExecStartPre=/usr/bin/mountpoint -q /srv/enshrouded
+ExecStartPre=/usr/bin/test -f /srv/enshrouded/enshrouded_server.exe
+ExecStart=/opt/steamcmd/compatibilitytools.d/GE-Proton10-26/proton run /srv/enshrouded/enshrouded_server.exe
+
+# ---- Shutdown path: invariant 1.3. Do not "simplify" any of these. ----
+# ExecStop runs to completion BEFORE KillSignal/KillMode apply. It SIGINTs the game exe ALONE
+# (never wineserver, Wine's kernel, which the save is written through) and waits for it to exit.
+ExecStop=/usr/local/lib/enshrouded/stop-game.sh
+# SIGINT, not systemd's SIGTERM default: the signal the binary is believed to save on.
+KillSignal=SIGINT
+# Backstop only: after ExecStop the game is already gone; this reaps the Proton launcher and
+# wineserver so no orphan blocks the next start. Do not change to "mixed" or "process".
+KillMode=control-group
+# The save window; covers ExecStop (<=110s wait) PLUS the kill after it. SIGKILL (left enabled, deliberately) can only arrive after this.
+# Keep well under AWS's ~4 minute force-stop window; do not raise past ~180.
+TimeoutStopSec=120
+# Never resurrect the server after a deliberate stop; it would fight the drain.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

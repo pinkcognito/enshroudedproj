@@ -1,0 +1,18 @@
+[Unit]
+Description=Update Enshrouded dedicated server files (SteamCMD app 2278520)
+After=network-online.target
+Wants=network-online.target
+# Must finish before the game starts, never while it runs.
+Before=enshrouded.service
+RequiresMountsFor=/srv/enshrouded
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=enshrouded
+Group=enshrouded
+WorkingDirectory=/srv/enshrouded
+# Honours /enshroudedproj/server/auto-update-on-boot, then runs steamcmd with
+# +@sSteamCmdForcePlatformType windows (see /usr/local/lib/enshrouded/update-game.sh).
+ExecStart=/usr/local/lib/enshrouded/update-game.sh
+TimeoutStartSec=1800

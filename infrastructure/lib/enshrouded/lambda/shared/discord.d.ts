@@ -1,0 +1,11 @@
+export const DISCORD_API: string;
+export const DISCORD_USER_AGENT: string;
+export const INTERACTION_TYPE: { PING: number; APPLICATION_COMMAND: number };
+export const CALLBACK_TYPE: { PONG: number; CHANNEL_MESSAGE: number; DEFERRED_CHANNEL_MESSAGE: number };
+export const OPTION_TYPE: { SUB_COMMAND: number; SUB_COMMAND_GROUP: number; STRING: number; INTEGER: number };
+export function verifySignature(publicKeyHex: string, rawBody: string, signatureHex: string, timestamp: string): boolean;
+export function jsonResponse(body: unknown): { statusCode: number; headers: Record<string, string>; body: string };
+export function getBotToken(): Promise<string>;
+export function editOriginalResponse(applicationId: string, interactionToken: string, content: string): Promise<boolean>;
+export function getSubcommand(interaction: unknown): { name: string; options?: unknown[] } | null;
+export function getOption(interaction: unknown, name: string): unknown;

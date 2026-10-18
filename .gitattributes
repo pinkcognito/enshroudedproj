@@ -1,0 +1,16 @@
+# This repo deploys to Linux. Anything that executes on the server MUST have LF
+# line endings: a CRLF shebang fails with "bash\r: No such file or directory",
+# and systemd units with CRLF are silently malformed. The dev machine has
+# core.autocrlf=true set globally, so WITHOUT this file a fresh checkout would
+# rewrite these files to CRLF and the host would fail to provision.
+# Do not remove.
+* text=auto eol=lf
+
+# Belt and braces for the files that reach the game server.
+*.sh      text eol=lf
+*.py      text eol=lf
+*.service text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+*.ts      text eol=lf
+*.js      text eol=lf
