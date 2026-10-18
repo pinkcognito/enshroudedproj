@@ -12,10 +12,24 @@ below point at it.
 
 ## 1. Operator prerequisites — run once, by hand
 
+| Step | Status | Who |
+| --- | --- | --- |
+| 1.1 Bootstrap isolated CDK toolkit | ✅ done 2026-10-18 | Claude (authorised) |
+| 1.2 Verify isolation | ✅ done, output recorded below | Claude |
+| **1.3 Seed SSM parameters** | **⬜ TODO** | **You — contains secrets** |
+| 1.4 Discord endpoint + command registration | ⬜ TODO after first deploy | You |
+| 1.5 GitHub repo variables | ✅ done 2026-10-18 (all 6 set) | Claude |
+| 1.6 Hand-deploy `EnshroudedOidcStack` | ✅ done 2026-10-18 | Claude (authorised) |
+
+**Only §1.3 is blocking.** Everything in it is a secret or a value only you can
+choose, which is why it is not automated. Paste the block as a whole — it defines a
+prompt helper first, so the passwords are never typed on a command line and never
+land in PowerShell history.
+
 These cannot be done by CI. The first two create the credentials CI itself relies on, and the
 third seeds secrets that must never pass through CloudFormation.
 
-### 1.1 Bootstrap an isolated CDK toolkit (§6.2.1)
+### 1.1 Bootstrap an isolated CDK toolkit (§6.2.1) — ✅ DONE 2026-10-18
 
 **Why by hand:** CI cannot safely bootstrap the credentials it is currently using.
 
@@ -76,7 +90,7 @@ stack coexists with it.
 
 `cdk.json` is already pinned to `@aws-cdk/core:bootstrapQualifier: "enshrd1"`.
 
-### 1.2 Verify the isolation actually holds (§6.2.2)
+### 1.2 Verify the isolation actually holds (§6.2.2) — ✅ DONE 2026-10-18
 
 An untested control is an assumption, not a control. All read-only.
 
@@ -135,7 +149,7 @@ POSITIVE  exec role still able to do its job:
 
 Guardrail attached to **both** `cdk-enshrd1-deploy-role` and `cdk-enshrd1-cfn-exec-role`.
 
-### 1.3 Seed the SSM parameters (§6.6)
+### 1.3 Seed the SSM parameters (§6.6) — ⬜ TODO (you must run this)
 
 The deploy **hard-fails** unless the required ones exist. That is deliberate, not defensive
 padding: the reference implementation's own example config ships a group with
@@ -162,31 +176,38 @@ and so CDK never overwrites an operator edit.
 | `/enshroudedproj/state/run-state` | String | *auto* | `starting`/`stopping`/empty |
 
 ```powershell
+# Paste this whole block into PowerShell at once (it defines a helper first).
 $Region = 'us-east-2'
 
+function Read-Secret($Prompt) {
+  $ss = Read-Host -AsSecureString $Prompt
+  [System.Net.NetworkCredential]::new('', $ss).Password
+}
+
+# --- non-secret values -----------------------------------------------------
 aws ssm put-parameter --region $Region --name /enshroudedproj/server/name `
-  --type String --value "Your Server Name" --overwrite
+  --type String --value "Dave's Enshrouded Server" --overwrite
+
 aws ssm put-parameter --region $Region --name /enshroudedproj/server/slot-count `
   --type String --value "16" --overwrite
 
-# Prompted so the passwords never land in PowerShell history.
-function Read-Plain($Prompt) {
-  $ss = Read-Host -AsSecureString $Prompt
-  [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss))
-}
-
+# --- the four group passwords (prompted; never echoed, never in history) ---
 foreach ($g in 'admin', 'friend', 'guest', 'visitor') {
-  $pw = Read-Plain "Password for the $g group (min 4 chars)"
+  $pw = Read-Secret "Password for the $g group (min 4 chars)"
   aws ssm put-parameter --region $Region `
     --name "/enshroudedproj/server/user-groups/$g-password" `
     --type SecureString --value $pw --overwrite
 }
 
-# Discord bot token - Developer Portal > Bot tab. NEVER commit this.
-$tok = Read-Plain "Discord bot token"
+# --- Discord bot token: Developer Portal > your app > Bot > Reset Token -----
+$tok = Read-Secret "Discord bot token"
 aws ssm put-parameter --region $Region --name /enshroudedproj/discord/bot-token `
   --type SecureString --value $tok --overwrite
+
+# --- verify: names and types only, never values ----------------------------
+aws ssm describe-parameters --region $Region `
+  --parameter-filters "Key=Name,Option=BeginsWith,Values=/enshroudedproj/" `
+  --query "Parameters[].{Name:Name,Type:Type}" --output table
 ```
 
 > Shell history: these commands put secrets on the command line. Prefer
@@ -197,7 +218,7 @@ permission matrix for each group is fixed in `config/enshrouded_server.json.tmpl
 — **every permission key is set explicitly on every group; none is ever inherited from a
 default.**
 
-### 1.4 Discord application
+### 1.4 Discord application — ⬜ TODO after the first deploy
 
 Non-secret values (safe to record here; the bot token is not):
 
@@ -213,10 +234,18 @@ After the stack deploys, set the interactions endpoint in the Discord Developer 
 `DiscordBotInteractionsUrl` stack output, then register the commands:
 
 ```powershell
+# AFTER the first deploy. Get the endpoint URL from the stack outputs:
+aws cloudformation describe-stacks --region us-east-2 `
+  --stack-name EnshroudedServerStack `
+  --query "Stacks[0].Outputs[?OutputKey=='DiscordBotInteractionsUrl'].OutputValue" `
+  --output text
+
+# Paste that URL into the Developer Portal as the Interactions Endpoint URL,
+# then register the slash commands:
 cd infrastructure
 $env:DISCORD_APPLICATION_ID = '1561358999863955538'
-# Optional: near-instant guild-scoped registration for testing
-# $env:DISCORD_GUILD_ID = '<guild id>'
+# Optional, for near-instant guild-scoped testing instead of ~1h global propagation:
+# $env:DISCORD_GUILD_ID = '<your test guild id>'
 node scripts/register-discord-commands.js
 ```
 
@@ -225,7 +254,7 @@ Registration is a **manual step, not part of deploy**, and is a **bulk overwrite
 deletes the omitted ones. Global and guild command sets *stack* rather than merge, so a guild
 with both registered shows duplicates.
 
-### 1.5 GitHub repository variables
+### 1.5 GitHub repository variables — ✅ DONE 2026-10-18
 
 ```powershell
 gh variable set AWS_REGION                 --body us-east-2
@@ -268,6 +297,37 @@ workflow posts a comment saying the diff was skipped rather than failing.
 **First-deploy ordering (open item).** `deploy.yml` authenticates as a role that
 `EnshroudedOidcStack` itself creates, so the first deploy of that stack cannot come from CI.
 How to seed it is an operator decision; it is not covered by this runbook yet.
+
+### 1.6 EnshroudedOidcStack is hand-deployed — the one `cdk deploy` exception — ✅ DONE 2026-10-18
+
+`deploy.yml` authenticates as `enshrouded-github-actions-cdk-deploy`, a role that
+`EnshroudedOidcStack` itself creates. CI cannot assume a role that does not exist, so the
+**first** deploy of that stack can never come from CI. This is a genuine cycle, not a gap.
+
+It is therefore deployed by hand, and **excluded from `deploy.yml` permanently** — not just
+for the first run. Letting CI redeploy the credentials it is actively authenticating with
+means a bad change there locks CI out of fixing itself, and recovery needs manual admin
+credentials. `UOPrivateServer` excludes its equivalent `GithubOidcStack` for the same reason.
+
+Everything else — `EnshroudedServerStack` and all future stacks — deploys only through the
+workflow on merge to `main`. This is the sole exception.
+
+**Applied 2026-10-18.** Diff reviewed first; it created two IAM roles and nothing else.
+
+```powershell
+cd infrastructure
+npx cdk diff EnshroudedOidcStack --exclusively        # review first, always
+npx cdk deploy EnshroudedOidcStack --exclusively --require-approval never
+```
+
+Outputs, now set as repo variables (see §1.5):
+```
+CdkDeployRoleArn = arn:aws:iam::334953720182:role/enshrouded-github-actions-cdk-deploy
+CdkDiffRoleArn   = arn:aws:iam::334953720182:role/enshrouded-github-actions-cdk-diff
+```
+
+Re-run this by hand only when the OIDC stack itself changes — a rare, deliberate act. Review
+the diff every time: a mistake here is what locks you out.
 
 ---
 

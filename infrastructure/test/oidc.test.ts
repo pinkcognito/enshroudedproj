@@ -91,12 +91,24 @@ describe('workflows', () => {
     expect(code(f)).not.toMatch(/--all\b/);
   });
 
-  test('deploy.yml names both stacks explicitly and only runs on main', () => {
+  test('deploy.yml names stacks explicitly and only runs on main', () => {
     const c = code('deploy.yml');
-    expect(c).toMatch(/cdk deploy[^\n]*EnshroudedOidcStack/);
     expect(c).toMatch(/cdk deploy[^\n]*EnshroudedServerStack/);
     expect(c).toMatch(/branches: \[main\]/);
     expect(c).not.toContain('pull_request');
+  });
+
+  // EnshroudedOidcStack defines the very role this workflow authenticates as.
+  // If CI redeploys it, a bad change can lock CI out of fixing itself and
+  // recovery needs manual admin credentials. It is hand-deployed (RUNBOOK 1.6).
+  // This guards the exclusion rather than merely tolerating it.
+  test('deploy.yml never deploys or synthesises EnshroudedOidcStack', () => {
+    const c = code('deploy.yml');
+    const cdkLines = c.split('\n').filter((l) => /\bcdk\s+(deploy|synth)\b/.test(l));
+    expect(cdkLines.length).toBeGreaterThan(0);
+    for (const line of cdkLines) {
+      expect(line).not.toContain('EnshroudedOidcStack');
+    }
   });
 
   test('every uses: is pinned to a full commit SHA', () => {

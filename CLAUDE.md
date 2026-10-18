@@ -9,6 +9,7 @@ Account `334953720182` (us-east-2) also hosts the running UOPrivateServer game s
 - **Never `cdk deploy` locally — no exceptions.** Infra reaches AWS *only* through the GitHub workflow on merge to `main` (GitHub OIDC). This is what keeps every change to a shared account reviewed and auditable.
 - **Every feature-branch PR must post its `cdk diff` as a PR comment**, so what is about to change is visible before the merge that applies it. A PR with infra changes and no diff comment is not reviewable.
 - **`cdk bootstrap` is permitted when needed.** CI structurally cannot bootstrap the credentials it runs with, so this is a human/assistant step. Already done: qualifier `enshrd1`, stack `CDKToolkitEnshrouded` (see `docs/RUNBOOK.md` §1.1).
+- **`EnshroudedOidcStack` is the one hand-deployed stack**, and is excluded from `deploy.yml` permanently — it defines the role CI authenticates as, so CI redeploying it can lock CI out of fixing itself (`docs/RUNBOOK.md` §1.6). Review the diff every time.
 - Validate locally with `npm run build`, `npx cdk synth` and `npx cdk diff` — all read-only.
 - **Never commit to `main`; branch fresh per task and open a PR.**
 - **Tag every AWS resource** `project=enshroudedproj`, `repo=pinkcognito/enshroudedproj` (applied at App level in `bin/enshrouded.ts`; do not remove).

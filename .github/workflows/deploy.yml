@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   deploy:
-    name: cdk deploy (EnshroudedOidcStack, EnshroudedServerStack)
+    name: cdk deploy (EnshroudedServerStack)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -65,10 +65,14 @@ jobs:
           esac
       # Synth (named stacks only), then re-run the WP-19 synth-time invariants before AWS is mutated.
       - name: Synth
-        run: npx cdk synth --quiet EnshroudedOidcStack EnshroudedServerStack
+        run: npx cdk synth --quiet EnshroudedServerStack
       - name: Project invariants (WP-19 script, reused)
         working-directory: .
         run: python3 -I .github/scripts/check-invariants.py
       # --exclusively: only the named stacks, never their dependencies. Role stack first.
       - name: Deploy
-        run: npx cdk deploy EnshroudedOidcStack EnshroudedServerStack --exclusively --require-approval never --concurrency 1
+        # EnshroudedOidcStack is deliberately EXCLUDED. It defines the very role this
+        # workflow authenticates as, so letting CI redeploy it means a bad change can
+        # lock CI out of fixing itself - recovery would need manual admin credentials.
+        # It is deployed by hand as a rare, deliberate step (docs/RUNBOOK.md 1.6).
+        run: npx cdk deploy EnshroudedServerStack --exclusively --require-approval never --concurrency 1
