@@ -77,8 +77,19 @@ ensure_ssm_agent() {
   fi
   if ! agent_active && ! snap list amazon-ssm-agent >/dev/null 2>&1 && ! dpkg -s amazon-ssm-agent >/dev/null 2>&1; then
     # Last resort: AWS's own regional package (TLS, AWS-owned bucket).
-    curl -fsSL --retry 5 -o /tmp/amazon-ssm-agent.deb "https://s3.us-east-2.amazonaws.com/amazon-ssm-us-east-2/latest/debian_amd64/amazon-ssm-agent.deb" \
-      && dpkg -i /tmp/amazon-ssm-agent.deb || true
+    # Split rather than `curl && dpkg || true` (SC2015): that form cannot
+    # distinguish a download failure from an install failure, and this is the
+    # path deciding whether the host is reachable at all (no SSH, no key pair).
+    # Both stay non-fatal - the agent_active gate below is what decides - but
+    # each failure is now named in the console log.
+    ssm_deb_url="https://s3.us-east-2.amazonaws.com/amazon-ssm-us-east-2/latest/debian_amd64/amazon-ssm-agent.deb"
+    if curl -fsSL --retry 5 -o /tmp/amazon-ssm-agent.deb "$ssm_deb_url"; then
+      if ! dpkg -i /tmp/amazon-ssm-agent.deb; then
+        echo "WARN: dpkg install of amazon-ssm-agent.deb failed" >&2
+      fi
+    else
+      echo "WARN: could not download amazon-ssm-agent.deb from AWS" >&2
+    fi
     systemctl enable --now amazon-ssm-agent.service || true
   fi
   for _ in 1 2 3 4 5 6; do
