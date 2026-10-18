@@ -15,5 +15,10 @@ Account `334953720182` (us-east-2) also hosts the running UOPrivateServer game s
 - **Tag every AWS resource** `project=enshroudedproj`, `repo=pinkcognito/enshroudedproj` (applied at App level in `bin/enshrouded.ts`; do not remove).
 - Stop and ask before anything that could affect a non-`Enshrouded*` resource.
 
+## Script language
+- **Operator/tooling scripts (seeding, rotation, ops helpers, diagnostics): Python.** Not PowerShell — it ties a script to Windows and to PowerShell 5.1's quirks. Matches the existing convention in `.github/scripts/` (`check-invariants.py`, `check-diff-stacks.py`, `render-diff-comment.py`) and WP-08's `probe-players.py`.
+- **Scripts that run on the game host: bash.** They are delivered over SSM to Ubuntu and must stay LF (`.gitattributes` enforces it).
+- `scripts/seed-parameters.ps1` predates this convention and is deliberately left as-is.
+
 ## Build / check
 `cd infrastructure && npm run build && npm run lint && npm test && npx cdk synth` — must be clean before opening a PR.
