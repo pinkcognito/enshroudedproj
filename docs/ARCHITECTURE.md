@@ -1133,6 +1133,21 @@ still required with `UMU_ID=0` set**, because carrying an unnecessary patch to a
 binary is pure risk for no benefit. If GE-Proton later fixes umu mode upstream, this
 requirement should disappear rather than be carried forever.
 
+##### Prefix upgrade across a Proton major — a suspect to remember
+
+`Proton: Prefix has an invalid version?!` appeared when `compatdata` was upgraded in place
+from 10-26 to 11-9. The game launched anyway, so this is not currently a fault — but
+**a stale prefix carried across a Proton major version is the first thing to suspect if
+Proton-layer weirdness appears later** (odd Wine errors, missing DLL behaviour,
+`lsteamclient` misbehaviour).
+
+Forcing a clean rebuild is `rm -rf /srv/enshrouded/compatdata`; Proton recreates it on next
+start, costing one slower boot. **Two cautions:** it lives on the **retained** data volume
+(§6.1.3), so this is a deliberate operator act rather than something a redeploy does —
+and `savegame/` is its **sibling on the same volume**. The delete must name `compatdata`
+exactly and must never be widened to the parent directory. Worth a runbook entry (WP-16)
+precisely because it is a safe operation one careless glob away from an unsafe one.
+
 ##### Gaps against the known-good build — recorded, unverified as causes
 
 The reference has two things we lack. Neither is confirmed to matter, but both are real
@@ -1140,6 +1155,13 @@ divergences from a build known to work:
 
 - `~/.steam/sdk64` and `~/.steam/sdk32` symlinks (with `steamservice.so` → `steamclient.so`)
 - the `winbind` package
+- **`libfreetype6`** — without it Wine logs "cannot find the FreeType font library" about
+  ten times per start. Harmless for a headless server with no text rendering, but **log
+  noise around startup is exactly what obscures the next real error**, which is reason
+  enough on its own. **Close it in this change.** Attribution is already clean here: the
+  startup crash was fixed by Proton 11-9 and the config rejection by §7.1, both
+  independently diagnosed, so adding one cosmetic package alongside cannot be confused
+  with fixing either.
 
 Close them on the principle that divergence from a known-good build should be deliberate,
 not accidental — but do not record them as fixes for the 255 crash without evidence.
@@ -2003,44 +2025,91 @@ one bucket.
   - `saveDirectory`/`logDirectory` defaults are relative (`./…`), which with the unit's
     `WorkingDirectory=/srv/enshrouded` resolve exactly where §8 and §3.2 expect. Setting
     them explicitly is therefore belt-and-braces rather than load-bearing.
-#### 7.1 Per-group permission matrix — `canEditWorld` must be explicit
+#### 7.1 Per-group permission matrix — corrected by the game itself
 
-The template omitted `canEditWorld` on all four groups. It is a **destructive, world-wide**
-capability, so leaving it to an undocumented default is the same error class as an empty
-password — and worse in one respect: an empty password reads as an obvious gap, whereas a
-permission block listing five of six keys looks complete. **Every permission key is set
-explicitly on every group. No permission is ever inherited from a default.**
+**VERIFIED BY THE GAME (2026-10-19), and it is a schema constraint, not a preference:**
 
-| group | canKickBan | canAccessInventories | **canEditWorld** | canEditBase | canExtendBase |
-| --- | --- | --- | --- | --- | --- |
-| Admin | true | true | **true** | true | true |
-| Friend | false | true | **true** | true | false |
-| Guest | false | false | **false** | true | false |
-| Visitor | false | false | **false** | false | false |
+```
+Internal Error: Users that are allowed to Edit the Base But not the World ?
+Internal Error: Invalid Server Configuration 'Z:/srv/enshrouded/enshrouded_server.json'
+status=255/EXCEPTION
+```
 
-**The semantic of `canEditWorld` is UNVERIFIED** — it is either (a) core voxel interaction
-(mining and digging, i.e. how the game is played) or (b) terraforming outside base claims
-(purely destructive). The values above are chosen to be defensible under **both** readings
-rather than by assuming one:
+**`canEditBase` implies `canEditWorld`. The two keys are nested, not independent, and the
+server *refuses to start* on the invalid combination** rather than ignoring it or
+degrading. Admin and Friend (both `true`) and Visitor (both `false`) were accepted; Guest
+(`canEditBase: true`, `canEditWorld: false`) was rejected.
 
-- **Friend = true is the dominant choice.** Under (b) a trusted friend can reshape
-  terrain — which is ordinary play on a private server whose world is autosaved every
-  ~10 min, saved on shutdown, and synced to S3. Under (a), `false` would mean **friends
-  cannot mine at all**, i.e. the server looks broken for everyone who is not Admin. The
-  downside of `true` is mild and reversible; the downside of `false` is severe and
-  immediate. Note this deliberately breaks the gradient — Friend has `canExtendBase:
-  false` — because `canExtendBase` cannot make the game unplayable and `canEditWorld`
-  might.
-- **Guest = false under both readings.** Under (b) it is exactly the capability the tier
-  exists to withhold. Under (a) Guest becomes "can build inside the base, cannot reshape
-  the landscape" — unusual but coherent, since `canEditBase: true` still permits building.
-  The tier exists for someone the owner does not fully trust, and the asymmetry favours
-  restriction: over-restriction is fixed by a Discord message and a one-line redeploy,
-  over-permission is fixed by a world restore that costs the whole session.
-- Admin and Visitor are unambiguous under either reading.
+**This also settles the semantic §7.1 previously could not.** If base editing *requires*
+world editing, then `canEditWorld` is the **broad, fundamental "may modify voxels at all"**
+permission and `canEditBase` is a narrower privilege layered on top. That is reading (a)
+from the earlier analysis — core voxel interaction — not reading (b), terraforming outside
+claims. **A player with `canEditWorld: false` therefore cannot build or mine anything**:
+such a tier is a true spectator, not a restricted builder.
 
-**WP-07 (f2) must record which semantic is real.** If `canEditWorld` turns out to gate
-core mining, revisit Guest.
+##### The corrected matrix
+
+| group | canKickBan | canAccessInventories | canEditWorld | canEditBase | canExtendBase | reservedSlots |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Admin** | true | true | **true** | true | true | 0 |
+| **Friend** | false | true | **true** | true | false | 0 |
+| **Guest** | false | **false** | **true** | **true** | false | 0 |
+| **Visitor** | false | false | **false** | **false** | false | 0 |
+
+**Guest is distinguished from Friend by `canAccessInventories` alone** — Guest may play and
+build, but may not open other players' containers.
+
+##### Why this, and why NOT "restrict Guest further"
+
+The instinct that produced the original error — *the asymmetry favours restriction* — was
+right in general and wrong here, and it is worth being precise about why, because the same
+instinct will recur.
+
+That principle assumed restriction left Guest with **a role**: "can build in the base,
+cannot reshape the landscape." The nesting constraint destroys that option. Restricting
+Guest now means setting `canEditWorld: false`, which per the semantic above makes Guest
+**permission-identical to Visitor** — same five booleans, same `reservedSlots`, differing
+only in name and password. That is not a restricted tier; it is a duplicate tier wearing a
+different name, i.e. deleting Guest by stealth while leaving its password, its SSM
+parameter and its `/enshrouded password` entry in place.
+
+So the real choice was never "permissive Guest vs restrictive Guest". It was:
+
+- **Four tiers where Guest = "may play, may not rummage"** (chosen), or
+- **Three tiers**, dropping Guest honestly — which also means removing
+  `/enshroudedproj/server/user-groups/guest-password` (§6.6.1), its seeding, and its
+  handling in WP-13. More churn, less function.
+
+**And the "no terraforming but can build" property we appear to lose was never
+achievable.** The game says it is incoherent. We are not giving up a capability; we are
+discovering it never existed. Reframing it that way is what flips the decision.
+
+The restriction instinct is still honoured — **Visitor** is the genuinely locked-down tier
+and is the password you hand to someone you do not trust. Guest is "trusted enough to
+play, not enough to open your chests", which is a distinction small survival servers
+actually want.
+
+Residual risk, stated: Guest can now terraform. On a private server with hand-delivered
+passwords and a world that autosaves every ~10 min, saves on clean shutdown, syncs to S3
+and is snapshotted daily (§8), a Guest reshaping terrain is *ordinary play* and is
+recoverable. The irreversibility concern was overweighted once "cannot terraform" and "can
+build" turned out to be mutually exclusive.
+
+##### A property worth keeping: only game-accepted combinations
+
+The corrected matrix uses exactly **two** `(canEditWorld, canEditBase)` pairs — `(true,
+true)` and `(false, false)` — **both already accepted by the running server.** It
+therefore cannot produce a new startup rejection. The untested `(true, false)` combination
+is deliberately unused: no tier needs it, and there is no reason to depend on a
+combination the game has not validated.
+
+##### The invariant held, and that is the point
+
+§7.1's rule — **every permission key is set explicitly on every group, no permission is
+ever inherited from a default** — is what turned a wrong guess into a **loud startup
+failure with a precise error message**, three seconds into a deploy, instead of a silent
+permission surprise discovered weeks later by a Guest who could suddenly reshape the map.
+The guess was wrong; the discipline around it worked exactly as intended. Keep the rule.
 
 #### 7.2 Settings we deliberately do NOT ship — inherit vs pin
 
@@ -2529,8 +2598,9 @@ account.
 - **(f) Log strings.** Exact ready-line text, and whether unambiguous join/leave lines
   exist. (Two conflicting ready strings are in circulation — see §3.1 step 9. Note the
   ready line is now **corroboration only**; the socket predicate is the gate.)
-- **(f2) Diff the rendered config against the server's own first-run generated
-  `enshrouded_server.json`** and record the real schema **verbatim** in
+- **(f2) — PROMOTED: run this immediately after the first successful boot, ahead of the
+  rest of WP-07.** It no longer sits in the general batch. **Diff the rendered config
+  against the server's own first-run generated `enshrouded_server.json`** and record the real schema **verbatim** in
   `FINDINGS-detection.md`. This settles the key names permanently and retires the last
   ASSUMED items in §7: whether `gameSettings` is ignored under
   `gameSettingsPreset: "Default"`, what Keen's actual default `userGroups` set is, and
@@ -2540,8 +2610,18 @@ account.
   `canEditWorld`: list every *permission* key present in the generated file that our
   template omits, together with the generated default for each.** Any permission we are
   inheriting rather than setting is a finding, not a detail — §7.1's rule is that no
-  permission is ever inherited. Also record what `canEditWorld` actually gates (core
-  mining, or terraforming outside claims), since §7.1's Guest value depends on it.
+  permission is ever inherited.
+  **Also record every *inter-key constraint* the generated file implies**, not just the key
+  names. `canEditBase ⇒ canEditWorld` (§7.1) was discovered by the server refusing to
+  start; there may be further nesting among `canExtendBase`, `canEditBase` and
+  `canAccessInventories` that we have not tripped because no tier happens to use the
+  invalid combination. Enumerate what the generated defaults imply rather than probing by
+  trial and error.
+  **Why this is promoted:** §7 marked the config schema ASSUMED, (f2) was the item meant
+  to settle it, and the refutation arrived *before* (f2) ran — as a 255 startup crash
+  mid-deploy. The check was correctly specified and merely scheduled too late. Running it
+  at first boot costs minutes and retires the single largest remaining ASSUMED cluster in
+  the document.
 - **(g) Clean shutdown — the load-bearing test (§4.1.1).** Which files under `savegame/`
   change on a `systemctl stop`, how long the save takes, and whether **`SIGINT` under
   Proton really produces a *completed* clean save** — not merely a process that exited.
@@ -2661,7 +2741,7 @@ account.
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
 | **WP-15** | Observability: grant the instance role CloudWatch Logs permissions (WP-05 installs and starts the agent but it **cannot publish** until this lands) and ship `enshrouded_server.log` to the log group **`/enshroudedproj/game-log`** — the name WP-05 already configured on the agent, so match it exactly rather than inventing another (**the game deletes the log on every launch**, so off-box shipping is the only way to keep crash forensics); alarms for `SaveVerificationFailed`, `DetectionIndeterminate`, `MaxUptimeCapHit`, `BootWatcherTimeout`; AWS Budgets alarm; all alarms routed to the Discord ops channel. | `lib/enshrouded/observability.ts` | WP-10, WP-14 | Forcing a save-verification failure produces a Discord message within 5 minutes. Last session's log is readable in CloudWatch after a restart. | R |
-| **WP-16** | `docs/RUNBOOK.md` + a **real restore drill, exercised cross-AZ** (§8.1): create a volume from a DLM snapshot in a **different AZ**, overlay the newest `<worldid>*` set from S3, attach to an instance in that AZ, boot, and confirm the world and a built structure are intact. Also do the simpler same-AZ `savegame/`-only restore. Record the exact steps and the elapsed time for both. | `docs/RUNBOOK.md` | WP-04, WP-09 | The drill is performed and documented, not described hypothetically. The cross-AZ elapsed time is recorded as the project's de facto recovery objective. Runbook also covers: **the GE-Proton bump procedure — write it from the 10-26 → 11-9 bump (§6.1.3a) while the details are fresh, since the contingency it documents has already occurred once and will recur at every significant game release** (the only mitigation for a patch the pinned Proton cannot run, §7); **the warning that adding user data mutated the instance resource, so the first deploy after WP-05 may stop/start or replace it** — harmless for the world because the data volume is retained (§6.3.1), but it will interrupt a running session and should not be a surprise; re-applying the §6.2.1 step-3 Deny after a re-bootstrap; manual stop, clearing a stuck maintenance mode, forcing a game update, and rolling back a bad Keen patch. | **A**-light |
+| **WP-16** | `docs/RUNBOOK.md` + a **real restore drill, exercised cross-AZ** (§8.1): create a volume from a DLM snapshot in a **different AZ**, overlay the newest `<worldid>*` set from S3, attach to an instance in that AZ, boot, and confirm the world and a built structure are intact. Also do the simpler same-AZ `savegame/`-only restore. Record the exact steps and the elapsed time for both. | `docs/RUNBOOK.md` | WP-04, WP-09 | The drill is performed and documented, not described hypothetically. The cross-AZ elapsed time is recorded as the project's de facto recovery objective. Runbook also covers: **the GE-Proton bump procedure — write it from the 10-26 → 11-9 bump (§6.1.3a) while the details are fresh, since the contingency it documents has already occurred once and will recur at every significant game release** (the only mitigation for a patch the pinned Proton cannot run, §7); **the warning that adding user data mutated the instance resource, so the first deploy after WP-05 may stop/start or replace it** — harmless for the world because the data volume is retained (§6.3.1), but it will interrupt a running session and should not be a surprise; **forcing a clean Proton prefix rebuild** (`rm -rf /srv/enshrouded/compatdata` — never widened to the parent, `savegame/` is its sibling, §6.1.3a); re-applying the §6.2.1 step-3 Deny after a re-bootstrap; manual stop, clearing a stuck maintenance mode, forcing a game update, and rolling back a bad Keen patch. | **A**-light |
 | **WP-17** | **Permissions boundary (§6.2.1b).** Author an `EnshroudedPermissionsBoundary` customer-managed policy in the `Allow NotAction: ["organizations:*","account:*"]` + `Deny`-UO-resources shape (a boundary is an intersection, so it must contain Allows), re-bootstrap with `--custom-permissions-boundary`, and confirm every role our stacks create carries it. Covers the runtime-escape threat the deploy-time Deny does not. | `docs/RUNBOOK.md` (boundary section), `infrastructure/policies/permissions-boundary.json` | WP-02, and every WP that creates a role (WP-03, 09–15) | Every role in the deployed stacks shows the boundary in `iam:GetRole`. A `simulate-principal-policy` of the EC2 instance role against the UO instance returns `explicitDeny`. **A full deploy still succeeds** — a too-tight boundary fails `iam:CreateRole` mid-deploy, so the positive control matters more than the negative one here. | **A** — easy to get wrong in a way that wedges deploys. |
 | **WP-20** | **Close the reverse isolation direction (§6.2.3b)** — the UO → Enshrouded gap. Author `UoCannotTouchEnshrouded` (CFN on `stack/Enshrouded*/*` + `stack/CDKToolkitEnshrouded/*`; `ec2:*` conditioned on `aws:ResourceTag/project=enshroudedproj`; `iam:*` on `role/enshrouded-*` and `role/cdk-enshrd1-*`; `ssm:*` on `parameter/enshroudedproj/*`), attach it to `cdk-hnb659fds-deploy-role` and `-cfn-exec-role`, and enable termination protection on `EnshroudedServerStack`. **Cannot be done from this repo** — our own guardrail denies `iam:*` on `cdk-hnb659fds-*` and that must not be relaxed. Hand-run operator step or a UO-repo change, and it **modifies the live production system**, so it needs the user's explicit authorisation. | `infrastructure/policies/uo-cannot-touch-enshrouded.json` (checked in for review only), `docs/RUNBOOK.md` | **Phase 1 deployed and tagged** (a tag-conditioned deny protects nothing before the tagged resources exist), + user authorisation | Simulation in **both** directions: UO roles **denied** on `stack/EnshroudedServerStack/*`, **and still allowed** on `stack/InfrastructureStack/*`. The positive control is the important half — it is what catches a too-broad deny breaking UO's pipeline. Termination protection enabled and recorded in the runbook **as a speed bump, not a control**. | **A** — touches live production IAM; low urgency, high care. |
 

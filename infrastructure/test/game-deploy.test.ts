@@ -86,7 +86,8 @@ const PERMISSION_KEYS = [
   'canKickBan', 'canAccessInventories', 'canEditWorld', 'canEditBase', 'canExtendBase', 'reservedSlots',
 ] as const;
 // section 7.1: canEditWorld per group. Friend=true while canExtendBase=false is intentional.
-const CAN_EDIT_WORLD: Record<string, boolean> = { Admin: true, Friend: true, Guest: false, Visitor: false };
+// The game enforces canEditBase => canEditWorld and refuses to boot otherwise (verified on the box).
+const CAN_EDIT_WORLD: Record<string, boolean> = { Admin: true, Friend: true, Guest: true, Visitor: false };
 
 function expectExplicitPermissions(cfgGroups: Array<Record<string, unknown>>): void {
   for (const g of cfgGroups) {
@@ -128,6 +129,12 @@ describe('config template (section 7 schema)', () => {
     expect(groups.map((g) => g.name)).toEqual(Object.keys(CAN_EDIT_WORLD));
     for (const g of groups) expect(g).toHaveProperty('canEditWorld');
     expectExplicitPermissions(groups);
+  });
+
+  test('7.1: nesting - every group is (canEditWorld, canEditBase) == (true,true) or (false,false)', () => {
+    for (const g of groups) {
+      expect({ group: g.name, nested: g.canEditWorld === g.canEditBase }).toEqual({ group: g.name, nested: true });
+    }
   });
 
   test('7.2: enableTextChat pinned true; gameSettings/tags/voice keys deliberately absent', () => {
