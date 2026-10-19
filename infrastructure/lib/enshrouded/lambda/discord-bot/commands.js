@@ -25,6 +25,11 @@ const commands = [
       },
       {
         type: OPTION_TYPE.SUB_COMMAND,
+        name: 'help',
+        description: 'Show commands, permissions, and how server status works',
+      },
+      {
+        type: OPTION_TYPE.SUB_COMMAND,
         name: 'start',
         description: 'Start the Enshrouded server',
       },

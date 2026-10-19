@@ -36,7 +36,7 @@ async function describeInstance() {
 // Runs as a separate async invocation so the slow part never blocks Discord's 3s ack
 // deadline (EC2 start alone regularly took 3.5-4s). The initial invocation already
 // delivered a deferred (type 5) callback; we edit it via the interaction token.
-async function finishStart(event) {
+async function finishStart(event, context) {
   const reply = (content) =>
     editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken, content);
   try {
@@ -50,8 +50,25 @@ async function finishStart(event) {
       await reply('The server is shutting down. Try again in a minute.');
     } else if (state === 'stopped') {
       const { StartInstancesCommand } = require('@aws-sdk/client-ec2');
-      await ec2().send(new StartInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
-      await reply('Booting the world - this takes a few minutes.');
+      const result = await ec2().send(new StartInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
+      // A successful EC2 start must not become a failed start because Discord failed.
+      try {
+        await editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken,
+          'Booting the world - this takes a few minutes.', 2000);
+      } catch {
+        console.error('Server start reply failed: network-or-timeout');
+      }
+      const started = result.StartingInstances?.some((item) =>
+        item.InstanceId === process.env.INSTANCE_ID &&
+        item.PreviousState?.Name === 'stopped' && item.CurrentState?.Name === 'pending');
+      if (started) {
+        try {
+          const budgetMs = Math.min(3500, (context?.getRemainingTimeInMillis?.() ?? 4000) - 500);
+          if (budgetMs > 0) await require('./starter-announcement').announceStarter(event, budgetMs);
+        } catch {
+          console.error('Starter announcement failed: delivery-failed');
+        }
+      }
     } else {
       await reply(`The server is in an unexpected state (${state ?? 'unknown'}).`);
     }
@@ -83,7 +100,7 @@ async function finishStatus(event) {
 }
 
 // Deliver the acknowledgement before SDK loading or the awaited async invocation.
-async function deferAndInvoke(internal, interaction, channelRequest) {
+async function deferAndInvoke(internal, interaction, channelRequest, starter) {
   if (!(await deferInteraction(interaction.id, interaction.token, channelRequest ? { ephemeral: true } : undefined))) {
     return { statusCode: 202, body: '' };
   }
@@ -93,7 +110,7 @@ async function deferAndInvoke(internal, interaction, channelRequest) {
       new InvokeCommand({
         FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
         InvocationType: 'Event',
-        Payload: JSON.stringify({ _internal: internal, interactionToken: interaction.token, ...channelRequest }),
+        Payload: JSON.stringify({ _internal: internal, interactionToken: interaction.token, ...channelRequest, ...starter }),
       }),
       { abortSignal: AbortSignal.timeout(3000) },
     );
@@ -113,10 +130,10 @@ async function deferAndInvoke(internal, interaction, channelRequest) {
   return { statusCode: 202, body: '' };
 }
 
-exports.handler = async (event) => {
+exports.handler = async (event, context) => {
   // Internal self-invocations are not Discord requests: no signature to verify.
   if (event && event._internal === 'finish-start') {
-    return finishStart(event);
+    return finishStart(event, context);
   }
   if (event && event._internal === 'finish-status') {
     return finishStatus(event);
@@ -167,8 +184,12 @@ exports.handler = async (event) => {
 
     if (commandName === 'enshrouded') {
       // WP-13 adds stop/password/update/backup as further branches here (and in commands.js).
+      if (subcommand === 'help') {
+        return require('./help').helpResponse();
+      }
       if (subcommand === 'start') {
-        return deferAndInvoke('finish-start', interaction);
+        return deferAndInvoke('finish-start', interaction, undefined,
+          { guildId: interaction.guild_id, userId: user?.id });
       }
       if (subcommand === 'status') {
         return deferAndInvoke('finish-status', interaction);

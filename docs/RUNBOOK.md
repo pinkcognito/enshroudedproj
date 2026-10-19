@@ -384,6 +384,9 @@ from the SSM values above; it is never committed with real values.
 
 ## 3. Discord status channel
 
+Run `/enshrouded help` for a private explanation of the available commands, channel
+permissions, status indicators, and automatic idle shutdown.
+
 After the channel-status change is merged, its workflow deploy succeeds, and the updated
 slash commands are registered, run `/enshrouded channel` in the text channel you want
 to use. You need **Manage Server** or **Administrator**. Grant the bot **View Channel**,
@@ -401,6 +404,12 @@ starting, query-responsive, stopping, offline, or readiness unknown. A running E
 instance alone does not qualify for green. Updates normally occur on the next one-minute
 check; Discord rate limits can delay renames, and the worker retries after the cooldown.
 It does not post on every poll or ping channel members.
+
+When `/enshrouded start` starts a stopped instance, the bot also posts
+`🚀 Server start requested by @person.` in that Discord server's configured status
+channel. The handle identifies the requester without pinging them. Requests made while
+the instance is already running or starting do not produce another starter announcement.
+If the announcement cannot be delivered, the server still starts normally.
 
 Command registration is still an explicit operator step and bulk-overwrites the current
 command set. After deploying this change, from the repo root in PowerShell:

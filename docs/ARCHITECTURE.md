@@ -197,6 +197,11 @@ EventBridge (1 min) ──> idle-shutdown λ ──SSM RunCommand──> box
 
 ### 3.1 Flow A — `/enshrouded start` → playable
 
+**Help:** `/enshrouded help` returns an inline private response (`type: 4`, `flags: 64`)
+after signature verification, without AWS calls or deferred work. It lists `start`,
+`status`, `channel`, and `help`, channel permissions, green/red status meanings, and the
+configured 10-minute idle threshold and 15-minute startup grace period.
+
 1. A user runs `/enshrouded start` in Discord. Discord POSTs the interaction to the HTTP API
    Gateway route `/interactions`.
 2. `discord-bot` Lambda verifies the Ed25519 signature over
@@ -219,6 +224,17 @@ EventBridge (1 min) ──> idle-shutdown λ ──SSM RunCommand──> box
 5. The async invocation checks instance state. If already `running`, it jumps to step 9. If
    `stopping`, it replies "shutting down, try again in a minute" and exits (do not race a
    drain). Otherwise it sets `run-state=starting` and calls `ec2:StartInstances`.
+
+   **Starter announcement — requested behavior:** only a start response containing our
+   instance ID with `PreviousState=stopped` and `CurrentState=pending` triggers a one-off
+   announcement in the invoking guild's configured WP-14 status channel. Take the starter's
+   user ID and guild ID from the signed interaction; render the user as `<@userId>` with
+   `allowed_mentions: { parse: [] }` to avoid a ping. Skip absent configuration, and GET
+   the channel to verify its guild and ordinary text-channel type before posting. Honor
+   the existing global bot-API cooldown and persist a global 429 deadline if returned.
+   Notification and reply-edit failures must be isolated from each other and from a
+   successful start. This is best-effort attribution, not a readiness announcement:
+   no durable starter parameter, queued retry, or periodic reconciler change is added.
 6. It PATCHes the original reply: *"Booting the world — about 3 minutes. I'll edit this
    message when it's ready."*
 7. **Readiness gate 1:** poll `ec2:DescribeInstances` until `running`, then
