@@ -348,9 +348,42 @@ the retained data volume so this is a one-time cost, but WP-07 should record bot
        this boot. **If a player connected and `savegame/` is still empty after a clean
        stop, that is a FAIL.** If no player ever connected, passing is correct.
 
-       **WP-07 can retire this whole branch:** does a clean shutdown of a never-saved world
-       write a file? If it always does, the empty/empty row can never legitimately occur
-       and the rule tightens to "a file must appear, always". Added as WP-07 (g5).
+       **CORRECTED AGAIN 2026-10-19 — the "newer than `t0`" test is wrong, and the
+       measurement that broke it also makes the gate safer.** **VERIFIED:** `world0.ksd`
+       (87,760 B) is written **on player disconnect**, not only at shutdown — the log shows
+       `[save2] Server sent final client save` / `Received final savegame ack`. So a save
+       appears for reasons other than our stop.
+
+       Why that breaks the rule: the drain only runs after **10 minutes of zero players**,
+       so by then the last player's state was already flushed at *their* disconnect. A
+       clean shutdown may legitimately write **nothing**, because nothing has changed. The
+       "a file must be newer than `t0`" test would then fail a perfectly good stop — the
+       wedge again, now on the *normal* path rather than an edge case.
+
+       **The question the gate should ask is not "did a save happen during our stop?" but
+       "is the on-disk save at least as new as the last thing that could have changed the
+       world?"** We already hold that timestamp: `last-active`, the parameter whose
+       10-minute staleness triggered the drain.
+
+       | condition | verdict |
+       | --- | --- |
+       | a `savegame/` file has mtime > `t0` | **PASS** — a shutdown save was written |
+       | newest `savegame/` mtime ≥ `last-active` | **PASS** — nothing could be unflushed; the disconnect save already covered it |
+       | `savegame/` non-empty but newest mtime < `last-active` | **FAIL** — a player was present *after* the last save and nothing flushed. This is the real data-loss signature and the case the gate exists for. |
+       | `savegame/` empty, and no player connected this boot | **PASS**, `SaveSkippedEmptyWorld` metric |
+       | `savegame/` empty, and a player *did* connect this boot | **FAIL** |
+
+       Use **file mtimes and the SSM parameter**, both wall-clock. **Never a log
+       timestamp** — those are uptime-relative (§5.6).
+
+       **WP-07 (g5) — partly answered, and the branch stays.** A never-saved world *did*
+       get a file, but at **disconnect**, not at stop. So the empty→empty branch remains
+       reachable: a session nobody joins never disconnects anyone and so never saves.
+       **But that branch is now VERIFIED safe rather than assumed safe** — we know saves
+       fire on disconnect, and in that branch there were no disconnects because there were
+       no connections. The "no player connected this boot" condition I attached as a
+       hedge turns out to be exactly the right discriminator. Keep it; it is no longer
+       fail-open reasoning.
     c. The unit's exit status does **not** indicate a truncated stop. Read
        `systemctl show enshrouded -p Result -p ExecMainCode -p ExecMainStatus` and fail
        **only** on the two signatures that unambiguously mean the save was cut short:
@@ -914,10 +947,11 @@ player count** — better than all three existing mechanisms, immune to transpor
 and requiring no protocol parsing. The observed `ss` output already shows the game holding
 `fd=98` on the query socket, so fds are at least enumerable.
 
-**ASSUMED — and quite likely false:** the Steamworks networking SDK typically multiplexes
-all peers over a single socket, in which case neither number moves on join. **Cost to find
-out is one command with one player connected**, so WP-07 should check it before settling
-for a heuristic. Added as WP-07 (d3). A cheap long shot with a large payoff.
+**DEAD — measured 2026-10-19.** fd count was **113 with one player and 113 with none**;
+all sockets `UNCONN`. The Steamworks SDK multiplexes all peers over a single socket, as
+suspected. The UDP *socket* count did move 3→2, but on one sample per state that is not
+something to build on. The check cost one command and is now closed — which is the point:
+a cheap long shot is worth taking precisely because it resolves quickly either way.
 
 Rejected while here: querying the **Steam Web API** for the server's player count by its
 `SteamId`. It would work, but it adds an external dependency, an API key to store and a
@@ -944,27 +978,116 @@ The architecture must survive every outcome of the spike, not just the happy one
 table is the contract: WP-07 reports, and the owning engineer applies the matching row
 without re-opening the design.
 
-##### Re-ruled 2026-10-19, now that the transport is known
+##### FINAL RULING — measured 2026-10-19, one player joining and leaving
 
-WP-07 question (b) is **answered**: game traffic is Steam P2P / relay, only 15637 is bound
-(§5.3). Applying the table below, we land on **row (b) — but not the row's consequence**,
-because the row was written assuming "traffic does not transit the instance's UDP ports"
-implied M2 was dead. It does not: M2 is system-wide, not port-scoped, so it is **not
-deleted**. The corrected ruling for the transport we actually have:
+WP-07 questions (a), (b), (c), (d) and (d3) are all answered. §5.6 resolves to the **best
+case**: an exact primary with three independent corroborators.
 
-| | mechanism | status |
+| Signal | 1 player | 0 players | Ratio | Verdict |
+| --- | --- | --- | --- | --- |
+| **S1 — A2S `players` byte** | **1** | **0** | exact | **PRIMARY.** Exact both directions. |
+| **S2 — `m#N` rows in the Session block** | present | absent | exact | **Exact cross-check.** On-box, no network. A *count*, not just presence. |
+| **S3 — UDP datagrams/sec** | ~211 | **0.55** | **~380×** | **Strongest heuristic.** Promote above CPU — see below. |
+| **S4 — cgroup CPU rate** | 1.36 cores | 0.283 cores | 4.8× | Weakest usable signal. Tiebreaker only. |
+| ~~fd count~~ | 113 | 113 | — | **DELETED.** M4 is dead, as suspected (§5.4a). |
+| ~~memory / RSS~~ | ~912 MB | ~925 MB | — | **DELETED.** Does not separate, and was *higher* with nobody on. The ~100 MB-per-player heuristic from research is **refuted on this workload** — §5.4's RSS half is withdrawn. |
+
+**The feared idle floor did not materialise.** §5.3 warned the standing Steam connection
+and relay keepalives would raise M2's floor and wreck separation. Measured idle:
+**0.55 datagrams/sec**, giving the cleanest ratio in the whole set. The concern was worth
+recording and the outcome is better than expected — worth saying plainly, since the
+opposite result would have been recorded just as prominently.
+
+**One correction to the proposed ranking: UDP rate outranks CPU rate, and not just on the
+ratio.** CPU has a specific failure mode UDP does not — **an AFK player**. Someone standing
+still generates little simulation load, so CPU could fall back toward the 0.283 idle
+figure, while their client keeps sending position and keepalive traffic at tick rate, so
+UDP holds up. An AFK player is precisely the case where stopping the server is most
+wrong — they are connected and coming back. So CPU must never be the deciding signal for
+*idleness*; it may only ever push toward ACTIVE.
+
+**M3 splits in half, as observed.** Any M3 implementation uses **CPU rate only** and
+ignores memory entirely. §5.4's RSS reasoning is superseded.
+
+##### Thresholds, and the honesty about them
+
+| Constant | Value | Derivation |
 | --- | --- | --- |
-| **primary** | **M3 — cgroup-wide process activity** | The transport-independent one, and §5.4's cgroup form is now clearly primary rather than a hedge (see §5.4's PID finding). |
-| **secondary** | **M2 — system-wide UDP datagram rate** | Alive. Separation may be worse than estimated because of Steam keepalives; WP-07 (c) measures it. |
-| **corroborating** | **M1 — A2S on 15637** | 15637 *is* bound, so the probe can run. Whether its `players` byte reflects P2P-connected players is **still unverified** — that was question (a), which remains open. |
+| `UDP_RATE_THRESHOLD` | **10 datagrams/sec** | Geometric mean of (0.55, 211) ≈ 10.8. Sits ~18× above idle and ~20× below one player — very comfortable. |
+| `CPU_RATE_THRESHOLD` | **0.6 cores** | Geometric mean of (0.283, 1.36) ≈ 0.62. Only ~2.1× above idle — **tight**, which is the second reason CPU is a tiebreaker rather than a decider. |
 
-Disagreement still resolves toward ACTIVE, and §3.2 step 6's rule is unchanged in shape.
+**These come from n=1.** One player, one sample per state, and two-or-more players is
+untested. They are starting values, not settled constants. §5.5 already requires the raw
+`players`, `udpRate` and `cpuRate` values to be emitted as CloudWatch metrics on every
+check — that is what makes retuning possible from a month of real data rather than another
+guess. Revisit after the first few real sessions.
 
-**Phase 3 is unblocked on the transport question.** It remains blocked on question (a) —
-whether A2S reports a live player count — and on (c)/(d) calibration, which is what
-decides whether M3 or M2 carries the primary role in practice.
+##### The classification rule — concrete, for WP-10
 
-| WP-07 finding | Authoritative mechanism | Secondary | Consequence |
+This replaces §3.2 step 6's mechanism-agnostic placeholder. The asymmetry is deliberate
+and is the whole design: **ACTIVE needs only one signal; IDLE needs an exact signal to
+affirmatively say zero AND every heuristic to agree.**
+
+```
+probe returns: a2sOk, players, logOk, mCount, udpRate, cpuRate
+
+ACTIVE  if  (a2sOk and players > 0)
+         or (logOk and mCount > 0)
+         or udpRate >= UDP_RATE_THRESHOLD
+         or cpuRate >= CPU_RATE_THRESHOLD
+
+IDLE    if  at least one EXACT signal affirmatively reports zero
+                 — (a2sOk and players == 0) or (logOk and mCount == 0) —
+        and udpRate <  UDP_RATE_THRESHOLD
+        and cpuRate <  CPU_RATE_THRESHOLD
+
+INDETERMINATE  otherwise  — i.e. no exact signal could confirm "zero",
+                            and no heuristic claimed ACTIVE
+SSM command failed / timed out  ->  INDETERMINATE
+```
+
+Three properties worth stating, because they are the reasons it is shaped this way:
+
+1. **IDLE requires an *exact* signal.** S3 and S4 are heuristics; they may push toward
+   ACTIVE but may never, alone, justify stopping a server. Only A2S or the `m#N` count can
+   assert emptiness.
+2. **The exact tier is redundant.** Either S1 or S2 suffices, so a broken A2S probe does
+   not wedge the system as long as the log parses, and vice versa. That redundancy is why
+   INDETERMINATE should be genuinely rare.
+3. **INDETERMINATE keeps the box up** (§5.5) and emits a metric. If A2S *and* the log both
+   break permanently we would never auto-stop — which is what the **max-uptime cap** and
+   the budget alarm exist for. Cost is bounded; a kicked player is not.
+
+Disagreement always resolves toward ACTIVE, and every disagreement emits a metric.
+
+##### Implementation constraints for WP-08 / WP-10 — from the measurements
+
+- **A2S requires the challenge handshake**, now confirmed in practice: a bare `A2S_INFO`
+  returns `A` plus a 4-byte challenge **which changes per request**, and the request must
+  be re-sent with it appended. An implementation that skips this sees "no response" and
+  concludes the server is empty — the dangerous direction. Unit-test both legs.
+- **`A2S_PLAYER` returns the count but with empty player names.** It cannot identify *who*
+  is on, so there is no identity-based mechanism available and §5.7's hope for one is
+  closed. Use `A2S_INFO` and ignore `A2S_PLAYER`.
+- **Game-log timestamps are NOT wall-clock** — they read ~00:23 while the box clock read
+  14:41, apparently uptime-relative. **Nothing may compare a log timestamp to `date`.**
+  Consequences: parse the **last** Session block by file position (`tail`), never by
+  timestamp; and never use log timestamps for save-recency or last-active logic — file
+  mtimes and the SSM parameter are wall-clock and are the only valid sources.
+- **S2 lags up to ~30 s** (Session blocks print every 30 s) and has a **~2 s transient at
+  join** where `Added peer` has fired but the `m#N` row has not appeared, logging
+  `Unable to find machine for peer`. Both are harmless against a **10-minute** idle
+  threshold, and S1 catches a joining player immediately. Do not add complexity for them.
+- The leave sequence is unambiguous: `[server] Remove Player '<name>'`, with the `m#N` row
+  gone within ~30 s.
+
+##### Still untested — do not assume
+
+**Two or more players**, and **A2S accuracy mid-join**. Both are low-risk given exactness
+at 0 and 1, but the thresholds above are calibrated on a single player and should be
+re-checked at the first multi-player session.
+
+| WP-07 finding | Authoritative mechanism | Secondary | Consequence || WP-07 finding | Authoritative mechanism | Secondary | Consequence |
 | --- | --- | --- | --- |
 | (a) A2S answers with a live, accurate `players` | **M1** | M2 + M3 as corroboration; disagreement → ACTIVE | The design as written. Best case. |
 | (b) Player traffic does **not** transit the instance's UDP ports (Steam relay is real) | **M3** | log scraping if lines exist | ~~M2 is deleted~~ **— SUPERSEDED. This row's consequence was wrong**: it assumed "not on our port" meant "not on our NIC". M2 reads a system-wide counter, so relayed traffic still counts. M2 is **demoted to secondary, not deleted**. See the re-ruling above. |
@@ -2882,11 +3005,10 @@ account.
   separately — they are expected to differ substantially (§3.1).
 - **(j) Save-file churn.** Does an idle server with no players stop rewriting the save
   across two autosave cycles? (Qualifies the §5.4 reserve mechanism.)
-- **(d3) Does the game hold a socket or fd per connected peer? (§5.4a)** With one player
-  connected, compare `ls /proc/$pid/fd | wc -l` and `ss -u -a -p | grep -c "pid=$pid"`
-  against the idle baseline. If either moves by a fixed amount per player this is an exact
-  player count and supersedes M1/M2/M3. Likely false (Steamworks usually multiplexes), but
-  it is one command and the payoff is large.
+- **(d3) — ANSWERED, negative.** fd count 113 vs 113; M4 is dead (§5.4a).
+- **(a) / (c) / (d) — ANSWERED.** A2S is an exact player counter with the challenge
+  handshake; UDP rate separates ~380×; CPU rate 4.8×; RSS does not separate at all. See
+  the final ruling in §5.6, which supersedes the decision table below.
 - **(g5) Does a clean shutdown of a never-saved world write a file?** Start a fresh world,
   connect nobody, stop cleanly inside the autosave window, and check whether `savegame/`
   gains a file. **If it always does, §3.2 step 12b's "empty before, empty after" branch
@@ -2931,6 +3053,14 @@ account.
   may not be — but §6.1.4 chose Ubuntu partly *for* its i386 story, so settle it), and
   whether `STEAM_COMPAT_CLIENT_INSTALL_PATH=/opt/steamcmd` is actually correct.
 
+> **GATE LIFTED 2026-10-19.** WP-07's detection questions (a)(b)(c)(d)(d3) are answered
+> and the ruling is in **§5.6 — FINAL RULING**, which supersedes the decision table above.
+> **WP-08, WP-09 and WP-10 are unblocked** and must implement §5.6's classification rule
+> and §3.2 step 12b's save rule as written, not the earlier placeholders. The remaining
+> WP-07 items — multi-player calibration, Proton/Ubuntu checks, config-schema diff (f2) —
+> are no longer blocking.
+>
+> Original gate text, retained for the record:
 > **Gate:** WP-09 and WP-10 must not start before WP-07 reports. On delivery, apply the
 > matching row of the **§5.6 decision table** — including, if questions (a)–(d) all come
 > back negative, the explicit session-lease fallback of last resort. The gate exists so
@@ -2940,9 +3070,9 @@ account.
 
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
-| **WP-08** | A2S client module: build request, handle `S2C_CHALLENGE` retry, parse `S2A_INFO_SRC`, time out cleanly. Plus the on-box probe script (Python 3, stdlib only) emitting one JSON line for M1+M2+M3. | `lib/enshrouded/lambda/shared/a2s.js`, `scripts/probe-players.py`, `test/a2s.test.ts` | WP-07 (fixtures) | Unit tests pass against captured fixture bytes, including the challenge path and a truncated/garbage response. Probe script prints valid JSON in <15 s and never throws. | R |
+| **WP-08** | A2S client module: build request, handle `S2C_CHALLENGE` retry, parse `S2A_INFO_SRC`, time out cleanly. Plus the on-box probe script (Python 3, stdlib only) emitting one JSON line with **`a2sOk, players, logOk, mCount, udpRate, cpuRate`** — the exact field set §5.6's classification rule consumes. **Parse the last Session block by file position (`tail`), never by timestamp — game-log timestamps are uptime-relative, not wall-clock (§5.6).** Ignore `A2S_PLAYER` (names come back empty) and ignore RSS (does not separate). | `lib/enshrouded/lambda/shared/a2s.js`, `scripts/probe-players.py`, `test/a2s.test.ts` | WP-07 — **unblocked, §5.6 final ruling** | Unit tests pass against captured fixture bytes, including the challenge path and a truncated/garbage response. Probe script prints valid JSON in <15 s and never throws. | R |
 | **WP-09** | `graceful-stop` Lambda + `drain-and-save.sh`: re-check, `systemctl stop`, the three-part save verification (`is-active`, savegame mtime, `systemctl show -p Result` not `timeout`/137), S3 sync, **then** `StopInstances`; failure path sets maintenance mode and alarms. Invocable by both `idle-shutdown` and the Discord `/stop`. | `lib/enshrouded/graceful-stop.ts`, `lambda/graceful-stop/index.js`, `scripts/drain-and-save.sh`, `test/graceful-stop-handler.test.ts` | WP-05, WP-07, WP-08 | Unit test: with the SSM verification step mocked to fail, `StopInstances` is **never** called and maintenance mode is set. Live test: a drain against the real box produces a fresh `savegame/` mtime and an S3 object. | **A** — invariant 6. |
-| **WP-10** | `idle-shutdown` Lambda: maintenance gate, not-running reset, 15-minute `LaunchTime` grace, probe, the §3.2-step-6 classification **wired to whichever mechanisms WP-07 validated (§5.6)**, INDETERMINATE = stay up, max-uptime cap, CloudWatch metrics. 1-minute EventBridge rule, **10-minute idle threshold**. | `lib/enshrouded/idle-shutdown.ts`, `lambda/idle-shutdown/index.js`, `test/idle-shutdown-handler.test.ts` | WP-07 (decision table), WP-09 | Unit tests cover each branch, explicitly including: stale-timestamp-after-fast-restart does not stop the box; a failed SSM command does not stop the box; a secondary mechanism reporting activity overrides a primary reporting zero. The mechanisms enabled in code match the §5.6 row WP-07 selected — no mechanism WP-07 refuted is left wired in. | **A** — port the reference's race fixes faithfully; they were hard-won. |
+| **WP-10** | `idle-shutdown` Lambda: maintenance gate, not-running reset, 15-minute `LaunchTime` grace, probe, **the §5.6 classification rule verbatim** (ACTIVE on any one signal; IDLE only when an *exact* signal affirmatively reports zero AND both heuristics are below threshold; otherwise INDETERMINATE), with `UDP_RATE_THRESHOLD=10` and `CPU_RATE_THRESHOLD=0.6`, INDETERMINATE = stay up, max-uptime cap, CloudWatch metrics. 1-minute EventBridge rule, **10-minute idle threshold**. | `lib/enshrouded/idle-shutdown.ts`, `lambda/idle-shutdown/index.js`, `test/idle-shutdown-handler.test.ts` | WP-07 — **answered**; WP-09 | Unit tests cover each branch, explicitly including: stale-timestamp-after-fast-restart does not stop the box; a failed SSM command does not stop the box; a secondary mechanism reporting activity overrides a primary reporting zero. **No refuted mechanism is wired in** — no RSS/memory signal and no fd/socket signal anywhere. A unit test asserts CPU rate alone can never produce IDLE, and that INDETERMINATE never stops the instance. Raw `players`/`udpRate`/`cpuRate` are emitted as CloudWatch metrics on every check so the n=1 thresholds can be retuned from real data (§5.6). | **A** — port the reference's race fixes faithfully; they were hard-won. |
 
 ### Phase 4 — Discord
 

@@ -9,3 +9,4 @@ infrastructure/**/*.d.ts
 !infrastructure/scripts/*.js
 !infrastructure/lib/enshrouded/lambda/**/*.d.ts
 coverage/
+__pycache__/
