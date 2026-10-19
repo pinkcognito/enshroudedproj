@@ -4,12 +4,16 @@ import { EnshroudedServer } from './enshrouded/server';
 import { WorldStorage } from './enshrouded/world-storage';
 import { DiscordBot } from './enshrouded/discord-bot';
 import { GameDeploy } from './enshrouded/game-deploy';
+import { GracefulStop } from './enshrouded/graceful-stop';
+import { IdleShutdown } from './enshrouded/idle-shutdown';
 
 export class EnshroudedServerStack extends cdk.Stack {
   public readonly server: EnshroudedServer;
   public readonly worldStorage: WorldStorage;
   public readonly discordBot: DiscordBot;
   public readonly gameDeploy: GameDeploy;
+  public readonly gracefulStop: GracefulStop;
+  public readonly idleShutdown: IdleShutdown;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -29,6 +33,12 @@ export class EnshroudedServerStack extends cdk.Stack {
       bucket: this.worldStorage.bucket,
       // Existing account-level GitHub OIDC provider, by ARN (env var or `-c githubOidcProviderArn=...`).
       githubOidcProviderArn: process.env.GITHUB_OIDC_PROVIDER_ARN ?? this.node.tryGetContext('githubOidcProviderArn'),
+    });
+    // The ONLY path to ec2:StopInstances. idle-shutdown holds no stop permission; it invokes this.
+    this.gracefulStop = new GracefulStop(this, 'GracefulStop', { instance: this.server.instance });
+    this.idleShutdown = new IdleShutdown(this, 'IdleShutdown', {
+      instance: this.server.instance,
+      stopFunction: this.gracefulStop.stopFunction,
     });
   }
 }
