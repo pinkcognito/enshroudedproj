@@ -278,7 +278,45 @@ the retained data volume so this is a one-time cost, but WP-07 should record bot
    inherits a stale timestamp — potentially hours old from stack-deploy time — and the very
    first check after boot concludes "idle for hours" and stops the box before anyone can
    join.)*
-4. **Gate: launch grace.** Compute minutes since `instance.LaunchTime`. If less than
+4. **Gate: launch grace — PROBE, then return without stopping (corrected 2026-10-19).**
+   The grace branch must run the probe and write `last-player-seen` on an exact detection,
+   **then** return without evaluating the idle clock. It must **not** return before
+   probing.
+
+   **Why: "cannot stop yet" and "cannot observe yet" are separable, and only the first was
+   ever intended.** Demonstrated live — instance launched 17:21:33, a real player connected
+   ~17:30, chopped a tree and disconnected; idle-shutdown logged only
+   `within grace - not stopping` and `last-player-seen` stayed **empty**, despite the game
+   log confirming the session and `world0.ksd` growing 43,376 → 134,682 bytes.
+
+   **This is a correctness hole, not a missing datapoint, and my earlier reasoning was
+   incomplete.** I argued that a false "no player seen" was unreachable because a
+   disconnect always writes a save, so `savegame/` would be non-empty and we would land on
+   rows 1–3 rather than the empty-world rows. That part is correct. **What it failed to
+   follow through is what rows 2/3 do when their own input is missing**: the player plays
+   within grace, the disconnect-save *fails* (the disk-full / permissions case rows 2–3
+   exist to catch), the shutdown-save writes nothing, `savegame/` is non-empty from an
+   earlier boot, and `last-player-seen` is absent — so row 2 takes the absent-parameter
+   fallback and **PASSes silently**. The grace gap converts the exact scenario the gate
+   exists for into a silent success.
+
+   **And "narrow" understates the exposure.** A 15-minute grace window on a server people
+   join immediately after `/enshrouded start` overlaps almost perfectly with when sessions
+   actually begin — the observed session started 9 minutes after boot. The *save failure*
+   is rare; the *grace overlap* is close to the common case, so the gate was effectively
+   disabled during the most likely session-start window.
+
+   Cost of the fix is ~15 extra SSM probes per boot. Negligible, and it makes the FACT
+   complete for the whole time the instance is running rather than starting 15 minutes
+   late.
+
+   **Two things that must NOT change in that branch:** it still writes `last-active = now`
+   **unconditionally** (CONTROL, §6.6.0 — that write *is* the race fix; narrowing it to
+   "only on ACTIVE" would reintroduce the race), and it still must **not** evaluate
+   `now - last-active >= IDLE_MINUTES`.
+
+   Original gate text:
+   **Gate: launch grace.** Compute minutes since `instance.LaunchTime`. If less than
    `LAUNCH_GRACE_MINUTES` (15 — must exceed worst-case boot + world load *and* the
    10-minute idle threshold, so a fresh boot can never be stopped by an inherited clock),
    reset last-active and return. *(Reference-verified
@@ -456,6 +494,41 @@ So the fact we need is recorded explicitly. **Simplified in the fourth revision:
        detection power (the signature being caught is "played for ages, nothing ever
        saved", a gap of many minutes) and removes a whole class of clock-skew false
        positives.
+
+       **What rows 2/3 do when `last-player-seen` is ABSENT — the remaining fail-open, and
+       how it closes.** Even with the grace fix (§3.2 step 4), the parameter can still be
+       missing: the very first drain after a fresh stack, a deleted parameter, or a boot
+       where every probe returned INDETERMINATE so no exact signal ever fired. The current
+       behaviour — *absent → treat as covered → PASS* — is fail-open on the one check that
+       catches silent loss.
+
+       **Do not flip it to FAIL.** The first drain after a fresh stack would then wedge,
+       which is the pattern this document has already hit three times.
+
+       **Close it with evidence instead: the game log.** §5.6 established that the log
+       carries unambiguous `[server] Remove Player '<name>'` lines and `m#N` rows, and that
+       the log survives for the whole life of the process (it is deleted only on launch).
+       So at drain time `graceful-stop` — which already runs a script on the box — can ask
+       retrospectively **"was any player ever present this boot?"** That signal **cannot be
+       missed by a probe that did not run**, which is exactly the weakness that produced
+       this bug.
+
+       | `last-player-seen` | log shows a player this boot? | verdict |
+       | --- | --- | --- |
+       | present | — | use rows 1–3 as written |
+       | absent | **no** | **PASS** — nothing was lost because nobody played |
+       | absent | **yes**, and no save is newer than `LaunchTime` | **FAIL** — a session happened and nothing was written all boot |
+       | absent | log unreadable | **PASS**, and emit **`SaveVerificationUnverifiable`** |
+
+       **The log and `last-player-seen` are complementary, not redundant, and the reason is
+       §5.6's timestamp rule.** The log can say *whether* a player was present but not
+       *when* in wall-clock terms — its timestamps are uptime-relative and may never be
+       compared to wall-clock. `last-player-seen` supplies the wall-clock instant that rows
+       2/3's mtime comparison needs. Each covers the other's blind spot.
+
+       **The principle, which generalises past this row:** when the gate cannot evaluate
+       its evidence it must not pretend it did. PASS, so as not to wedge — but say so, with
+       a distinct metric, so a silent fail-open becomes a visible one. Alarm if it recurs.
 
        **Rows 2/3 are NOT dropped (option (c) rejected), and this is the important
        judgement.** The tempting move is to delete the check that has now produced two
@@ -2278,6 +2351,19 @@ boundary** — each one maps to exactly one answer to "who is allowed to see thi
 | `/enshroudedproj/state/run-state` | String | `starting`/`stopping`/**`none`** — **not empty**: SSM rejects an empty `Value`, so the idle value is the literal string `none`. WP-10 treats only `stopping` as meaningful, so the two are compatible. |
 | `/enshroudedproj/state/last-player-seen` | String | **FACT.** Wall-clock epoch ms at which an *exact* signal last reported ≥1 player. Written **only** on `(a2sOk and players>0)` or `(logOk and mCount>0)` — never on a heuristic, never by any other code path. Consumed by §3.2 step 12b. **Supersedes `player-seen-boot`**, which it subsumes: "a player connected this boot" is `lastPlayerSeen >= LaunchTime`. |
 
+> **A FACT must be recordable for the whole time it can change.** `last-player-seen` is
+> only observable while the instance is **running**, which is correct and unavoidable — the
+> not-running reset branch cannot probe a stopped box, and should not try. A player from a
+> previous boot is then correctly invisible, because `lastPlayerSeen < LaunchTime`.
+>
+> **But the window in which the instance *is* running must be covered completely**, and
+> that is precisely what the launch-grace branch was breaking: a 15-minute hole in the
+> middle of the running period where the parameter could not be written (§3.2 step 4).
+> When adding any future early-return to a probe loop, check it does not create another.
+> The question to ask is not "does this branch need to stop the instance?" but **"does
+> this branch need to *observe*?"** — they are different, and conflating them is what
+> caused this.
+
 #### 6.6.0 Every state parameter is a FACT or a CONTROL variable — label it
 
 **This classification exists because the same bug has now occurred three times**
@@ -3217,8 +3303,8 @@ account.
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
 | **WP-08** | A2S client module: build request, handle `S2C_CHALLENGE` retry, parse `S2A_INFO_SRC`, time out cleanly. Plus the on-box probe script (Python 3, stdlib only) emitting one JSON line with **`a2sOk, players, logOk, mCount, udpRate, cpuRate`** — the exact field set §5.6's classification rule consumes. **Parse the last Session block by file position (`tail`), never by timestamp — game-log timestamps are uptime-relative, not wall-clock (§5.6).** Ignore `A2S_PLAYER` (names come back empty) and ignore RSS (does not separate). | `lib/enshrouded/lambda/shared/a2s.js`, `scripts/probe-players.py`, `test/a2s.test.ts` | WP-07 — **unblocked, §5.6 final ruling** | Unit tests pass against captured fixture bytes, including the challenge path and a truncated/garbage response. Probe script prints valid JSON in <15 s and never throws. | R |
-| **WP-09** | `graceful-stop` Lambda + `drain-and-save.sh`: re-check, `systemctl stop`, the three-part save verification (`is-active`, savegame mtime, `systemctl show -p Result` not `timeout`/137), S3 sync, **then** `StopInstances`; failure path sets maintenance mode and alarms. Invocable by both `idle-shutdown` and the Discord `/stop`. | `lib/enshrouded/graceful-stop.ts`, `lambda/graceful-stop/index.js`, `scripts/drain-and-save.sh`, `test/graceful-stop-handler.test.ts` | WP-05, WP-07, WP-08 | Unit test: with the SSM verification step mocked to fail, `StopInstances` is **never** called and maintenance mode is set. Live test: a drain against the real box produces a fresh `savegame/` mtime and an S3 object. | **A** — invariant 6. |
-| **WP-10** | `idle-shutdown` Lambda: maintenance gate, not-running reset, 15-minute `LaunchTime` grace, probe, **the §5.6 classification rule verbatim** (ACTIVE on any one signal; IDLE only when an *exact* signal affirmatively reports zero AND both heuristics are below threshold; otherwise INDETERMINATE), with `UDP_RATE_THRESHOLD=10` and `CPU_RATE_THRESHOLD=0.6`. **Also writes `state/last-player-seen = <now>` whenever an *exact* signal reports a player (never on a heuristic-only ACTIVE) — a FACT parameter per §6.6.0, consumed by §3.2 step 12b rows 2–5**, INDETERMINATE = stay up, max-uptime cap, CloudWatch metrics. 1-minute EventBridge rule, **10-minute idle threshold**. | `lib/enshrouded/idle-shutdown.ts`, `lambda/idle-shutdown/index.js`, `test/idle-shutdown-handler.test.ts` | WP-07 — **answered**; WP-09 | Unit tests cover each branch, explicitly including: stale-timestamp-after-fast-restart does not stop the box; a failed SSM command does not stop the box; a secondary mechanism reporting activity overrides a primary reporting zero. **No refuted mechanism is wired in** — no RSS/memory signal and no fd/socket signal anywhere. A unit test asserts CPU rate alone can never produce IDLE, and that INDETERMINATE never stops the instance. Raw `players`/`udpRate`/`cpuRate` are emitted as CloudWatch metrics on every check so the n=1 thresholds can be retuned from real data (§5.6). | **A** — port the reference's race fixes faithfully; they were hard-won. |
+| **WP-09** | `graceful-stop` Lambda + `drain-and-save.sh`: re-check, `systemctl stop`, the save verification per §3.2 step 12b **including the log-based fallback when `last-player-seen` is absent** and the `SaveVerificationUnverifiable` metric (`is-active`, savegame mtime, `systemctl show -p Result` not `timeout`/137), S3 sync, **then** `StopInstances`; failure path sets maintenance mode and alarms. Invocable by both `idle-shutdown` and the Discord `/stop`. | `lib/enshrouded/graceful-stop.ts`, `lambda/graceful-stop/index.js`, `scripts/drain-and-save.sh`, `test/graceful-stop-handler.test.ts` | WP-05, WP-07, WP-08 | Unit test: with the SSM verification step mocked to fail, `StopInstances` is **never** called and maintenance mode is set. Live test: a drain against the real box produces a fresh `savegame/` mtime and an S3 object. | **A** — invariant 6. |
+| **WP-10** | `idle-shutdown` Lambda: maintenance gate, not-running reset, 15-minute `LaunchTime` grace that **probes before returning** (§3.2 step 4 — it may not stop, but it must still observe and write `last-player-seen`), probe, **the §5.6 classification rule verbatim** (ACTIVE on any one signal; IDLE only when an *exact* signal affirmatively reports zero AND both heuristics are below threshold; otherwise INDETERMINATE), with `UDP_RATE_THRESHOLD=10` and `CPU_RATE_THRESHOLD=0.6`. **Also writes `state/last-player-seen = <now>` whenever an *exact* signal reports a player (never on a heuristic-only ACTIVE) — a FACT parameter per §6.6.0, consumed by §3.2 step 12b rows 2–5**, INDETERMINATE = stay up, max-uptime cap, CloudWatch metrics. 1-minute EventBridge rule, **10-minute idle threshold**. | `lib/enshrouded/idle-shutdown.ts`, `lambda/idle-shutdown/index.js`, `test/idle-shutdown-handler.test.ts` | WP-07 — **answered**; WP-09 | Unit tests cover each branch, explicitly including: stale-timestamp-after-fast-restart does not stop the box; a failed SSM command does not stop the box; a secondary mechanism reporting activity overrides a primary reporting zero. **No refuted mechanism is wired in** — no RSS/memory signal and no fd/socket signal anywhere. A unit test asserts CPU rate alone can never produce IDLE, and that INDETERMINATE never stops the instance. Raw `players`/`udpRate`/`cpuRate` are emitted as CloudWatch metrics on every check so the n=1 thresholds can be retuned from real data (§5.6). | **A** — port the reference's race fixes faithfully; they were hard-won. |
 
 ### Phase 4 — Discord
 

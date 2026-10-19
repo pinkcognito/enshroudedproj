@@ -272,15 +272,16 @@ exports.handler = async () => {
     return { action: 'not-running' };
   }
 
-  // Gate 3: LaunchTime grace (must exceed the idle threshold).
+  // Gate 3: LaunchTime grace (must exceed the idle threshold). Grace means "cannot STOP yet"; it must
+  // never mean "cannot OBSERVE yet". Players join right after /enshrouded start, so the grace window
+  // overlaps almost exactly with when sessions begin: returning before the probe left last-player-seen
+  // unwritten for a real session that happened entirely inside grace (observed live), disabling the
+  // save-verification gate's input. So grace probes and records the FACT, and differs from the
+  // post-grace path ONLY in that it returns before the idle decision (ARCHITECTURE 3.2 step 4).
   const launchMs = new Date(instance.LaunchTime).getTime();
   const minutesSinceLaunch = (now - launchMs) / 60000;
-  if (!(minutesSinceLaunch >= c.graceMinutes)) {
-    // `!(x >= y)` also catches a missing/invalid LaunchTime (NaN): fail toward staying up.
-    await putParam(c.lastActiveParam, now);
-    console.log(`Instance booted ${minutesSinceLaunch.toFixed(1)} min ago, within grace - not stopping.`);
-    return { action: 'launch-grace' };
-  }
+  // `!(x >= y)` also catches a missing/invalid LaunchTime (NaN): fail toward staying up.
+  const inGrace = !(minutesSinceLaunch >= c.graceMinutes);
 
   // Measure + classify (5.6).
   const probe = await runProbe(c);
@@ -297,6 +298,15 @@ exports.handler = async () => {
     DetectionIndeterminate: classification === INDETERMINATE ? 1 : 0,
     SignalDisagreement: hasDisagreement(probe, classification) ? 1 : 0,
   });
+
+  if (inGrace) {
+    // last-active is a CONTROL variable (6.6.0): this write is UNCONDITIONAL, not "only when ACTIVE".
+    // It is the race fix that stops a fresh boot inheriting a stale clock. Do not narrow it. And do
+    // NOT evaluate the idle clock or call graceful-stop from here: "cannot stop yet" is unchanged.
+    await putParam(c.lastActiveParam, now);
+    console.log(`Instance booted ${minutesSinceLaunch.toFixed(1)} min ago, within grace - probed, not stopping.`);
+    return { action: 'launch-grace', classification };
+  }
 
   // Max-uptime cap (5.5): a cost backstop on NON-ACTIVE uptime. It is the one deliberate
   // exception to "INDETERMINATE keeps the box up", bounded to boxes up > MAX_UPTIME_HOURS.

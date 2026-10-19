@@ -894,6 +894,27 @@ snapshot() {
     END { printf "%d %s\n", n, (n ? newest : 0) }'
 }
 
+# "Was any player present in the CURRENT boot's log?" - yes | no | unreadable. Retrospective evidence for the
+# absent-last-player-seen case (ARCHITECTURE 3.2 step 12b). The log carries SEVERAL Session blocks (see
+# probe-players.py newest_session_block), so only the NEWEST block - located by file POSITION, never by
+# timestamp - is searched; an older block's leave line must not read as "a player this boot". No Session
+# marker, or any read error, is "unreadable": an unparseable log must never claim nobody played. Only the
+# PRESENCE of a leave line or an m#N (N>=1) row is tested; log timestamps are never read or compared.
+# SESSION_MARKER must stay identical to probe-players.py (a test asserts it).
+log_player() {
+  local log=/srv/enshrouded/logs/enshrouded_server.log
+  local marker='-------------- Session ----------------'
+  local ln block rc
+  [ -r "$log" ] || { echo unreadable; return; }
+  ln="$(grep -n -F -- "$marker" "$log" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+  [ -n "$ln" ] || { echo unreadable; return; }
+  block="$(tail -n +"$ln" "$log" 2>/dev/null)" || { echo unreadable; return; }
+  printf '%s\n' "$block" | grep -Eq "\[server\] Remove Player|(^|[^[:alnum:]_#])m#[1-9][0-9]*([^0-9]|\$)"
+  rc=$?
+  # grep exits 0 on a match, 1 on "no match", 2 on an error.
+  case "$rc" in 0) echo yes ;; 1) echo no ;; *) echo unreadable ;; esac
+}
+
 mode="${1:-}"
 case "$mode" in
   stop)
@@ -920,6 +941,7 @@ case "$mode" in
     echo "DRAIN_EXEC_MAIN_CODE=$exec_code"
     echo "DRAIN_EXEC_MAIN_STATUS=$exec_status"
     echo "DRAIN_GAME_PIDS=$game_pids"
+    echo "DRAIN_LOG_PLAYER=$(log_player)"
     echo "DRAIN_DONE=1"
     exit 0
     ;;

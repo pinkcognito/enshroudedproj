@@ -62,6 +62,9 @@ function parseDrainFacts(stdout) {
     execMainCode: kv.EXEC_MAIN_CODE,
     execMainStatus: kv.EXEC_MAIN_STATUS,
     gamePids: num(kv.GAME_PIDS),
+    // "Was any player ever present this boot?" from the game log: yes | no | unreadable. Anything else
+    // (including a script that predates the field) is "unreadable": never coerced to "no".
+    logPlayer: ['yes', 'no'].includes(kv.LOG_PLAYER) ? kv.LOG_PLAYER : 'unreadable',
   };
 }
 
@@ -84,20 +87,34 @@ function isTruncatedStop(result, execMainCode, execMainStatus) {
  * The save-verification verdict. Inputs:
  *   facts   from parseDrainFacts
  *   ctx     { lastPlayerSeenMs, launchTimeMs }  (SSM FACT parameter + instance LaunchTime, epoch ms)
- * Returns { pass, reasons: string[], skippedEmptyWorld: boolean, saveCheck: string }.
+ * The game-log signal (facts.logPlayer: yes | no | unreadable) is used ONLY when last-player-seen is
+ * ABSENT (ARCHITECTURE 3.2 step 12b): the log can say WHETHER a player was present this boot but never
+ * WHEN (its timestamps are uptime-relative), so it supplements last-player-seen and never replaces it.
+ * Pure: no I/O.
+ * Returns { pass, reasons: string[], skippedEmptyWorld: boolean, unverifiable: boolean, saveCheck: string }.
+ * `unverifiable` = the verdict PASSed only because the gate could not evaluate its evidence (parameter
+ * absent AND log unreadable): the caller emits SaveVerificationUnverifiable so the fail-open is visible.
  * Any missing or unparseable input is a FAIL: when in doubt, do not stop.
  */
 function evaluateSave(facts, ctx) {
   const reasons = [];
   let skippedEmptyWorld = false;
+  let unverifiable = false;
   let saveCheck = 'unevaluated';
   if (!facts) {
-    return { pass: false, reasons: ['no-drain-facts: drain script did not complete'], skippedEmptyWorld, saveCheck };
+    return {
+      pass: false,
+      reasons: ['no-drain-facts: drain script did not complete'],
+      skippedEmptyWorld,
+      unverifiable,
+      saveCheck,
+    };
   }
   // null/undefined = parameter ABSENT (no player has ever been seen); NaN = present but unparseable.
   const seenAbsent = !ctx || ctx.lastPlayerSeenMs === null || ctx.lastPlayerSeenMs === undefined;
   const lastPlayerSeenMs = !seenAbsent && Number.isFinite(ctx.lastPlayerSeenMs) ? ctx.lastPlayerSeenMs : NaN;
   const launchTimeMs = ctx && Number.isFinite(ctx.launchTimeMs) ? ctx.launchTimeMs : NaN;
+  const logPlayer = facts.logPlayer === 'yes' || facts.logPlayer === 'no' ? facts.logPlayer : 'unreadable';
 
   // (a) the unit is no longer running. `failed` is what systemd reports after a clean SIGINT exit
   // with Result=exit-code/signal, so it is accepted; only still-running states are refused.
@@ -123,14 +140,28 @@ function evaluateSave(facts, ctx) {
     reasons.push('save-unreadable: savegame listing or t0 missing');
   } else if (count > 0 && Number.isFinite(facts.postNewest) && facts.postNewest > facts.t0) {
     saveCheck = 'shutdown-save-written'; // a file has mtime > t0
+  } else if (seenAbsent && logPlayer === 'yes') {
+    // Absent last-player-seen BUT the game log shows a player this boot (the probe never ran or never
+    // got an exact reading, e.g. a session entirely inside launch grace). Row 1 did not fire, so nothing
+    // was written during the stop: only a save newer than LaunchTime can cover that session.
+    if (count > 0 && Number.isFinite(newestMs) && Number.isFinite(launchTimeMs) && newestMs > launchTimeMs) {
+      saveCheck = 'covered-by-save-this-boot';
+    } else {
+      saveCheck = 'player-in-log-no-save-this-boot';
+      reasons.push(
+        'player-in-log-no-save: last-player-seen is absent but the game log shows a player this boot, ' +
+          'and no save is newer than LaunchTime (a session happened and nothing was written all boot)',
+      );
+    }
   } else if (
     count > 0 &&
     Number.isFinite(newestMs) &&
-    // Absent last-player-seen: no player was ever seen, so no save can be stale relative to it. An
-    // unparseable value is NOT absent: it falls through to FAIL (when in doubt, do not stop).
+    // Absent last-player-seen with a log that says nobody played (or cannot say): no save can be stale
+    // relative to it. An unparseable value is NOT absent: it falls through to FAIL (when in doubt, do not stop).
     (seenAbsent || newestMs >= lastPlayerSeenMs - CLOCK_SKEW_TOLERANCE_MS)
   ) {
     saveCheck = 'covered-by-disconnect-save'; // newest mtime >= last-player-seen (within tolerance)
+    if (seenAbsent && logPlayer === 'unreadable') unverifiable = true;
   } else if (count > 0) {
     saveCheck = 'unflushed';
     reasons.push(
@@ -149,12 +180,14 @@ function evaluateSave(facts, ctx) {
     } else {
       saveCheck = 'empty-no-player';
       skippedEmptyWorld = true; // PASS, emit SaveSkippedEmptyWorld
+      if (seenAbsent && logPlayer === 'unreadable') unverifiable = true;
     }
   } else {
     saveCheck = 'unreadable';
     reasons.push('save-unreadable: negative count');
   }
-  return { pass: reasons.length === 0, reasons, skippedEmptyWorld, saveCheck };
+  const pass = reasons.length === 0;
+  return { pass, reasons, skippedEmptyWorld, unverifiable: pass && unverifiable, saveCheck };
 }
 
 /** Classify a probe-players.py JSON line: only "players present" / "unreadable" / "clear". */
@@ -366,6 +399,12 @@ function createHandler(deps) {
       }
       if (verification.skippedEmptyWorld) {
         await attempt('metric SaveSkippedEmptyWorld', () => deps.putMetric('SaveSkippedEmptyWorld', 1));
+      }
+
+      if (verification.unverifiable) {
+        // PASS so as not to wedge, but say so: last-player-seen was absent AND the log could not be read,
+        // so the gate could not evaluate its evidence. A fail-open must be visible, not silent.
+        await attempt('metric SaveVerificationUnverifiable', () => deps.putMetric('SaveVerificationUnverifiable', 1));
       }
 
       // 4. Sync savegame/ to S3. Failure here also refuses the stop.
