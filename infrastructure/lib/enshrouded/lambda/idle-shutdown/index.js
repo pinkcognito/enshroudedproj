@@ -3,6 +3,9 @@
 // This Lambda DECIDES; it never stops anything itself. It has no ec2:StopInstances
 // permission. Every stop goes through graceful-stop so save verification cannot be bypassed.
 //
+// last-active is a CONTROL variable (ARCHITECTURE 6.6.0): written on five triggers, only one of which is
+// activity, and read ONLY by this Lambda's own idle test. last-player-seen is the FACT.
+//
 // Race fixes ported from the UOPrivateServer reference (all hard-won, do not simplify):
 //   1. maintenance-mode gate runs FIRST - a deploy must never be killed mid-flight
 //   2. not `running` -> reset the idle clock (a fresh boot must not inherit a stale one)
@@ -130,7 +133,7 @@ function cfg() {
     lastActiveParam: process.env.LAST_ACTIVE_PARAM,
     maintenanceParam: process.env.MAINTENANCE_MODE_PARAM,
     runStateParam: process.env.RUN_STATE_PARAM,
-    playerSeenBootParam: process.env.PLAYER_SEEN_BOOT_PARAM ?? '/enshroudedproj/state/player-seen-boot',
+    lastPlayerSeenParam: process.env.LAST_PLAYER_SEEN_PARAM ?? '/enshroudedproj/state/last-player-seen',
     probeCommand: process.env.PROBE_COMMAND ?? 'python3 /usr/local/lib/enshrouded/probe-players.py',
     pollMs: Number(process.env.POLL_INTERVAL_MS ?? '2000'),
     pollAttempts: Number(process.env.POLL_ATTEMPTS ?? '25'),
@@ -204,20 +207,20 @@ function exactPlayerDetected(probe) {
 }
 
 /**
- * Record that a player was affirmatively seen THIS boot by storing the boot's LaunchTime (epoch ms).
- * graceful-stop reads "a player connected this boot" iff the value equals the current LaunchTime.
- * NEVER cleared anywhere (a stale value from an earlier boot simply fails to match; clearing it on the
- * not-running reset would recreate the stop->start race the LaunchTime grace exists to prevent).
+ * Record the FACT "an exact signal saw a player at wall-clock time `nowMs`" (ARCHITECTURE 6.6.0).
+ * graceful-stop reads it: "a player connected this boot" is lastPlayerSeen >= LaunchTime, and the
+ * disconnect-save check compares save mtimes against it. Called ONLY when exactPlayerDetected() is true,
+ * so it is never written from a heuristic, a reset, a grace period or an INDETERMINATE tick.
+ * NEVER cleared anywhere: wall-clock time is monotonic across boots and LaunchTime advances, so a stale
+ * value is necessarily older than the new LaunchTime and fails the comparison (no race, nothing to clear).
  * Best-effort: a failure is logged and retried on the next 1-minute tick while the player is present.
  */
-async function recordPlayerSeen(c, launchMs) {
+async function recordPlayerSeen(c, nowMs) {
   try {
-    const stored = await getParam(c.playerSeenBootParam);
-    if (stored === String(launchMs)) return;
-    await putParam(c.playerSeenBootParam, launchMs);
-    console.log(`Player affirmatively seen this boot; ${c.playerSeenBootParam}=${launchMs}.`);
+    await putParam(c.lastPlayerSeenParam, nowMs);
+    console.log(`Player affirmatively seen; ${c.lastPlayerSeenParam}=${nowMs}.`);
   } catch (err) {
-    console.log(`Could not record player-seen-boot: ${err && err.name}: ${err && err.message}`);
+    console.log(`Could not record last-player-seen: ${err && err.name}: ${err && err.message}`);
   }
 }
 
@@ -284,7 +287,7 @@ exports.handler = async () => {
   const classification = classify(probe);
   console.log(`Probe ${JSON.stringify(probe)} -> ${classification}`);
 
-  if (exactPlayerDetected(probe) && Number.isFinite(launchMs)) await recordPlayerSeen(c, launchMs);
+  if (exactPlayerDetected(probe)) await recordPlayerSeen(c, now);
 
   emitMetrics({
     Players: probe?.a2sOk ? probe.players : null,

@@ -53,7 +53,7 @@ export class IdleShutdown extends Construct {
         LAST_ACTIVE_PARAM: '/enshroudedproj/state/last-active',
         MAINTENANCE_MODE_PARAM: '/enshroudedproj/state/maintenance-mode',
         RUN_STATE_PARAM: '/enshroudedproj/state/run-state',
-        PLAYER_SEEN_BOOT_PARAM: '/enshroudedproj/state/player-seen-boot',
+        LAST_PLAYER_SEEN_PARAM: '/enshroudedproj/state/last-player-seen',
       },
     });
 

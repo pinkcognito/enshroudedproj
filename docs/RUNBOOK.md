@@ -226,7 +226,8 @@ That restarts the game and disconnects anyone currently playing.
 | `/enshroudedproj/server/auto-update-on-boot` | String | no | `true`/`false`; absent ⇒ update |
 | `/enshroudedproj/server/backup-bucket` | String | *auto* | Created by the `GameDeploy` CDK construct |
 | `/enshroudedproj/state/maintenance-mode` | String | *auto* | `true`/`false` |
-| `/enshroudedproj/state/last-active` | String | *auto* | Epoch ms |
+| `/enshroudedproj/state/last-active` | String | *auto* | Epoch ms. **CONTROL** (idle-shutdown's idle clock; never evidence of player activity) |
+| `/enshroudedproj/state/last-player-seen` | String | *auto* | Epoch ms. **FACT**: last time an exact signal saw a player; read by graceful-stop |
 | `/enshroudedproj/state/run-state` | String | *auto* | `starting`/`stopping`/empty |
 
 Deliberately not created by CDK, so no secret ever lands in a CloudFormation

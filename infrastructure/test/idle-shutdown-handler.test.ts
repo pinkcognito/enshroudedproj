@@ -85,7 +85,7 @@ const P = {
   maintenance: '/enshroudedproj/state/maintenance-mode',
   lastActive: '/enshroudedproj/state/last-active',
   runState: '/enshroudedproj/state/run-state',
-  playerSeen: '/enshroudedproj/state/player-seen-boot',
+  playerSeen: '/enshroudedproj/state/last-player-seen',
 };
 const STOP_ARN = 'arn:aws:lambda:us-east-2:123456789012:function:graceful-stop';
 
@@ -127,7 +127,7 @@ beforeEach(() => {
     LAST_ACTIVE_PARAM: P.lastActive,
     MAINTENANCE_MODE_PARAM: P.maintenance,
     RUN_STATE_PARAM: P.runState,
-    PLAYER_SEEN_BOOT_PARAM: P.playerSeen,
+    LAST_PLAYER_SEEN_PARAM: P.playerSeen,
     POLL_INTERVAL_MS: '0',
   });
 });
@@ -299,29 +299,36 @@ describe('handler: gates', () => {
   });
 });
 
-// ---------------------------------------------------------------- player-seen-boot (graceful-stop row 4/5 discriminator)
-describe('handler: player-seen-boot is written only on EXACT detection', () => {
-  const launchMs = () => String(NOW - 60 * MIN);
+// ---------------------------------------------------------------- last-player-seen (FACT, ARCHITECTURE 6.6.0)
+describe('handler: last-player-seen is written only on EXACT detection', () => {
+  const nowStr = () => String(NOW);
   const written = () =>
     mockWorld.sent.filter((c) => c.constructor.name === 'PutParameterCommand' && c.input.Name === P.playerSeen);
 
-  test('A2S players > 0 -> stores the instance LaunchTime (epoch ms)', async () => {
+  test('A2S players > 0 -> stores wall-clock now (epoch ms)', async () => {
     probeReturns(probeLine({ players: 2, mCount: 0 }));
     await handler();
-    expect(mockWorld.params.get(P.playerSeen)).toBe(launchMs());
+    expect(mockWorld.params.get(P.playerSeen)).toBe(nowStr());
   });
 
-  test('log mCount > 0 with A2S failed -> stores the LaunchTime', async () => {
+  test('log mCount > 0 with A2S failed -> stores now', async () => {
     probeReturns(probeLine({ a2sOk: false, players: null, mCount: 1 }));
     await handler();
-    expect(mockWorld.params.get(P.playerSeen)).toBe(launchMs());
+    expect(mockWorld.params.get(P.playerSeen)).toBe(nowStr());
+  });
+
+  test('refreshed on every tick a player is present (it is a "last seen" timestamp)', async () => {
+    mockWorld.params.set(P.playerSeen, String(NOW - 5 * MIN));
+    probeReturns(probeLine({ players: 1 }));
+    await handler();
+    expect(mockWorld.params.get(P.playerSeen)).toBe(nowStr());
   });
 
   test.each([
     ['high udpRate, both exact signals zero', { udpRate: 211 }],
     ['high cpuRate, both exact signals zero', { cpuRate: 1.36 }],
     ['high udpRate and cpuRate, exact signals UNAVAILABLE', { a2sOk: false, players: null, logOk: false, mCount: null, udpRate: 300, cpuRate: 5 }],
-  ])('HEURISTIC ONLY (%s) -> ACTIVE but player-seen-boot is NOT written', async (_n, over) => {
+  ])('HEURISTIC ONLY (%s) -> ACTIVE but last-player-seen is NOT written', async (_n, over) => {
     probeReturns(probeLine(over));
     const r = await handler();
     expect(r.classification).toBe('ACTIVE');
@@ -343,43 +350,48 @@ describe('handler: player-seen-boot is written only on EXACT detection', () => {
     expect(written()).toHaveLength(0);
   });
 
-  test('not rewritten every minute once it already equals this LaunchTime', async () => {
-    mockWorld.params.set(P.playerSeen, launchMs());
-    probeReturns(probeLine({ players: 1 }));
-    await handler();
+  test('the five last-active housekeeping writes (bootstrap, reset, grace, INDETERMINATE) never touch it', async () => {
+    // clock bootstrap on first IDLE observation
+    mockWorld.params.delete(P.lastActive);
+    probeReturns(probeLine());
+    expect((await handler()).action).toBe('first-observation');
+    // INDETERMINATE
+    probeReturns(probeLine({ a2sOk: false, players: null, logOk: false, mCount: null }));
+    expect((await handler()).action).toBe('indeterminate');
     expect(written()).toHaveLength(0);
-  });
-
-  test('a stale value from a previous boot is overwritten with the current LaunchTime', async () => {
-    mockWorld.params.set(P.playerSeen, String(NOW - 5 * 60 * MIN));
-    probeReturns(probeLine({ players: 1 }));
-    await handler();
-    expect(mockWorld.params.get(P.playerSeen)).toBe(launchMs());
+    expect(mockWorld.params.has(P.playerSeen)).toBe(false);
   });
 
   test('NEVER CLEARED: the not-running reset leaves it untouched', async () => {
-    mockWorld.params.set(P.playerSeen, launchMs());
+    mockWorld.params.set(P.playerSeen, '12345');
     mockWorld.instance = { State: { Name: 'stopped' }, LaunchTime: new Date(NOW - 60 * MIN) };
     const r = await handler();
     expect(r.action).toBe('not-running');
     expect(mockWorld.params.get(P.lastActive)).toBe(String(NOW)); // the reset did run
-    expect(mockWorld.params.get(P.playerSeen)).toBe(launchMs());
+    expect(mockWorld.params.get(P.playerSeen)).toBe('12345');
     expect(written()).toHaveLength(0);
   });
 
   test('NEVER CLEARED: launch-grace leaves it untouched', async () => {
-    mockWorld.params.set(P.playerSeen, launchMs());
+    mockWorld.params.set(P.playerSeen, '12345');
     mockWorld.instance = { State: { Name: 'running' }, LaunchTime: new Date(NOW - 3 * MIN) };
     expect((await handler()).action).toBe('launch-grace');
-    expect(mockWorld.params.get(P.playerSeen)).toBe(launchMs());
+    expect(mockWorld.params.get(P.playerSeen)).toBe('12345');
     expect(written()).toHaveLength(0);
   });
 
-  test('source guard: the handler never deletes it and only ever writes it the LaunchTime', () => {
+  test('source guard: never deleted, and the ONLY write is recordPlayerSeen, called only behind exactPlayerDetected', () => {
     const src = fs.readFileSync(path.join(__dirname, '../lib/enshrouded/lambda/idle-shutdown/index.js'), 'utf-8');
     expect(src).not.toMatch(/DeleteParameter/);
-    const puts = src.split('\n').filter((l) => /playerSeenBootParam/.test(l) && /putParam\(/.test(l));
-    expect(puts).toEqual(['    await putParam(c.playerSeenBootParam, launchMs);']);
+    const puts = src.split('\n').filter((l) => /lastPlayerSeenParam/.test(l) && /putParam\(/.test(l));
+    expect(puts).toEqual(['    await putParam(c.lastPlayerSeenParam, nowMs);']);
+    const calls = src.split('\n').filter((l) => /recordPlayerSeen\(/.test(l) && !/^async function/.test(l));
+    expect(calls).toEqual(['  if (exactPlayerDetected(probe)) await recordPlayerSeen(c, now);']);
+  });
+
+  test('player-seen-boot is gone', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../lib/enshrouded/lambda/idle-shutdown/index.js'), 'utf-8');
+    expect(src).not.toMatch(/player-seen-boot|PLAYER_SEEN_BOOT|playerSeenBoot/);
   });
 });
 

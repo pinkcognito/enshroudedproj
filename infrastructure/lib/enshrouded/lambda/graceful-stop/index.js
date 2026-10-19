@@ -15,15 +15,22 @@
 //     "noop-not-running"        the instance was not running; nothing to do
 //     "failed"                  something went wrong; maintenance mode set, alarm raised, NOT stopped
 //
-// WALL-CLOCK RULE: the only time sources are file mtimes (reported by the box), the last-active SSM
+// WALL-CLOCK RULE: the only time sources are file mtimes (reported by the box), the last-player-seen SSM
 // parameter and the instance LaunchTime. Game-log timestamps are uptime-relative and are never read.
 
 const NAMESPACE = 'Enshrouded';
 const PARAM_MAINTENANCE = '/enshroudedproj/state/maintenance-mode';
-const PARAM_LAST_ACTIVE = '/enshroudedproj/state/last-active';
 const PARAM_RUN_STATE = '/enshroudedproj/state/run-state';
-// Holds the LaunchTime (epoch ms) during which idle-shutdown affirmatively saw a player. Never cleared.
-const PARAM_PLAYER_SEEN_BOOT = '/enshroudedproj/state/player-seen-boot';
+// FACT (ARCHITECTURE 6.6.0): wall-clock epoch ms at which an EXACT signal last reported >= 1 player.
+// Written only by idle-shutdown, never cleared. This is the ONLY activity evidence this Lambda may read;
+// the idle-clock parameter is a CONTROL variable owned by idle-shutdown and is deliberately not read or
+// written here (a test enforces that).
+const PARAM_LAST_PLAYER_SEEN = '/enshroudedproj/state/last-player-seen';
+// Row 2 tolerance: save mtimes are on the INSTANCE clock, last-player-seen is stamped by the LAMBDA
+// (AWS clock). Both are chrony-synced so skew should be sub-millisecond, but the signature being caught
+// is "played for ages, nothing ever saved" - a gap of many minutes - so a two-minute margin costs no
+// detection power and removes a whole class of cross-clock false positives.
+const CLOCK_SKEW_TOLERANCE_MS = 120_000;
 // SSM rejects an empty Value, so "cleared" is the literal below; only "stopping" is meaningful to idle-shutdown.
 const RUN_STATE_CLEARED = 'none';
 const DRAIN_SCRIPT = '/usr/local/lib/enshrouded/drain-and-save.sh';
@@ -76,7 +83,7 @@ function isTruncatedStop(result, execMainCode, execMainStatus) {
 /**
  * The save-verification verdict. Inputs:
  *   facts   from parseDrainFacts
- *   ctx     { lastActiveMs, launchTimeMs, playerSeenBootMs }  (SSM parameters + instance LaunchTime, epoch ms)
+ *   ctx     { lastPlayerSeenMs, launchTimeMs }  (SSM FACT parameter + instance LaunchTime, epoch ms)
  * Returns { pass, reasons: string[], skippedEmptyWorld: boolean, saveCheck: string }.
  * Any missing or unparseable input is a FAIL: when in doubt, do not stop.
  */
@@ -87,7 +94,9 @@ function evaluateSave(facts, ctx) {
   if (!facts) {
     return { pass: false, reasons: ['no-drain-facts: drain script did not complete'], skippedEmptyWorld, saveCheck };
   }
-  const lastActiveMs = ctx && Number.isFinite(ctx.lastActiveMs) ? ctx.lastActiveMs : NaN;
+  // null/undefined = parameter ABSENT (no player has ever been seen); NaN = present but unparseable.
+  const seenAbsent = !ctx || ctx.lastPlayerSeenMs === null || ctx.lastPlayerSeenMs === undefined;
+  const lastPlayerSeenMs = !seenAbsent && Number.isFinite(ctx.lastPlayerSeenMs) ? ctx.lastPlayerSeenMs : NaN;
   const launchTimeMs = ctx && Number.isFinite(ctx.launchTimeMs) ? ctx.launchTimeMs : NaN;
 
   // (a) the unit is no longer running. `failed` is what systemd reports after a clean SIGINT exit
@@ -114,25 +123,27 @@ function evaluateSave(facts, ctx) {
     reasons.push('save-unreadable: savegame listing or t0 missing');
   } else if (count > 0 && Number.isFinite(facts.postNewest) && facts.postNewest > facts.t0) {
     saveCheck = 'shutdown-save-written'; // a file has mtime > t0
-  } else if (count > 0 && Number.isFinite(newestMs) && Number.isFinite(lastActiveMs) && newestMs >= lastActiveMs) {
-    saveCheck = 'covered-by-disconnect-save'; // newest mtime >= last-active
+  } else if (
+    count > 0 &&
+    Number.isFinite(newestMs) &&
+    // Absent last-player-seen: no player was ever seen, so no save can be stale relative to it. An
+    // unparseable value is NOT absent: it falls through to FAIL (when in doubt, do not stop).
+    (seenAbsent || newestMs >= lastPlayerSeenMs - CLOCK_SKEW_TOLERANCE_MS)
+  ) {
+    saveCheck = 'covered-by-disconnect-save'; // newest mtime >= last-player-seen (within tolerance)
   } else if (count > 0) {
     saveCheck = 'unflushed';
     reasons.push(
-      'save-not-flushed: savegame/ is non-empty but its newest mtime is older than last-active ' +
+      'save-not-flushed: savegame/ is non-empty but its newest mtime is older than last-player-seen ' +
         'and nothing was written during the stop (a player was present after the last save)',
     );
   } else if (count === 0) {
-    // Empty savegame/. Did a player connect this boot? ONLY the player-seen-boot parameter answers
-    // that: it equals this boot's LaunchTime iff idle-shutdown affirmatively saw a player. NEVER infer
-    // it from last-active (the launch-grace and INDETERMINATE branches stamp last-active = now, so it
-    // is almost always "after LaunchTime" and would wedge every session nobody joined).
-    // Absent / stale (another boot's LaunchTime) / unparseable all mean "no player seen".
-    const playerSeenBootMs = ctx && Number.isFinite(ctx.playerSeenBootMs) ? ctx.playerSeenBootMs : NaN;
+    // Empty savegame/. Did a player connect this boot? ONLY last-player-seen answers that
+    // (lastPlayerSeen >= LaunchTime). Absent / older than LaunchTime / unparseable all mean "no".
     if (!Number.isFinite(launchTimeMs)) {
       saveCheck = 'empty-unknown';
       reasons.push('empty-world-unknown: cannot tell whether a player connected this boot (no LaunchTime)');
-    } else if (playerSeenBootMs === launchTimeMs) {
+    } else if (lastPlayerSeenMs >= launchTimeMs) {
       saveCheck = 'empty-but-player-connected';
       reasons.push('empty-world-after-player: savegame/ is empty but a player connected this boot');
     } else {
@@ -319,7 +330,8 @@ function createHandler(deps) {
       const probeRun = await deps.runOnBox(`python3 ${PROBE_SCRIPT}`, 60);
       const verdict = probeRun.ok ? classifyRecheck(parseLastJsonLine(probeRun.stdout)) : 'indeterminate';
       if (verdict === 'active') {
-        await attempt('write last-active', () => deps.putParam(PARAM_LAST_ACTIVE, String(deps.now())));
+        // Deliberately does NOT touch the idle clock: that is idle-shutdown's CONTROL variable (6.6.0).
+        // Its next tick sees the same player and resets it itself.
         await attempt('clear run-state', () => deps.putParam(PARAM_RUN_STATE, RUN_STATE_CLEARED));
         await attempt('discord status', () => deps.postDiscord('status', 'Someone just joined - stop cancelled.'));
         return { outcome: 'aborted-players-present', stopped: false, reason };
@@ -336,13 +348,9 @@ function createHandler(deps) {
         return { outcome: 'noop-not-running', stopped: false, reason, instanceState: inst.state };
       }
 
-      // Read last-active BEFORE the stop: once the game is down every probe fails, and idle-shutdown
-      // may stamp last-active = now, which would make a good save look stale.
-      const lastActiveRaw = await deps.getParam(PARAM_LAST_ACTIVE);
-      const lastActiveMs = lastActiveRaw === null ? NaN : Number(lastActiveRaw);
-      // "A player connected this boot" iff player-seen-boot equals this boot's LaunchTime. Absent = no.
-      const playerSeenRaw = await deps.getParam(PARAM_PLAYER_SEEN_BOOT);
-      const playerSeenBootMs = playerSeenRaw === null || playerSeenRaw === undefined ? NaN : Number(playerSeenRaw);
+      // Read the FACT parameter BEFORE the stop (once the game is down every probe fails). Absent -> null.
+      const seenRaw = await deps.getParam(PARAM_LAST_PLAYER_SEEN);
+      const lastPlayerSeenMs = seenRaw === null || seenRaw === undefined ? null : Number(seenRaw);
 
       // 2. Stop (the unit ExecStop does SIGINT + wait). 3. Collect facts.
       const drain = await deps.runOnBox(`${DRAIN_SCRIPT} stop`, 240);
@@ -352,7 +360,7 @@ function createHandler(deps) {
       const facts = parseDrainFacts(drain.stdout);
 
       // SAVE VERIFICATION. Nothing below this line may run unless it passes.
-      const verification = evaluateSave(facts, { lastActiveMs, launchTimeMs: inst.launchTimeMs, playerSeenBootMs });
+      const verification = evaluateSave(facts, { lastPlayerSeenMs, launchTimeMs: inst.launchTimeMs });
       if (!verification.pass) {
         return await fail('save-verification', verification.reasons.join('; '), { verification: true });
       }
