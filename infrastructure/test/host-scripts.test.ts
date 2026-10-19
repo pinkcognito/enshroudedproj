@@ -205,10 +205,16 @@ describe('unit file content', () => {
     expect(unit['Service']['Environment']).toContain('UMU_ID=0');
   });
 
-  test('stop-game.sh pattern still matches a relative launch (and the Wine-side absolute path)', () => {
-    const pattern = /[e]nshrouded_server\.exe/;
-    expect(pattern.test('python3 /opt/steamcmd/compatibilitytools.d/GE-Proton11-9/proton run enshrouded_server.exe')).toBe(true);
-    expect(pattern.test('Z:\\srv\\enshrouded\\enshrouded_server.exe')).toBe(true);
+  test('stop-game.sh selector is the 15-char-truncated comm of the game, which is not the launcher\'s comm', () => {
+    // The kernel truncates comm to 15 chars: the game's comm is 'enshrouded_serv' (seen in live `ss`),
+    // the Proton launcher's is 'python3'. `pgrep -x` compares against comm, so the selector must be
+    // exactly the truncated name and must not equal the launcher's.
+    const gameComm = 'enshrouded_server.exe'.slice(0, 15);
+    expect(gameComm).toBe('enshrouded_serv');
+    const body = /<<'STOP_EOF'\n([\s\S]*?)\nSTOP_EOF\n/.exec(read(PROVISION))?.[1] ?? '';
+    expect(body).toContain(`COMM='${gameComm}'`);
+    expect(body).toContain('pgrep -x "$COMM"');
+    expect(gameComm).not.toBe('python3');
   });
 
   test('update unit is a oneshot ordered Before=enshrouded.service', () => {
@@ -425,18 +431,40 @@ describe('provision-host.sh', () => {
   /** Executable lines only (comments and blanks removed). */
   const code = (s: string) =>
     s.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).join('\n');
-  const PKILL_OK = /\bpkill -(INT|2|SIGINT) -f "\$PATTERN"/;
-  /** Problems with how stop-game.sh signals; empty = signals only the exe pattern. */
+  const KILL_OK = /^kill -INT "\$pid"( \|\| true)?$/;
+  /**
+   * Problems with how stop-game.sh resolves, signals and waits (ARCHITECTURE 4.3.1 / 4.3.2);
+   * empty = resolves one comm-matched PID before signalling, signals only it, waits on /proc/<pid>.
+   */
   function stopSignalProblems(body: string): string[] {
     const c = code(body);
+    const lines = c.split('\n').map((l) => l.trim());
     const p: string[] = [];
     if (/wine/i.test(c)) p.push('mentions wine (wineserver must never be signalled)');
-    if (/\bkill(all)?\b/.test(c)) p.push('uses kill/killall');
-    if (/\bpkill\b[^\n]*\b(proton|python)\b/i.test(c)) p.push('signals the launcher by name');
-    if (!c.includes(String.raw`PATTERN='[e]nshrouded_server\.exe'`)) p.push('exe pattern/bracket trick missing');
-    const pkills = c.match(/^.*\bpkill\b.*$/gm) ?? [];
-    if (pkills.length === 0) p.push('no pkill');
-    for (const l of pkills) if (!PKILL_OK.test(l)) p.push(`pkill not keyed on $PATTERN with SIGINT: ${l}`);
+    if (/\b(pkill|killall|pidof)\b/.test(c)) p.push('uses pkill/killall/pidof (signal one resolved PID with kill -INT "$pid")');
+    if (/\b(proton|python)/i.test(c)) p.push('names the launcher (proton/python)');
+    // selector: exact match on the truncated game comm, resolved exactly once
+    if (!c.includes("COMM='enshrouded_serv'")) p.push("selector COMM='enshrouded_serv' missing");
+    const resolves = lines.filter((l) => /\bpgrep -x\b/.test(l));
+    if (resolves.length !== 1 || !/pgrep -x "\$COMM"/.test(resolves[0])) p.push('PID must be resolved exactly once with pgrep -x "$COMM"');
+    // exactly-one enforcement
+    if (!/\$\{#pids\[@\]\}" -ne 1\b/.test(c)) p.push('exactly-one match is not enforced (-ne 1)');
+    // signalling: only kill -INT "$pid", only one such line, never another kill form
+    const kills = lines.filter((l) => /(^|[;&|]\s*)kill\b/.test(l));
+    if (kills.length !== 1) p.push(`expected exactly one kill line, found ${kills.length}`);
+    for (const l of kills) if (!KILL_OK.test(l)) p.push(`kill is not 'kill -INT "$pid"': ${l}`);
+    const killIdx = lines.findIndex((l) => KILL_OK.test(l));
+    const resolveIdx = lines.findIndex((l) => /^mapfile\b.*pgrep -x/.test(l));
+    if (resolveIdx < 0 || killIdx < 0 || resolveIdx > killIdx) p.push('PID is not resolved before the signal is sent');
+    // the abort paths (not-exactly-one) must exit before the signal
+    const lastAbortExit = lines.map((l, i) => (/^exit 2$/.test(l) ? i : -1)).reduce((a, b) => Math.max(a, b), -1);
+    if (lastAbortExit < 0 || killIdx < 0 || lastAbortExit > killIdx) p.push('abort (exit 2) must come before the signal');
+    const pidAssign = lines.findIndex((l) => /^pid="\$\{pids\[0\]\}"$/.test(l));
+    if (pidAssign < 0 || killIdx < 0 || pidAssign > killIdx) p.push('pid must be taken from the single resolved match before the signal');
+    // waiting: poll /proc/$pid; NO pattern/process-name lookup after the signal
+    const after = lines.slice(killIdx + 1).join('\n');
+    if (!/\[ ! -d "\/proc\/\$pid" \]/.test(after)) p.push('wait does not poll /proc/$pid');
+    if (/\b(pgrep|pkill|pidof|ps)\b/.test(after)) p.push('pattern/name-based lookup after the signal (waiting on a pattern is the bug)');
     return p;
   }
 
@@ -448,18 +476,18 @@ describe('provision-host.sh', () => {
     expect(effective(parseUnit(read(GAME_UNIT)), 'Service', 'ExecStop')).toBe(STOP_PATH);
   });
 
-  test('stop-game.sh signals ONLY the exe pattern, never wineserver, and waits <=110s', () => {
+  test('stop-game.sh resolves one comm-matched PID before signalling, signals only it, waits on /proc/<pid> <=110s', () => {
     const body = embeddedStop(script)?.body ?? '';
     expect(stopSignalProblems(body)).toEqual([]);
     const c = code(body);
-    // waits for exit: bounded loop of 110 one-second polls, then fails (systemd then reaps)
     expect(c).toMatch(/seq 1 110/);
-    expect(c).toMatch(/pgrep -f "\$PATTERN"/);
     expect(c).toMatch(/sleep 1/);
     expect(c).toMatch(/exit 1\s*$/);
-    // idempotent: absent process => exit 0 before any signal is sent
+    // resolution precedes the signal; the idempotent exit 0 precedes it too
+    expect(c.indexOf('pgrep -x "$COMM"')).toBeLessThan(c.indexOf('kill -INT'));
     expect(c.indexOf('exit 0')).toBeGreaterThanOrEqual(0);
-    expect(c.indexOf('exit 0')).toBeLessThan(c.indexOf('pkill'));
+    expect(c.indexOf('exit 0')).toBeLessThan(c.indexOf('kill -INT'));
+    expect(c).toMatch(/\bkill -INT "\$pid"/);
   });
 
   test('stop-game.sh passes bash -n and is LF-only (skipped if bash is unavailable)', () => {
@@ -473,17 +501,101 @@ describe('provision-host.sh', () => {
 
   test('the stop-game.sh checker rejects a wineserver / bare-pkill "simplification"', () => {
     const body = embeddedStop(script)?.body ?? '';
-    const pk = (repl: string) => body.replace(/^pkill .*$/m, () => repl);
+    const sig = (repl: string) => body.replace(/^kill -INT "\$pid".*$/m, () => repl);
     for (const bad of [
-      pk('pkill -INT -f "$PATTERN"; pkill wineserver'),
-      pk('pkill -2'),
-      pk('pkill wineserver'),
-      pk('pkill -INT -f wineserver'),
-      pk('pkill -INT -f "$PATTERN"; pkill -INT -f proton'),
-      pk('killall -INT wineserver'),
+      sig('kill -INT "$pid"; pkill wineserver'),
+      sig('pkill -2'),
+      sig('pkill wineserver'),
+      sig('pkill -INT -f wineserver'),
+      sig('kill -INT "$pid"; pkill -INT -f proton'),
+      sig('killall -INT wineserver'),
+      sig('pkill -INT -f "[e]nshrouded_server"'),
+      sig('kill -INT "$(pgrep wineserver)"'),
+      sig('kill -9 "$pid"'),
     ]) {
       expect(stopSignalProblems(bad).length).toBeGreaterThan(0);
     }
+  });
+
+  test('the stop-game.sh checker rejects pattern-based waiting (the regression guard for ARCHITECTURE 4.3.2)', () => {
+    const body = embeddedStop(script)?.body ?? '';
+    const poll = '  if [ ! -d "/proc/$pid" ]; then';
+    expect(body).toContain(poll);
+    for (const bad of [
+      body.replace(poll, '  if ! pgrep -x "$COMM" >/dev/null 2>&1; then'),
+      body.replace(poll, "  if ! pgrep -f '[e]nshrouded_server' >/dev/null 2>&1; then"),
+      body.replace(poll, '  if ! pidof enshrouded_server.exe >/dev/null 2>&1; then'),
+      body.replace(poll, '  if ! ps -p "$pid" >/dev/null 2>&1; then'),
+      body.replace(poll, '  if [ -z "$(pgrep -x enshrouded_serv)" ]; then'),
+    ]) {
+      expect(stopSignalProblems(bad).length).toBeGreaterThan(0);
+    }
+  });
+
+  test('the stop-game.sh checker rejects accepting several matches, a launcher selector, or signalling before resolving', () => {
+    const body = embeddedStop(script)?.body ?? '';
+    // several matches accepted
+    expect(stopSignalProblems(body.replace('-ne 1', '-lt 1')).length).toBeGreaterThan(0);
+    expect(stopSignalProblems(body.replace(/pid="\$\{pids\[0\]\}"/, 'pid="${pids[*]}"')).length).toBeGreaterThan(0);
+    // selector pointed at the launcher
+    expect(stopSignalProblems(body.replace("COMM='enshrouded_serv'", "COMM='python3'")).length).toBeGreaterThan(0);
+    // exact match dropped (substring/regex match would also hit other processes)
+    expect(stopSignalProblems(body.replace('pgrep -x "$COMM"', 'pgrep "$COMM"')).length).toBeGreaterThan(0);
+    // signal moved ahead of resolution
+    const sig = 'kill -INT "$pid" || true\n';
+    const moved = body.replace(sig, '').replace('mapfile', `kill -INT "$pid" || true\nmapfile`);
+    expect(stopSignalProblems(moved).length).toBeGreaterThan(0);
+    // abort removed (zero/many falls through to the signal)
+    expect(stopSignalProblems(body.replace(/exit 2/g, 'true')).length).toBeGreaterThan(0);
+  });
+
+  describe('stop-game.sh behaviour (stubbed pgrep/ps/kill; skipped without bash)', () => {
+    const body = embeddedStop(script)?.body ?? '';
+    const haveBash = !spawnSync('bash', ['--version']).error;
+    // Windows temp paths -> MSYS form so they are usable inside bash and in its ':'-separated PATH
+    const fwd = (x: string) => x.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_m, d: string) => `/${d.toLowerCase()}/`);
+    const run = (stubs: { pgrepX?: string[]; pgrepF?: string[] }) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stopgame-'));
+      const log = path.join(dir, 'signals.log');
+      const w = (n: string, t: string) => fs.writeFileSync(path.join(dir, n), t, { mode: 0o755 });
+      // pgrep stub: -x answers from pgrepX, anything else (-f) from pgrepF; non-empty answer => exit 0
+      w('pgrep', '#!/bin/bash\nif [ "$1" = "-x" ]; then out=(' + (stubs.pgrepX ?? []).map((x) => `"${x}"`).join(' ') + ');' +
+        ' else out=(' + (stubs.pgrepF ?? []).map((x) => `"${x}"`).join(' ') + '); fi\n' +
+        '[ "${#out[@]}" -gt 0 ] && printf "%s\\n" "${out[@]}" && exit 0\nexit 1\n');
+      w('ps', '#!/bin/bash\nexit 0\n');
+      w('pkill', `#!/bin/bash\necho "pkill $*" >> '${fwd(log)}'\n`);
+      w('sleep', '#!/bin/bash\nexit 0\n');
+      w('script.sh', body);
+      const wrapper = `kill() { echo "kill $*" >> '${fwd(log)}'; }; export -f kill; ` +
+        `PATH='${fwd(dir)}':$PATH bash '${fwd(path.join(dir, 'script.sh'))}'`;
+      const r = spawnSync('bash', ['-c', wrapper], { encoding: 'utf8' });
+      const signals = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '';
+      return { status: r.status, signals, err: r.stderr, out: r.stdout };
+    };
+    const t = haveBash ? test : test.skip;
+
+    t('zero comm matches and no game visible: exit 0, nothing signalled (idempotent)', () => {
+      const r = run({});
+      expect(r.status).toBe(0);
+      expect(r.signals).toBe('');
+    });
+    t('zero comm matches but the game is visible by command line (stale selector): abort non-zero, nothing signalled', () => {
+      const r = run({ pgrepF: ['8474 enshrouded_server.exe'] });
+      expect(r.status).not.toBe(0);
+      expect(r.signals).toBe('');
+      expect(r.err).toMatch(/ABORT/);
+    });
+    t('two comm matches: abort non-zero, nothing signalled', () => {
+      const r = run({ pgrepX: ['8416', '8474'] });
+      expect(r.status).not.toBe(0);
+      expect(r.signals).toBe('');
+      expect(r.err).toMatch(/ABORT/);
+    });
+    t('exactly one match: kill -INT that PID only, no pkill, exits 0 once /proc/<pid> is gone', () => {
+      const r = run({ pgrepX: ['999999'] }); // a PID that does not exist => /proc/999999 absent
+      expect(r.signals.trim()).toBe('kill -INT 999999');
+      expect(r.status).toBe(0);
+    });
   });
 
   test('update helper carries the platform flag and refuses an unmounted data volume', () => {

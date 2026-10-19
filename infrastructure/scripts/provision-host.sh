@@ -590,30 +590,49 @@ backup_savegame
 exec /opt/steamcmd/steamcmd.sh   +@sSteamCmdForcePlatformType windows   +force_install_dir /srv/enshrouded   +login anonymous   +app_update 2278520 validate   +quit
 UPDATE_EOF
 
-  # Game stop helper (ExecStop): SIGINT the exe alone, wait for exit. ARCHITECTURE 4.3.1.
+  # Game stop helper (ExecStop): resolve the game PID once, SIGINT it alone, wait on /proc/<pid>. ARCHITECTURE 4.3.1/4.3.2.
   write_if_changed /usr/local/lib/enshrouded/stop-game.sh 0755 <<'STOP_EOF'
 #!/bin/bash
-# stop-game.sh - ExecStop for enshrouded.service (WP-05a, ARCHITECTURE 4.3.1). Data-loss critical.
-# systemd runs ExecStop to completion BEFORE applying KillSignal/KillMode. This signals ONLY the
-# game executable (SIGINT) and WAITS for it to exit, so the save finishes before anything else
-# is touched. It must never signal the Wine server process: that is Wine's kernel, and the save
-# is performed through it. The '[e]' bracket stops pkill/pgrep matching their own command line;
-# -f matches the full command line (the game and the Proton launcher, not the Wine server).
-# Idempotent: exits 0 if the game is not running. Bound (110 s) sits inside TimeoutStopSec=120.
-PATTERN='[e]nshrouded_server\.exe'
-if ! pgrep -f "$PATTERN" >/dev/null 2>&1; then
+# stop-game.sh - ExecStop for enshrouded.service (WP-05a, ARCHITECTURE 4.3.1 / 4.3.2). Data-loss critical.
+# systemd runs ExecStop to completion BEFORE applying KillSignal/KillMode. This SIGINTs the game
+# process alone and WAITS for that same process to exit, so the save finishes before anything
+# else is touched. It must never signal the Wine server process: that is Wine's kernel, and the
+# save is performed through it.
+# The PID is resolved ONCE, before anything is signalled, by exact match on the kernel's
+# (15-char-truncated) comm, which is 'enshrouded_serv'. The Proton launcher's comm is 'python3',
+# so it is not matched. Exactly one match is required; zero-with-the-game-visible or several
+# aborts without signalling. The wait polls /proc/<pid>, never a pattern: a broken pattern must
+# not be able to look like "the game exited" (that would let KillMode SIGKILL a mid-save game).
+# Idempotent: exits 0 if the game is not running at all. Bound (110 s) is inside TimeoutStopSec=120.
+COMM='enshrouded_serv'
+mapfile -t pids < <(pgrep -x "$COMM" 2>/dev/null)
+if [ "${#pids[@]}" -eq 0 ]; then
+  # Nothing has the game's comm. Either it is not running (fine), or the selector is stale and
+  # the game is running under another name (NOT fine). Tell them apart by command line.
+  if pgrep -f '[e]nshrouded_server' >/dev/null 2>&1; then
+    echo "stop-game: ABORT: no process has comm '$COMM' but a process mentions enshrouded_server; selector is stale; signalling nothing" >&2
+    pgrep -af '[e]nshrouded_server' >&2
+    exit 2
+  fi
   echo "stop-game: game not running; nothing to do"
   exit 0
 fi
-pkill -INT -f "$PATTERN" || true
+if [ "${#pids[@]}" -ne 1 ]; then
+  echo "stop-game: ABORT: expected exactly 1 process with comm '$COMM', found ${#pids[@]}; signalling nothing" >&2
+  ps -o pid,comm,args -p "${pids[*]}" >&2
+  exit 2
+fi
+pid="${pids[0]}"
+echo "stop-game: sending SIGINT to game pid $pid"
+kill -INT "$pid" || true
 for _ in $(seq 1 110); do
-  if ! pgrep -f "$PATTERN" >/dev/null 2>&1; then
+  if [ ! -d "/proc/$pid" ]; then
     echo "stop-game: game exited"
     exit 0
   fi
   sleep 1
 done
-echo "stop-game: game still running after 110s; leaving it to systemd" >&2
+echo "stop-game: game pid $pid still running after 110s; leaving it to systemd" >&2
 exit 1
 STOP_EOF
 
