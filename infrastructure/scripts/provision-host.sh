@@ -35,9 +35,15 @@ GAME_USER="enshrouded"
 DATA_MOUNT="/srv/enshrouded"
 STEAMCMD_DIR="/opt/steamcmd"
 
-GE_PROTON_VERSION="10-26"
-GE_PROTON_SHA256="e2ffd9d2a1ece30b5da3d3dc9cedaa82875008d1c984b5efc7666c028203f9db"
-GE_PROTON_TARBALL="GE-Proton${GE_PROTON_VERSION}.tar.gz"
+GE_PROTON_VERSION="11-9"
+GE_PROTON_SHA256="b2cf4a632a70ec321cdb9904fa396a2a45d4061129f9fdc89d8a27ea5ceeb9d6"
+# GE-Proton 11 ships as GE-Proton<ver>-x86_64.tar.gz and extracts to GE-Proton<ver>-x86_64/;
+# we install it as GE-Proton<ver> so the unit path stays version-keyed only.
+# SHA256 of the extracted, lsteamclient-patched proton script (the derived artifact we actually
+# run; see patch_lsteamclient). Regenerate on every Proton bump - that is the point.
+GE_PROTON_PATCHED_PROTON_SHA256="81ce6ce5fce8501abe8614c97770b975b0ea2ca6d5385de62592ea3a797b759d"
+GE_PROTON_TARBALL="GE-Proton${GE_PROTON_VERSION}-x86_64.tar.gz"
+GE_PROTON_EXTRACTED="GE-Proton${GE_PROTON_VERSION}-x86_64"
 GE_PROTON_URL="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton${GE_PROTON_VERSION}/${GE_PROTON_TARBALL}"
 GE_PROTON_DIR="${STEAMCMD_DIR}/compatibilitytools.d/GE-Proton${GE_PROTON_VERSION}"
 # Optional S3 mirror prefix, e.g. s3://<bucket>/mirror/ge-proton  (set by the SSM caller).
@@ -118,10 +124,13 @@ log "SSM Agent is active"
 install_packages() {
   local apt_opts=(-o DPkg::Lock::Timeout=600 -y -qq)
   apt-get "${apt_opts[@]}" update
-  # ASSUMED package set (reference container recipe + SteamCMD 32-bit needs); WP-07 confirms.
+  # Package set from the reference container recipe (jsknnr/enshrouded-server 11ac003) + SteamCMD
+  # 32-bit needs. GE-Proton 11's proton script loads libvulkan.so.1 at startup (libvulkan1); winbind
+  # is the reference's. No Vulkan ICD (mesa-vulkan-drivers): the reference installs none.
   apt-get "${apt_opts[@]}" install --no-install-recommends \
     ca-certificates curl tar gzip jq procps xdg-user-dirs python3 libfreetype6 \
-    nvme-cli util-linux e2fsprogs ufw lib32gcc-s1 lib32stdc++6
+    nvme-cli util-linux e2fsprogs ufw lib32gcc-s1 lib32stdc++6 \
+    libvulkan1 winbind
   if [ ! -x /snap/bin/aws ] && ! command -v aws >/dev/null 2>&1; then
     snap install aws-cli --classic
   fi
@@ -373,9 +382,20 @@ ensure_data_volume() {
   mountpoint -q "$DATA_MOUNT" || die "$DATA_MOUNT is not a mount point after mount"
   [ "$(findmnt -n -o UUID "$DATA_MOUNT")" = "$uuid" ] || die "mounted UUID mismatch at $DATA_MOUNT"
 
-  mkdir -p "${DATA_MOUNT}/compatdata" "${DATA_MOUNT}/logs"
-  chown "${GAME_USER}:${GAME_USER}" "$DATA_MOUNT" "${DATA_MOUNT}/compatdata" "${DATA_MOUNT}/logs"
   log "data volume mounted at $DATA_MOUNT (UUID ${uuid})"
+}
+
+# Game directories on the data volume, owned by the game user. Separate from ensure_data_volume
+# because that returns early when the volume is already mounted (every re-run on a live host).
+# savegame/ gets a write test, as the reference entrypoint does: a read-only or root-owned world
+# directory must fail provisioning, not the first save.
+ensure_game_dirs() {
+  mountpoint -q "$DATA_MOUNT" || die "$DATA_MOUNT is not mounted; refusing to create game directories on the root volume"
+  mkdir -p "${DATA_MOUNT}/compatdata" "${DATA_MOUNT}/savegame" "${DATA_MOUNT}/logs"
+  chown "${GAME_USER}:${GAME_USER}" "$DATA_MOUNT" "${DATA_MOUNT}/compatdata" "${DATA_MOUNT}/savegame" "${DATA_MOUNT}/logs"
+  runuser -u "$GAME_USER" -- touch "${DATA_MOUNT}/savegame/.permtest" \
+    || die "${DATA_MOUNT}/savegame is not writable by ${GAME_USER}"
+  rm -f "${DATA_MOUNT}/savegame/.permtest"
 }
 
 # ---------------------------------------------------------------------------
@@ -396,6 +416,26 @@ install_steamcmd() {
   as_game_user "${STEAMCMD_DIR}/steamcmd.sh" +quit || die "steamcmd does not run cleanly"
 }
 
+# Steam SDK links for the game user (the server's Steamworks layer looks in ~/.steam/sdk64|32).
+# Must run AFTER install_steamcmd: steamcmd's first run populates linux64/ and linux32/.
+install_steam_sdk_links() {
+  local home="/home/${GAME_USER}" bits dir link
+  as_game_user mkdir -p "${home}/.steam"
+  for bits in 64 32; do
+    dir="${STEAMCMD_DIR}/linux${bits}"
+    link="${home}/.steam/sdk${bits}"
+    [ -e "${dir}/steamclient.so" ] || die "${dir}/steamclient.so is missing (did steamcmd run?)"
+    # steamcmd may have made a real directory here; move it aside rather than delete it.
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+      rm -rf "${link}.pre-enshrouded"
+      mv "$link" "${link}.pre-enshrouded"
+    fi
+    as_game_user ln -sfn "$dir" "$link"
+    as_game_user ln -sfn "${link}/steamclient.so" "${link}/steamservice.so"
+  done
+  log "Steam SDK links in place (sdk64 -> ${STEAMCMD_DIR}/linux64, sdk32 -> ${STEAMCMD_DIR}/linux32)"
+}
+
 # ---------------------------------------------------------------------------
 # 6. GE-Proton: pinned version AND SHA256, S3 mirror fallback (invariant 1.4)
 # ---------------------------------------------------------------------------
@@ -407,9 +447,45 @@ verify_sha256() {
   return 1
 }
 
+# DOCUMENTED DEVIATION FROM THE PINNED UPSTREAM ARTIFACT (ARCHITECTURE 6.1.3a) - not a local hack.
+# GE-Proton 11's umu mode (UMU_ID set) disables lsteamclient, which the 1.0 server needs for
+# Steamworks (SteamUtils011). We remove that override from the proton script, as the reference
+# (jsknnr/enshrouded-server 11ac003) does. On every Proton bump ask whether this is still needed
+# before carrying it over; regenerating GE_PROTON_PATCHED_PROTON_SHA256 is deliberate friction.
+#
+# Integrity chain: tarball SHA256 (verify_sha256, "did we get upstream's bits") -> extract ->
+# this patch -> SHA256 of the patched proton script == GE_PROTON_PATCHED_PROTON_SHA256 ("are these
+# the bits we intend to run"). Called only AFTER verify_sha256, on the freshly extracted tree.
+#
+# Fresh tree (no LSTEAMCLIENT_PATCHED_MARKER; the marker is only written after a successful
+# patch): the override line must occur EXACTLY ONCE - 0 or >1 means upstream changed shape and
+# we stop. Already-patched tree (marker present, e.g. a re-run): the line must be absent and the
+# script must hash to the patched pin; nothing is modified. A fully provisioned host never gets
+# here at all - install_ge_proton returns early on the marker + tarball-SHA record.
+LSTEAMCLIENT_PATCHED_MARKER=".lsteamclient-patched"
+LSTEAMCLIENT_LINE='append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")'
+patch_lsteamclient() {
+  local proton_script="$1" tree n got
+  tree="$(dirname "$proton_script")"
+  n="$(grep -cF -- "$LSTEAMCLIENT_LINE" "$proton_script" || true)"
+  if [ -e "${tree}/${LSTEAMCLIENT_PATCHED_MARKER}" ]; then
+    [ "$n" -eq 0 ] || die "${proton_script} is marked patched but still contains the lsteamclient override"
+  else
+    [ "$n" -eq 1 ] || die "expected exactly 1 lsteamclient override line in ${proton_script}, found ${n}; GE-Proton ${GE_PROTON_VERSION} no longer matches the patch - NOT installing an unpatched or unknown build"
+    sed -i 's/append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")/pass/' "$proton_script"
+    if grep -q 'lsteamclient=d' "$proton_script"; then
+      die "lsteamclient=d still present in ${proton_script} after patching"
+    fi
+  fi
+  got="$(sha256sum "$proton_script" | awk '{print $1}')"
+  [ "$got" = "$GE_PROTON_PATCHED_PROTON_SHA256" ] \
+    || die "patched proton script SHA256 mismatch: expected ${GE_PROTON_PATCHED_PROTON_SHA256} got ${got}; NOT installing"
+}
+
 install_ge_proton() {
   local marker="${GE_PROTON_DIR}/.sha256-verified" tarball ok=0
-  if [ -x "${GE_PROTON_DIR}/proton" ] && [ "$(cat "$marker" 2>/dev/null || true)" = "$GE_PROTON_SHA256" ]; then
+  if [ -x "${GE_PROTON_DIR}/proton" ] && [ -e "${GE_PROTON_DIR}/${LSTEAMCLIENT_PATCHED_MARKER}" ] \
+     && [ "$(cat "$marker" 2>/dev/null || true)" = "$GE_PROTON_SHA256" ]; then
     log "GE-Proton ${GE_PROTON_VERSION} already installed and verified"
     return 0
   fi
@@ -436,10 +512,13 @@ install_ge_proton() {
 
   mkdir -p "${STEAMCMD_DIR}/compatibilitytools.d" "${WORK_DIR}/x"
   tar -xzf "$tarball" -C "${WORK_DIR}/x"
-  [ -x "${WORK_DIR}/x/GE-Proton${GE_PROTON_VERSION}/proton" ] || die "tarball did not contain GE-Proton${GE_PROTON_VERSION}/proton"
-  echo "$GE_PROTON_SHA256" > "${WORK_DIR}/x/GE-Proton${GE_PROTON_VERSION}/.sha256-verified"
+  [ -x "${WORK_DIR}/x/${GE_PROTON_EXTRACTED}/proton" ] || die "tarball did not contain ${GE_PROTON_EXTRACTED}/proton"
+  # Patch only AFTER the SHA256 check above, and before the tree is moved into place.
+  patch_lsteamclient "${WORK_DIR}/x/${GE_PROTON_EXTRACTED}/proton"
+  touch "${WORK_DIR}/x/${GE_PROTON_EXTRACTED}/${LSTEAMCLIENT_PATCHED_MARKER}"
+  echo "$GE_PROTON_SHA256" > "${WORK_DIR}/x/${GE_PROTON_EXTRACTED}/.sha256-verified"
   rm -rf "${GE_PROTON_DIR}.new"
-  mv "${WORK_DIR}/x/GE-Proton${GE_PROTON_VERSION}" "${GE_PROTON_DIR}.new"
+  mv "${WORK_DIR}/x/${GE_PROTON_EXTRACTED}" "${GE_PROTON_DIR}.new"
   rm -rf "$GE_PROTON_DIR"
   mv "${GE_PROTON_DIR}.new" "$GE_PROTON_DIR"
   chown -R "${GAME_USER}:${GAME_USER}" "$GE_PROTON_DIR"
@@ -541,7 +620,7 @@ STOP_EOF
   # BEGIN UNIT: enshrouded.service
   write_if_changed /etc/systemd/system/enshrouded.service 0644 <<'UNIT_EOF'
 [Unit]
-Description=Enshrouded dedicated server (GE-Proton 10-26)
+Description=Enshrouded dedicated server (GE-Proton 11-9)
 Documentation=file:///srv/enshrouded
 After=network-online.target enshrouded-update.service
 Wants=network-online.target enshrouded-update.service
@@ -556,6 +635,10 @@ Group=enshrouded
 WorkingDirectory=/srv/enshrouded
 
 Environment=WINEDEBUG=-all
+# GE-Proton 11 umu mode: the proton script is patched at install (lsteamclient override removed)
+# and expects UMU_ID set. Launch the exe by RELATIVE name (WorkingDirectory above): an absolute
+# path routes through umu.exe, which blocks the server at startup once lsteamclient is enabled.
+Environment=UMU_ID=0
 # Proton needs a client install path and a compat-data (Wine prefix) path.
 # The prefix MUST be on the retained data volume so it survives instance replacement.
 Environment=STEAM_COMPAT_CLIENT_INSTALL_PATH=/opt/steamcmd
@@ -564,7 +647,7 @@ Environment=STEAM_COMPAT_DATA_PATH=/srv/enshrouded/compatdata
 # Loud failures, never a silent skip: wrong mount or missing binary must be an error.
 ExecStartPre=/usr/bin/mountpoint -q /srv/enshrouded
 ExecStartPre=/usr/bin/test -f /srv/enshrouded/enshrouded_server.exe
-ExecStart=/opt/steamcmd/compatibilitytools.d/GE-Proton10-26/proton run /srv/enshrouded/enshrouded_server.exe
+ExecStart=/opt/steamcmd/compatibilitytools.d/GE-Proton11-9/proton run enshrouded_server.exe
 
 # ---- Shutdown path: invariant 1.3. Do not "simplify" any of these. ----
 # ExecStop runs to completion BEFORE KillSignal/KillMode apply. It SIGINTs the game exe ALONE
@@ -670,7 +753,9 @@ main() {
   install_packages
   ensure_user
   ensure_data_volume
+  ensure_game_dirs
   install_steamcmd
+  install_steam_sdk_links
   install_ge_proton
   install_units
   configure_firewall

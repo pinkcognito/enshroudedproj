@@ -1,5 +1,5 @@
 [Unit]
-Description=Enshrouded dedicated server (GE-Proton 10-26)
+Description=Enshrouded dedicated server (GE-Proton 11-9)
 Documentation=file:///srv/enshrouded
 After=network-online.target enshrouded-update.service
 Wants=network-online.target enshrouded-update.service
@@ -14,6 +14,10 @@ Group=enshrouded
 WorkingDirectory=/srv/enshrouded
 
 Environment=WINEDEBUG=-all
+# GE-Proton 11 umu mode: the proton script is patched at install (lsteamclient override removed)
+# and expects UMU_ID set. Launch the exe by RELATIVE name (WorkingDirectory above): an absolute
+# path routes through umu.exe, which blocks the server at startup once lsteamclient is enabled.
+Environment=UMU_ID=0
 # Proton needs a client install path and a compat-data (Wine prefix) path.
 # The prefix MUST be on the retained data volume so it survives instance replacement.
 Environment=STEAM_COMPAT_CLIENT_INSTALL_PATH=/opt/steamcmd
@@ -22,7 +26,7 @@ Environment=STEAM_COMPAT_DATA_PATH=/srv/enshrouded/compatdata
 # Loud failures, never a silent skip: wrong mount or missing binary must be an error.
 ExecStartPre=/usr/bin/mountpoint -q /srv/enshrouded
 ExecStartPre=/usr/bin/test -f /srv/enshrouded/enshrouded_server.exe
-ExecStart=/opt/steamcmd/compatibilitytools.d/GE-Proton10-26/proton run /srv/enshrouded/enshrouded_server.exe
+ExecStart=/opt/steamcmd/compatibilitytools.d/GE-Proton11-9/proton run enshrouded_server.exe
 
 # ---- Shutdown path: invariant 1.3. Do not "simplify" any of these. ----
 # ExecStop runs to completion BEFORE KillSignal/KillMode apply. It SIGINTs the game exe ALONE

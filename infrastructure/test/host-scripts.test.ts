@@ -1,6 +1,8 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
+import * as crypto from 'crypto';
 import * as cdk from 'aws-cdk-lib/core';
 import { Template } from 'aws-cdk-lib/assertions';
 import { EnshroudedServerStack } from '../lib/enshrouded-server-stack';
@@ -12,6 +14,8 @@ const read = (p: string) => fs.readFileSync(path.join(ROOT, p), 'utf8');
 const GAME_UNIT = 'systemd/enshrouded.service';
 const UPDATE_UNIT = 'systemd/enshrouded-update.service';
 const PROVISION = 'scripts/provision-host.sh';
+const DEBUG_HELPER = 'scripts/enshrouded-debug.sh';
+const DEPLOY = 'scripts/deploy-game-server.sh';
 const STOP_PATH = '/usr/local/lib/enshrouded/stop-game.sh';
 
 // ---------------------------------------------------------------------------
@@ -186,13 +190,25 @@ describe('unit file content', () => {
     expect(unit['Service']['ExecStartPre']).toContain('/usr/bin/mountpoint -q /srv/enshrouded');
   });
 
-  test('ExecStart runs the pinned GE-Proton, and its version matches the install script', () => {
+  test('ExecStart runs the pinned GE-Proton by RELATIVE exe name, and its version matches the install script', () => {
     const execStart = effective(unit, 'Service', 'ExecStart') ?? '';
     const ver = /GE_PROTON_VERSION="([^"]+)"/.exec(read(PROVISION))?.[1];
     expect(ver).toBeDefined();
-    expect(execStart).toBe(
-      `/opt/steamcmd/compatibilitytools.d/GE-Proton${ver}/proton run /srv/enshrouded/enshrouded_server.exe`,
-    );
+    // Relative (resolved against WorkingDirectory): an absolute exe path routes through umu.exe,
+    // which blocks the server at startup once lsteamclient is enabled.
+    expect(execStart).toBe(`/opt/steamcmd/compatibilitytools.d/GE-Proton${ver}/proton run enshrouded_server.exe`);
+    expect(execStart).not.toMatch(/proton run \//);
+    expect(effective(unit, 'Service', 'WorkingDirectory')).toBe('/srv/enshrouded');
+  });
+
+  test('UMU_ID=0 is set (GE-Proton 11 umu mode)', () => {
+    expect(unit['Service']['Environment']).toContain('UMU_ID=0');
+  });
+
+  test('stop-game.sh pattern still matches a relative launch (and the Wine-side absolute path)', () => {
+    const pattern = /[e]nshrouded_server\.exe/;
+    expect(pattern.test('python3 /opt/steamcmd/compatibilitytools.d/GE-Proton11-9/proton run enshrouded_server.exe')).toBe(true);
+    expect(pattern.test('Z:\\srv\\enshrouded\\enshrouded_server.exe')).toBe(true);
   });
 
   test('update unit is a oneshot ordered Before=enshrouded.service', () => {
@@ -207,8 +223,10 @@ describe('provision-host.sh', () => {
   const script = read(PROVISION);
 
   test('pins GE-Proton by version AND sha256 (invariant 1.4)', () => {
-    expect(script).toMatch(/^GE_PROTON_VERSION="10-26"$/m);
-    expect(script).toMatch(/^GE_PROTON_SHA256="e2ffd9d2a1ece30b5da3d3dc9cedaa82875008d1c984b5efc7666c028203f9db"$/m);
+    expect(script).toMatch(/^GE_PROTON_VERSION="11-9"$/m);
+    expect(script).toMatch(/^GE_PROTON_SHA256="b2cf4a632a70ec321cdb9904fa396a2a45d4061129f9fdc89d8a27ea5ceeb9d6"$/m);
+    expect(script).toMatch(/^GE_PROTON_TARBALL="GE-Proton\$\{GE_PROTON_VERSION\}-x86_64\.tar\.gz"$/m);
+    expect(script).toMatch(/^GE_PROTON_EXTRACTED="GE-Proton\$\{GE_PROTON_VERSION\}-x86_64"$/m);
     expect(script).toMatch(/\/download\/GE-Proton\$\{GE_PROTON_VERSION\}\//);
     expect(script).not.toMatch(/releases\/latest/);
   });
@@ -220,6 +238,125 @@ describe('provision-host.sh', () => {
     expect(script).toMatch(/^set -euo pipefail$/m);
     // extraction must come after verification
     expect(script.indexOf('verify_sha256 "$tarball"')).toBeLessThan(script.indexOf('tar -xzf "$tarball"'));
+  });
+
+  /** The patch_lsteamclient function text, and the install_ge_proton body. */
+  const patchFn = /patch_lsteamclient\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '';
+  const installFn = /install_ge_proton\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '';
+
+  test('lsteamclient patch: verify-then-extract-then-patch, with a fail-if-absent guard', () => {
+    expect(patchFn).toContain('sed -i');
+    expect(patchFn).toContain('lsteamclient=d');
+    // fail loudly when the override line is not found (and no already-patched marker)
+    expect(patchFn).toMatch(/\[ "\$n" -eq 1 \] \|\| die "expected exactly 1 lsteamclient override line/);
+    expect(patchFn).toMatch(/grep -cF/);
+    expect(patchFn).toMatch(/GE_PROTON_PATCHED_PROTON_SHA256[\s\S]*?die "patched proton script SHA256 mismatch/);
+    expect(script).toMatch(/^GE_PROTON_PATCHED_PROTON_SHA256="81ce6ce5fce8501abe8614c97770b975b0ea2ca6d5385de62592ea3a797b759d"$/m);
+    expect(script).toContain('ARCHITECTURE 6.1.3a');
+    // and when it is still there after the sed
+    expect(patchFn).toMatch(/grep -q 'lsteamclient=d'[\s\S]*?die/);
+    // ordering inside install_ge_proton: SHA verification < extraction < patch < move into place
+    const i = (needle: string) => installFn.indexOf(needle);
+    expect(i('verify_sha256 "$tarball"')).toBeGreaterThanOrEqual(0);
+    expect(i('verify_sha256 "$tarball"')).toBeLessThan(i('tar -xzf "$tarball"'));
+    expect(i('tar -xzf "$tarball"')).toBeLessThan(i('patch_lsteamclient '));
+    expect(i('patch_lsteamclient ')).toBeLessThan(i('mv "${WORK_DIR}/x/'));
+    // the patch is applied to the extracted tree, never to the tarball
+    expect(installFn).toMatch(/patch_lsteamclient "\$\{WORK_DIR\}\/x\/\$\{GE_PROTON_EXTRACTED\}\/proton"/);
+  });
+
+  describe('patch_lsteamclient behaviour (real bash)', () => {
+    const LINE = 'append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")';
+    let tmp: string;
+    beforeAll(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'patch-')); });
+    afterAll(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+    const fwd = (x: string) => x.replace(/\\/g, '/');
+    function run(name: string, content: string, marker = false, pin?: string) {
+      const dir = path.join(tmp, name);
+      fs.mkdirSync(dir, { recursive: true });
+      const f = path.join(dir, 'proton');
+      fs.writeFileSync(f, content);
+      if (marker) fs.writeFileSync(path.join(dir, '.lsteamclient-patched'), '');
+      const q = (x: string) => /^LSTEAMCLIENT_\w+=.*$/m.exec(script)?.[0] && x;
+      void q;
+      const defs = script.split('\n').filter((l) => /^LSTEAMCLIENT_(PATCHED_MARKER|LINE)=/.test(l)).join('\n') +
+        `\nGE_PROTON_PATCHED_PROTON_SHA256=${pin ?? crypto.createHash('sha256').update(content.split(LINE).join('pass')).digest('hex')}`;
+      const r = spawnSync('bash', ['-c',
+        `die() { echo "FATAL: $*" >&2; exit 1; }; GE_PROTON_VERSION=11-9; ${defs}\n${patchFn}\npatch_lsteamclient "${fwd(f)}"`],
+      { encoding: 'utf8' });
+      return { r, after: fs.readFileSync(f, 'utf8') };
+    }
+    const bashOk = !spawnSync('bash', ['-c', 'true']).error;
+    const t = bashOk ? test : test.skip;
+    t('removes the override line', () => {
+      const { r, after } = run('a', `x = 1\n        ${LINE}\ny = 2\n`);
+      expect(r.status).toBe(0);
+      expect(after).not.toContain('lsteamclient=d');
+      expect(after).toContain('pass');
+    });
+    t('FAILS when the line is absent and the tree is not marked patched', () => {
+      const { r } = run('b', 'x = 1\ny = 2\n');
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('expected exactly 1 lsteamclient override line');
+    });
+    t('FAILS when the line occurs more than once', () => {
+      const { r } = run('e', `${LINE}\n${LINE}\n`);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('found 2');
+    });
+    t('FAILS when the patched script does not hash to the pin', () => {
+      const { r } = run('f', `${LINE}\n`, false, '0'.repeat(64));
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('patched proton script SHA256 mismatch');
+    });
+    t('already-patched tree with a wrong hash is rejected too', () => {
+      const { r } = run('g', 'x = 1\npass\n', true, '0'.repeat(64));
+      expect(r.status).not.toBe(0);
+    });
+    t('is idempotent: absent line, patched marker present, pinned hash matches -> passes unmodified', () => {
+      const { r } = run('c', 'x = 1\npass\n', true, crypto.createHash('sha256').update('x = 1\npass\n').digest('hex'));
+      expect(r.status).toBe(0);
+    });
+    t('FAILS if lsteamclient=d survives in a form the sed does not match', () => {
+      const { r } = run('d', `${LINE}\nother = "lsteamclient=d"\n`);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('still present');
+    });
+  });
+
+  test('packages: libvulkan1 and winbind installed, and no Vulkan ICD added', () => {
+    const fn = (/install_packages\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '').replace(/^\s*#.*$/gm, '');
+    expect(fn).toMatch(/\blibvulkan1\b/);
+    expect(fn).toMatch(/\bwinbind\b/);
+    expect(fn).toMatch(/\blib32gcc-s1\b/);
+    expect(fn).toMatch(/\blib32stdc\+\+6\b/);
+    expect(fn).not.toMatch(/mesa-vulkan-drivers/);
+    expect(fn).not.toMatch(/apt-get[^\n]*install[\s\S]*\bmesa-/);
+  });
+
+  test('steam SDK symlinks for the game user, created after install_steamcmd', () => {
+    const fn = /install_steam_sdk_links\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '';
+    expect(fn).toContain('/home/${GAME_USER}');
+    expect(fn).toContain('.steam/sdk${bits}');
+    expect(fn).toContain('${STEAMCMD_DIR}/linux${bits}');
+    expect(fn).toMatch(/for bits in 64 32/);
+    expect(fn).toMatch(/as_game_user ln -sfn "\$dir" "\$link"/);
+    expect(fn).toMatch(/steamservice\.so/);
+    expect(fn).toMatch(/steamclient\.so/);
+    const main = /\nmain\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '';
+    expect(main.indexOf('install_steamcmd')).toBeGreaterThanOrEqual(0);
+    expect(main.indexOf('install_steamcmd')).toBeLessThan(main.indexOf('install_steam_sdk_links'));
+  });
+
+  test('savegame/ and logs/ are pre-created, game-owned, before the unit exists', () => {
+    const fn = /ensure_game_dirs\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '';
+    expect(fn).toMatch(/mkdir -p[^\n]*\/savegame[^\n]*\/logs/);
+    expect(fn).toMatch(/chown "\$\{GAME_USER\}:\$\{GAME_USER\}"[^\n]*\/savegame[^\n]*\/logs/);
+    expect(fn).toContain('.permtest'); // write test, as the reference entrypoint
+    expect(fn).toContain('mountpoint -q "$DATA_MOUNT"'); // never onto the root volume
+    const main = /\nmain\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '';
+    expect(main.indexOf('ensure_data_volume')).toBeLessThan(main.indexOf('ensure_game_dirs'));
+    expect(main.indexOf('ensure_game_dirs')).toBeLessThan(main.indexOf('install_units'));
   });
 
   test('uses +@sSteamCmdForcePlatformType windows with app 2278520', () => {
@@ -358,7 +495,7 @@ describe('provision-host.sh', () => {
   });
 
   test('no CRLF line endings (would break bash / systemd on the host)', () => {
-    for (const f of [PROVISION, GAME_UNIT, UPDATE_UNIT]) expect(read(f)).not.toContain('\r');
+    for (const f of [PROVISION, GAME_UNIT, UPDATE_UNIT, DEBUG_HELPER, DEPLOY]) expect(read(f)).not.toContain('\r');
   });
 
   test('passes bash -n (skipped if bash is unavailable)', () => {
@@ -372,6 +509,66 @@ describe('provision-host.sh', () => {
     for (const f of [PROVISION, GAME_UNIT, UPDATE_UNIT]) {
       expect(read(f)).not.toMatch(/InfrastructureStack|AdminUiStack|GithubOidcStack|i-0d2f683b403536375/);
     }
+  });
+});
+
+describe('debug drop-in helper (enshrouded-debug.sh)', () => {
+  const helper = read(DEBUG_HELPER);
+  const unitText = read(GAME_UNIT);
+
+  test('writes a drop-in for enshrouded.service with the verbose settings; does not touch the base unit', () => {
+    expect(helper).toContain('/etc/systemd/system/enshrouded.service.d');
+    expect(helper).toContain('debug.conf');
+    expect(helper).toContain('Environment=PROTON_LOG=1');
+    expect(helper).toContain('Environment=PROTON_LOG_DIR=/srv/enshrouded/logs');
+    expect(helper).toContain('Environment=WINEDEBUG=+err,+loaddll,+seh');
+    expect(helper).toMatch(/daemon-reload/);
+    expect(helper).toMatch(/\n\s*off\)/);
+    expect(helper).toMatch(/rm -f "\$DROPIN"/);
+  });
+
+  test('never starts/stops/restarts the game and never edits the base unit', () => {
+    expect(helper).not.toMatch(/systemctl\s+(start|stop|restart|kill|try-restart|reload-or-restart)\b/);
+    expect(helper).not.toMatch(/\/etc\/systemd\/system\/enshrouded\.service(?!\.d)/);
+  });
+
+  test('verbose logging is NOT permanent: base unit keeps WINEDEBUG=-all and no PROTON_LOG', () => {
+    const u = parseUnit(unitText);
+    expect(u['Service']['Environment']).toContain('WINEDEBUG=-all');
+    expect(unitText).not.toMatch(/PROTON_LOG/);
+    expect(read(PROVISION)).not.toMatch(/PROTON_LOG/);
+  });
+
+  test('passes bash -n (skipped if bash is unavailable)', () => {
+    const r = spawnSync('bash', ['-n', path.join(ROOT, DEBUG_HELPER)], { encoding: 'utf8' });
+    if (r.error) return;
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+  });
+});
+
+describe('deploy-game-server.sh readiness wait fails fast on a dead unit', () => {
+  const deploy = read(DEPLOY);
+  const waitFn = /wait_ready\(\) \{[\s\S]*?\n\}/.exec(deploy)?.[0] ?? '';
+
+  test('checks is-failed inside the loop, surfaces the journal, and aborts', () => {
+    expect(waitFn).toMatch(/systemctl is-failed --quiet enshrouded\.service/);
+    expect(waitFn).toMatch(/journalctl -u enshrouded -n 30/);
+    expect(waitFn.indexOf('is-failed')).toBeGreaterThan(waitFn.indexOf('for _ in'));
+    expect(waitFn.indexOf('is-failed')).toBeLessThan(waitFn.indexOf('is-active'));
+  });
+
+  test('behaviour: a failed unit returns immediately (not after READY_TIMEOUT) and prints the journal', () => {
+    if (spawnSync('bash', ['-c', 'true']).error) return;
+    const f = path.join(ROOT, DEPLOY).replace(/\\/g, '/');
+    const r = spawnSync('bash', ['-c',
+      `P="$PATH"; source "${f}"; PATH="$P"; READY_TIMEOUT=600; set +e; ` +
+      `systemctl() { [ "$1" = is-failed ] && return 0; return 1; }; ` +
+      `journalctl() { echo "JOURNAL-LINES $*"; }; ` +
+      `start=$SECONDS; wait_ready; rc=$?; echo "rc=$rc elapsed=$((SECONDS-start))"`,
+    ], { encoding: 'utf8', timeout: 20000 });
+    expect(r.stdout).toMatch(/rc=1 elapsed=[0-3]\b/);
+    expect(r.stderr).toContain('JOURNAL-LINES -u enshrouded -n 30');
   });
 });
 
