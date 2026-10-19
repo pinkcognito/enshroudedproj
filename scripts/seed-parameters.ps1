@@ -206,13 +206,19 @@ if ($targets) {
 
 if (-not $DryRun) {
   Write-Step 'Stored parameters (names and types only - values are never printed)'
-  # Filter CLIENT-SIDE rather than with --parameter-filters. Both server-side forms
-  # are broken from PowerShell: the CLI shorthand
-  # ("Key=Name,Option=BeginsWith,Values=...") silently returns ZERO matches even when
-  # the parameters exist, and the JSON form loses its double quotes to PowerShell's
-  # native-argument quoting, so the CLI receives invalid JSON. Both verified against a
-  # populated store. A silently-empty result would make this check report success-by-
-  # absence, so it is filtered here instead. Do not "simplify" this back.
+  # Filter CLIENT-SIDE rather than with --parameter-filters.
+  #
+  # CORRECTION: an earlier version of this comment claimed the CLI shorthand
+  # ("Key=Name,Option=BeginsWith,Values=/enshroudedproj/") silently returns zero
+  # matches. That was wrong - it was Git Bash rewriting the /-prefixed value into
+  # a Windows path (MSYS_NO_PATHCONV), in the author's shell, not PowerShell's.
+  # The shorthand works correctly from PowerShell.
+  #
+  # Client-side filtering is kept anyway, for a reason that IS real: the JSON form
+  # of --parameter-filters loses its double quotes to PowerShell's native-argument
+  # quoting (verified), and filtering here depends on no shell quoting behaviour at
+  # all. This check reports success-by-absence if it ever silently returns nothing,
+  # which is the dangerous direction, so it is worth being boring about.
   $all = (aws ssm describe-parameters --region $Region `
       --query 'Parameters[].[Name,Type]' --output text) -split "`n" |
     Where-Object { $_ -match "^$prefix/" }
