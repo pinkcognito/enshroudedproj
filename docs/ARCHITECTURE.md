@@ -2649,12 +2649,13 @@ such a tier is a true spectator, not a restricted builder.
 | group | canKickBan | canAccessInventories | canEditWorld | canEditBase | canExtendBase | reservedSlots |
 | --- | --- | --- | --- | --- | --- | --- |
 | **Admin** | true | true | **true** | true | true | 0 |
-| **Friend** | false | true | **true** | true | false | 0 |
+| **Friend** | false | true | **true** | true | true | 0 |
 | **Guest** | false | **false** | **true** | **true** | false | 0 |
 | **Visitor** | false | false | **false** | **false** | false | 0 |
 
-**Guest is distinguished from Friend by `canAccessInventories` alone** — Guest may play and
-build, but may not open other players' containers.
+**Guest differs from Friend in both `canAccessInventories` and `canExtendBase`.** Both
+groups may play and build; only Friend receives inventory access and base-extension/altar
+rights.
 
 ##### Why this, and why NOT "restrict Guest further"
 
