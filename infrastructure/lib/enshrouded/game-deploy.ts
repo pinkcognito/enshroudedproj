@@ -4,9 +4,10 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
+import { githubOidcSubs } from './constants';
 
 /** GitHub repo allowed to assume the deploy role (matches the project-wide `repo` tag). */
-export const GITHUB_REPO = 'pinkcognito/enshroudedproj';
+export { GITHUB_REPO_BY_NAME as GITHUB_REPO } from './constants';
 export const GAME_DEPLOY_ROLE_NAME = 'enshrouded-github-game-deploy';
 /** The ONLY parameter the deploy workflow may write (ARCHITECTURE 6.6.2). */
 export const MAINTENANCE_PARAM_PATH = '/enshroudedproj/state/maintenance-mode';
@@ -58,10 +59,10 @@ export class GameDeploy extends Construct {
       roleName: GAME_DEPLOY_ROLE_NAME,
       // main-branch workflows of this repo only (workflow_dispatch from main carries this sub).
       assumedBy: new iam.WebIdentityPrincipal(provider.openIdConnectProviderArn, {
-        StringEquals: {
-          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-          'token.actions.githubusercontent.com:sub': `repo:${GITHUB_REPO}:ref:refs/heads/main`,
-        },
+        StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com' },
+        // A list is an OR. No wildcards: the branch context stays exact, so this is
+        // still main-only - only the repo spelling has two accepted forms.
+        StringLike: { 'token.actions.githubusercontent.com:sub': githubOidcSubs('ref:refs/heads/main') },
       }),
       maxSessionDuration: cdk.Duration.hours(1),
     });

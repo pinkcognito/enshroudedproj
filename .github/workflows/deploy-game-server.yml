@@ -18,8 +18,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # SHA-pinned per ARCHITECTURE 6.1.3: a mutable tag running with the CI token is a
+      # supply-chain dependency. Same pin as pr-aws-diff.yml.
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           # Role + instance id are repository variables (neither is a secret); see the
           # DeployRoleArn / InstanceId outputs of EnshroudedServerStack.
