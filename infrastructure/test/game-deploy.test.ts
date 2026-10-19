@@ -13,6 +13,7 @@ import { spawnSync, SpawnSyncReturns } from 'child_process';
 import * as cdk from 'aws-cdk-lib/core';
 import { Template } from 'aws-cdk-lib/assertions';
 import { EnshroudedServerStack } from '../lib/enshrouded-server-stack';
+import { makeHarness, allSecrets } from './render-harness';
 
 const ROOT = path.join(__dirname, '..');
 const REPO = path.join(ROOT, '..');
@@ -21,12 +22,14 @@ const fwd = (p: string) => p.replace(/\\/g, '/');
 
 const DEPLOY = 'scripts/deploy-game-server.sh';
 const DRIVER = 'scripts/run-game-deploy.sh';
+const RENDER = 'scripts/render-config.sh';
 const PROVISION = 'scripts/provision-host.sh';
 const TEMPLATE = 'config/enshrouded_server.json.tmpl';
 const WORKFLOW = path.join(REPO, '.github', 'workflows', 'deploy-game-server.yml');
 
 const deploy = read(DEPLOY);
 const driver = read(DRIVER);
+const renderSrc = read(RENDER);
 const updateHelper = /<<'UPDATE_EOF'\n([\s\S]*?)\nUPDATE_EOF/.exec(read(PROVISION))?.[1] ?? '';
 const code = (s: string) => s.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).join('\n');
 
@@ -45,11 +48,11 @@ function runBash(script: string, env: Record<string, string> = {}): SpawnSyncRet
 
 describe('static hygiene', () => {
   test('LF only, bash -n clean', () => {
-    for (const f of [DEPLOY, DRIVER, TEMPLATE]) expect(read(f)).not.toContain('\r');
+    for (const f of [DEPLOY, DRIVER, RENDER, TEMPLATE]) expect(read(f)).not.toContain('\r');
     expect(fs.readFileSync(WORKFLOW, 'utf8')).not.toContain('\r');
     expect(updateHelper).not.toContain('\r');
     if (!HAVE_BASH) return;
-    for (const f of [DEPLOY, DRIVER, PROVISION]) {
+    for (const f of [DEPLOY, DRIVER, RENDER, PROVISION]) {
       const r = spawnSync('bash', ['-n', fwd(path.join(ROOT, f))], { encoding: 'utf8' });
       expect(r.stderr).toBe('');
       expect(r.status).toBe(0);
@@ -60,7 +63,7 @@ describe('static hygiene', () => {
   });
 
   test('nothing references the UO project', () => {
-    const all = [deploy, driver, read(TEMPLATE), fs.readFileSync(WORKFLOW, 'utf8'), read('lib/enshrouded/game-deploy.ts')];
+    const all = [deploy, driver, renderSrc, read(TEMPLATE), fs.readFileSync(WORKFLOW, 'utf8'), read('lib/enshrouded/game-deploy.ts')];
     for (const t of all) expect(t).not.toMatch(/InfrastructureStack|AdminUiStack|GithubOidcStack|i-0d2f683b403536375/);
   });
 });
@@ -152,7 +155,7 @@ describe('config template (section 7 schema)', () => {
 
 describe('SSM access from on-box code stays inside server/ (section 6.6)', () => {
   const onBox = [
-    ['deploy-game-server.sh', code(deploy)],
+    ['render-config.sh', code(renderSrc)],
     ['update-game.sh', code(updateHelper)],
   ] as const;
 
@@ -168,16 +171,28 @@ describe('SSM access from on-box code stays inside server/ (section 6.6)', () =>
     expect(deploy.replace(/^\s*#.*$/gm, '')).not.toMatch(/maintenance/i);
   });
 
-  test('group passwords are fetched with one server/ by-path call', () => {
-    expect(code(deploy)).toMatch(/get-parameters-by-path[\s\S]*--path "\$SSM_PREFIX"[\s\S]*--recursive[\s\S]*--with-decryption/);
-    expect(deploy).toMatch(/^SSM_PREFIX="\/enshroudedproj\/server"$/m);
+  test('WP-22: passwords are read by NAME (get-parameters --names), never by a path walk', () => {
+    const c = code(renderSrc);
+    expect(c).toMatch(/ssm get-parameters --region[\s\S]*--names "\$\{PARAM_NAMES\[@\]\}" --with-decryption/);
+    expect(c).not.toMatch(/get-parameters-by-path|--recursive/);
+    // the list is hardcoded: six literal names, no variable interpolation inside the array
+    const arr = /PARAM_NAMES=\(([\s\S]*?)\n\)/.exec(renderSrc)?.[1] ?? '';
+    const names = arr.split('\n').map((l) => l.trim()).filter(Boolean);
+    expect(names).toHaveLength(6);
+    for (const n of names) expect(n).toMatch(/^\/enshroudedproj\/server\/[a-z-]+(\/[a-z-]+)?$/);
+  });
+
+  test('WP-22: deploy-game-server.sh no longer reads SSM or keeps a renderer of its own', () => {
+    const c = code(deploy);
+    expect(c).not.toMatch(/aws ssm|get-parameters|RENDER_PY|python3 -c "\$/);
+    expect(c).toMatch(/"\$RENDER_SH" "\$1"/);
   });
 });
 
 describe('slot count', () => {
   test('hard cap of 16 is enforced in the renderer', () => {
-    expect(deploy).toMatch(/MAX_SLOTS = 16/);
-    expect(deploy).toMatch(/1 <= int\(vals\["SLOT_COUNT"\]\) <= MAX_SLOTS/);
+    expect(renderSrc).toMatch(/MAX_SLOTS = 16/);
+    expect(renderSrc).toMatch(/1 <= int\(vals\["SLOT_COUNT"\]\) <= MAX_SLOTS/);
   });
 });
 
@@ -185,43 +200,19 @@ describe('rendering (bash + python3 + stubbed aws)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wp06-'));
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  const SECRETS = {
-    admin: 'ADMINSECRET-s3cr3t"\\q',
-    friend: 'FRIENDSECRET-9981',
-    guest: 'GUESTSECRET-7742',
-    visitor: 'VISITORSECRET-5530',
-  };
-  function fixture(over: Record<string, string | null> = {}): string {
-    const base: Record<string, string> = {
-      name: 'Test Realm',
-      'slot-count': '12',
-      'user-groups/admin-password': SECRETS.admin,
-      'user-groups/friend-password': SECRETS.friend,
-      'user-groups/guest-password': SECRETS.guest,
-      'user-groups/visitor-password': SECRETS.visitor,
-    };
-    for (const [k, v] of Object.entries(over)) {
-      if (v === null) delete base[k];
-      else base[k] = v;
-    }
-    const params = Object.entries(base).map(([k, v]) => ({ Name: `/enshroudedproj/server/${k}`, Value: v }));
-    const f = path.join(tmp, `fx-${Math.random().toString(36).slice(2)}.json`);
-    fs.writeFileSync(f, JSON.stringify({ Parameters: params }));
-    return f;
-  }
+  const h = makeHarness(tmp);
+  // The deploy path: install the workflow's template at the canonical (here: sandboxed) path, then
+  // render through the extracted renderer. `aws` is the faithful get-parameters stub from the harness.
   function render(over: Record<string, string | null> = {}) {
-    const fx = fixture(over);
+    const fx = h.fixture(over);
     const out = path.join(tmp, `out-${Math.random().toString(36).slice(2)}.json`);
-    // `aws` is shadowed by a function that records its argv and serves the fixture.
     const r = runBash(
       `P="$PATH"; source "${fwd(path.join(ROOT, DEPLOY))}"; PATH="$P"; ` + // the script pins a Linux PATH
-        `aws() { echo "$*" >> "${fwd(tmp)}/aws-argv.log"; cat "${fwd(fx)}"; }; ` +
-        `fetch_and_render "${fwd(path.join(ROOT, TEMPLATE))}" "${fwd(out)}"`,
+        `install_template "${fwd(path.join(ROOT, TEMPLATE))}" && fetch_and_render "${fwd(out)}"`,
+      { ...h.env(fx), ENSHROUDED_RENDER_SCRIPT: fwd(h.renderSh), ENSHROUDED_TEMPLATE_DEST: fwd(h.templateDest) },
     );
     return { r, out };
   }
-  const allSecrets = Object.values(SECRETS);
-
   pyTest('renders the schema: passwords under userGroups, numeric slotCount, no gamePort', () => {
     const { r, out } = render();
     expect(r.status).toBe(0);
@@ -246,9 +237,9 @@ describe('rendering (bash + python3 + stubbed aws)', () => {
       expect(r.stderr).not.toContain(s);
     }
     // ...and none reached the aws argv either (values flow only through the pipe)
-    const argv = fs.readFileSync(path.join(tmp, 'aws-argv.log'), 'utf8');
+    const argv = h.calls().join('\n');
     for (const s of allSecrets) expect(argv).not.toContain(s);
-    expect(argv).toContain('--path /enshroudedproj/server');
+    expect(argv).toContain('--names /enshroudedproj/server/name');
   });
 
   pyTest('no secret value is echoed on any failure path either', () => {
@@ -259,6 +250,7 @@ describe('rendering (bash + python3 + stubbed aws)', () => {
       { 'user-groups/guest-password': null },
       { 'user-groups/admin-password': 'x' },
       { name: '' },
+      { 'user-groups/friend-password': '' },
     ];
     for (const c of cases) {
       const { r, out } = render(c);
@@ -281,6 +273,48 @@ describe('rendering (bash + python3 + stubbed aws)', () => {
     const { out } = render();
     if (process.platform === 'win32') return; // NTFS has no POSIX mode bits
     expect(fs.statSync(out).mode & 0o777).toBe(0o600);
+  });
+
+  pyTest('WP-22: the deploy installs its template BEFORE rendering - a stale on-box template is never used', () => {
+    // A boot render has no workflow to hand it a template; if the deploy rendered from the workflow's
+    // copy but left the older one on the box, the next boot render would silently overwrite the
+    // just-deployed config. Plant a stale template, deploy, and prove the config AND the on-box
+    // template are the new ones.
+    fs.writeFileSync(h.templateDest, JSON.stringify({ name: '${SERVER_NAME}', slotCount: '${SLOT_COUNT}', STALE: true }));
+    const { r, out } = render();
+    expect(r.status).toBe(0);
+    const cfg = JSON.parse(fs.readFileSync(out, 'utf8'));
+    expect(cfg).not.toHaveProperty('STALE');
+    expect(cfg.enableTextChat).toBe(true);
+    expect(fs.readFileSync(h.templateDest, 'utf8')).toBe(fs.readFileSync(path.join(ROOT, TEMPLATE), 'utf8'));
+  });
+
+  pyTest('WP-22: a later boot render over the deployed template reproduces the deployed config (idempotent)', () => {
+    const { r, out } = render();
+    expect(r.status).toBe(0);
+    const again = path.join(tmp, 'boot-render.json');
+    const r2 = h.run(again);
+    expect(r2.status).toBe(0);
+    expect(fs.readFileSync(again, 'utf8')).toBe(fs.readFileSync(out, 'utf8'));
+  });
+
+  pyTest('WP-22: an invalid template is rejected before it can replace the on-box one', () => {
+    const bad = path.join(tmp, 'bad.tmpl');
+    fs.writeFileSync(bad, '{ not json');
+    const before = fs.readFileSync(h.templateDest, 'utf8');
+    const r = runBash(
+      `P="$PATH"; source "${fwd(path.join(ROOT, DEPLOY))}"; PATH="$P"; install_template "${fwd(bad)}"`,
+      { ENSHROUDED_TEMPLATE_DEST: fwd(h.templateDest) },
+    );
+    expect(r.status).not.toBe(0);
+    expect(fs.readFileSync(h.templateDest, 'utf8')).toBe(before);
+  });
+
+  test('WP-22: main() installs the template before it renders, and checks the renderer exists', () => {
+    const c = code(deploy);
+    expect(c.indexOf('install_template "$TEMPLATE_FILE"')).toBeGreaterThan(0);
+    expect(c.indexOf('install_template "$TEMPLATE_FILE"')).toBeLessThan(c.indexOf('fetch_and_render "$STAGED"'));
+    expect(c).toMatch(/\[ -x "\$RENDER_SH" \]/);
   });
 });
 
