@@ -20,6 +20,11 @@ const commands = [
     options: [
       {
         type: OPTION_TYPE.SUB_COMMAND,
+        name: 'channel',
+        description: 'Use this text channel for server status posts and its green/red name',
+      },
+      {
+        type: OPTION_TYPE.SUB_COMMAND,
         name: 'start',
         description: 'Start the Enshrouded server',
       },

@@ -71,10 +71,11 @@ export function findDrift(source: string, cmds: Command[]): string[] {
 }
 
 describe('command definitions', () => {
-  test('/enshrouded is a single command with start and status subcommands (type 1)', () => {
+  test('/enshrouded is a single command with channel, start and status subcommands (type 1)', () => {
     expect(commandList.map((c) => c.name)).toEqual(['enshrouded']);
     const subs = commandList[0].options ?? [];
-    expect(subs.map((s) => s.name).sort()).toEqual(['start', 'status']);
+    expect(subs.map((s) => s.name).sort()).toEqual(['channel', 'start', 'status']);
+    expect(subs.find((s) => s.name === 'channel')?.options ?? []).toEqual([]);
     for (const s of subs) expect(s.type).toBe(1);
   });
 
@@ -101,7 +102,7 @@ describe('anti-drift: handler vs commands.js', () => {
   test('the handler actually dispatches on something (extractor is not vacuous)', () => {
     const usage = extractHandlerUsage(handlerSource);
     expect(usage.commandNames).toContain('enshrouded');
-    expect([...usage.subcommandNames].sort()).toEqual(['start', 'status']);
+    expect([...usage.subcommandNames].sort()).toEqual(['channel', 'start', 'status']);
   });
 
   test('fails when the handler reads an option commands.js does not register', () => {
@@ -229,6 +230,56 @@ describe('handler: signature verification, PING, deferred ack', () => {
     return signedEvent({ id: 'interaction-id', type: 2, token: 'secret-token',
       data: { name: 'enshrouded', options: [{ type: 1, name: 'start' }] } });
   }
+
+  const channelRequest = {
+    guild_id: '123456789012345678', channel_id: '234567890123456789',
+    channel: { type: 0 }, member: { permissions: '32' }, app_permissions: '3088',
+  };
+  function channelEvent(overrides: object = {}) {
+    return signedEvent({ type: 2, id: 'interaction-id', token: 'tok', ...channelRequest,
+      data: { name: 'enshrouded', options: [{ type: 1, name: 'channel' }] }, ...overrides });
+  }
+
+  test.each([
+    { member: undefined }, { member: { permissions: '0' } }, { member: { permissions: 'invalid' } },
+    { guild_id: undefined }, { guild_id: 'bad' }, { channel_id: 'bad' },
+    ...[1, 2, 5, 10, 11, 12, 13, 15, 16].map((type) => ({ channel: { type } })),
+    { channel: undefined }, { app_permissions: '3072' }, { app_permissions: '1040' },
+    { app_permissions: '2064' }, { app_permissions: undefined },
+    { data: { name: 'enshrouded', options: [{ type: 1, name: 'channel', options: [{ name: 'channel', value: 'other' }] }] } },
+  ])('channel rejection is ephemeral with no fetch or SDK load: %j', async (overrides) => {
+    const loads = mockSdkLoaded.mock.calls.length;
+    const res = await handler(channelEvent(overrides));
+    expect(JSON.parse(res.body as string)).toMatchObject({ type: 4, data: { flags: 64 } });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mockSdkLoaded).toHaveBeenCalledTimes(loads);
+    expect(sentCommands).toHaveLength(0);
+  });
+
+  test.each(['32', '8'])('signed channel command accepts member permissions %s and defers ephemerally', async (permissions) => {
+    expect(await handler(channelEvent({ member: { permissions }, app_permissions: '8' })))
+      .toEqual({ statusCode: 202, body: '' });
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/callback'),
+      expect.objectContaining({ body: JSON.stringify({ type: 5, data: { flags: 64 } }) }));
+    expect(JSON.parse((sentCommands[0] as { input: { Payload: string } }).input.Payload)).toEqual({
+      _internal: 'finish-channel', interactionToken: 'tok', guildId: channelRequest.guild_id,
+      channelId: channelRequest.channel_id, channelType: 0, memberPermissions: permissions, appPermissions: '8',
+    });
+  });
+
+  test('channel failed acknowledgement never dispatches', async () => {
+    jest.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 429 } as Response);
+    expect(await handler(channelEvent())).toEqual({ statusCode: 202, body: '' });
+    expect(sentCommands).toHaveLength(0);
+  });
+
+  test('invalid signed channel request never dispatches', async () => {
+    const event = channelEvent();
+    event.headers['X-Signature-Timestamp'] = 'tampered';
+    expect((await handler(event)).statusCode).toBe(401);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(sentCommands).toHaveLength(0);
+  });
 
   test('ack completes before SDK load and dispatch even when invocation stays pending', async () => {
     jest.resetModules();

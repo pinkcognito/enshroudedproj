@@ -61,7 +61,7 @@ export class DiscordBot extends Construct {
       },
     });
 
-    // Async self-invoke (finish-start / finish-status).
+    // Async self-invoke (finish-start / finish-status / finish-channel).
     role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['lambda:InvokeFunction'],
@@ -88,6 +88,13 @@ export class DiscordBot extends Construct {
       }),
     );
     // state/*: runtime coordination (maintenance-mode, last-active, run-state), read/write.
+    // WP-14: configuration writes only; no write access to the bot token namespace.
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:PutParameter'],
+        resources: [ssmParamArn('discord/status-channels/*')],
+      }),
+    );
     role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath', 'ssm:PutParameter'],

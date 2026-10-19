@@ -63,13 +63,14 @@ async function getBotToken() {
 }
 
 /** Acknowledge before loading AWS SDKs. Never log token-bearing fetch errors. */
-async function deferInteraction(interactionId, interactionToken) {
+async function deferInteraction(interactionId, interactionToken, options) {
   const started = Date.now();
   try {
     const res = await fetch(`${DISCORD_API}/interactions/${interactionId}/${interactionToken}/callback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': DISCORD_USER_AGENT },
-      body: JSON.stringify({ type: CALLBACK_TYPE.DEFERRED_CHANNEL_MESSAGE }),
+      body: JSON.stringify({ type: CALLBACK_TYPE.DEFERRED_CHANNEL_MESSAGE,
+        ...(options?.ephemeral ? { data: { flags: 64 } } : {}) }),
       signal: AbortSignal.timeout(2000),
     });
     console.log(JSON.stringify({ event: 'discord-callback', outcome: res.ok ? 'acknowledged' : 'rejected', status: res.status, durationMs: Date.now() - started }));

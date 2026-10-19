@@ -83,8 +83,8 @@ async function finishStatus(event) {
 }
 
 // Deliver the acknowledgement before SDK loading or the awaited async invocation.
-async function deferAndInvoke(internal, interaction) {
-  if (!(await deferInteraction(interaction.id, interaction.token))) {
+async function deferAndInvoke(internal, interaction, channelRequest) {
+  if (!(await deferInteraction(interaction.id, interaction.token, channelRequest ? { ephemeral: true } : undefined))) {
     return { statusCode: 202, body: '' };
   }
   try {
@@ -93,7 +93,7 @@ async function deferAndInvoke(internal, interaction) {
       new InvokeCommand({
         FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
         InvocationType: 'Event',
-        Payload: JSON.stringify({ _internal: internal, interactionToken: interaction.token }),
+        Payload: JSON.stringify({ _internal: internal, interactionToken: interaction.token, ...channelRequest }),
       }),
       { abortSignal: AbortSignal.timeout(3000) },
     );
@@ -120,6 +120,9 @@ exports.handler = async (event) => {
   }
   if (event && event._internal === 'finish-status') {
     return finishStatus(event);
+  }
+  if (event && event._internal === 'finish-channel') {
+    return require('./channel').finishChannel(event);
   }
 
   // Signature verification comes first, before any parsing or other processing.
@@ -169,6 +172,19 @@ exports.handler = async (event) => {
       }
       if (subcommand === 'status') {
         return deferAndInvoke('finish-status', interaction);
+      }
+      if (subcommand === 'channel') {
+        const request = {
+          guildId: interaction.guild_id,
+          channelId: interaction.channel_id,
+          channelType: interaction.channel?.type,
+          memberPermissions: interaction.member?.permissions,
+          appPermissions: interaction.app_permissions,
+        };
+        const invalid = require('./channel').validateChannelRequest(request) ||
+          (getSubcommand(interaction)?.options?.length ? 'This command takes no options; run it in the channel to configure.' : null);
+        if (invalid) return jsonResponse({ type: CALLBACK_TYPE.CHANNEL_MESSAGE, data: { content: invalid, flags: 64 } });
+        return deferAndInvoke('finish-channel', interaction, request);
       }
     }
 

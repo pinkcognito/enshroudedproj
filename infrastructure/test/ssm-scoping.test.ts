@@ -33,6 +33,7 @@ const ssmStatements = (stmts: Statement[]) => stmts.filter((s) => actionsOf(s).s
 describe('SSM namespace scoping (ARCHITECTURE §6.6.4)', () => {
   const instance = statementsFor('enshrouded-server-instance');
   const bot = statementsFor('enshrouded-discord-bot');
+  const statusChannel = statementsFor('enshrouded-status-channel');
 
   test('instance role: SSM Allow is server/ only; no discord ARN and no bare enshroudedproj/*', () => {
     const allows = ssmStatements(instance).filter((s) => s.Effect === 'Allow');
@@ -81,5 +82,34 @@ describe('SSM namespace scoping (ARCHITECTURE §6.6.4)', () => {
     const stmts = ssmStatements(bot).filter((s) => resourcesOf(s).some((r) => r.includes('server/user-groups')));
     expect(stmts).toHaveLength(1);
     expect(actionsOf(stmts[0])).toEqual(['ssm:GetParameter']);
+  });
+
+  test('channel selection can write configuration but cannot replace bot credentials', () => {
+    const writes = bot.filter((s) => s.Effect === 'Allow' && actionsOf(s).includes('ssm:PutParameter'));
+    const discordWrites = writes.flatMap(resourcesOf).filter((r) => r.includes('parameter/enshroudedproj/discord'));
+    expect(discordWrites.length).toBeGreaterThan(0);
+    for (const r of discordWrites) {
+      expect(r).toContain('parameter/enshroudedproj/discord/status-channels/*');
+      expect(r).not.toContain('bot-token');
+    }
+  });
+
+  test('status delivery reads only its config, token and delivery-state parameters', () => {
+    const scoped = ssmStatements(statusChannel).filter((s) => s.Effect === 'Allow');
+    expect(scoped.length).toBeGreaterThan(0);
+    for (const s of scoped) {
+      for (const r of resourcesOf(s)) {
+        expect(r).toMatch(/parameter\/enshroudedproj\/(discord\/(bot-token|status-channels)|state\/status-channel)/);
+        expect(r).not.toContain('parameter//');
+        if (actionsOf(s).includes('ssm:PutParameter')) {
+          expect(r).toContain('parameter/enshroudedproj/state/status-channel/');
+        }
+      }
+    }
+    for (const s of statusChannel) {
+      expect(actionsOf(s)).not.toEqual(expect.arrayContaining(['ec2:StartInstances']));
+      expect(actionsOf(s)).not.toEqual(expect.arrayContaining(['ec2:StopInstances']));
+      expect(actionsOf(s)).not.toContain('ec2:*');
+    }
   });
 });
