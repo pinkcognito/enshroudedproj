@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           # Role + instance id are repository variables (neither is a secret); see the
           # DeployRoleArn / InstanceId outputs of EnshroudedServerStack.
