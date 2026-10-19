@@ -85,7 +85,7 @@ describe('steamcmd invocation (section 7)', () => {
 const PERMISSION_KEYS = [
   'canKickBan', 'canAccessInventories', 'canEditWorld', 'canEditBase', 'canExtendBase', 'reservedSlots',
 ] as const;
-// section 7.1: canEditWorld per group. Friend=true while canExtendBase=false is intentional.
+// section 7.1: canEditWorld per group; Admin and Friend may also extend bases.
 // The game enforces canEditBase => canEditWorld and refuses to boot otherwise (verified on the box).
 const CAN_EDIT_WORLD: Record<string, boolean> = { Admin: true, Friend: true, Guest: true, Visitor: false };
 
