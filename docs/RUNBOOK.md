@@ -16,12 +16,12 @@ below point at it.
 | --- | --- | --- |
 | 1.1 Bootstrap isolated CDK toolkit | ✅ done 2026-10-18 | Claude (authorised) |
 | 1.2 Verify isolation | ✅ done, output recorded below | Claude |
-| **1.3 Seed SSM parameters** | **⬜ TODO** | **You — contains secrets** |
-| 1.4 Discord endpoint + command registration | ⬜ TODO after first deploy | You |
+| 1.3 Seed SSM parameters | ✅ done 2026-10-18 (7 params) | You |
+| **1.4 Discord endpoint + command registration** | **⬜ TODO** | **You** |
 | 1.5 GitHub repo variables | ✅ done 2026-10-18 (all 6 set) | Claude |
 | 1.6 Hand-deploy `EnshroudedOidcStack` | ✅ done 2026-10-18 | Claude (authorised) |
 
-**Only §1.3 is blocking.** Everything in it is a secret or a value only you can
+**Only §1.4 is blocking.** Everything in it is a secret or a value only you can
 choose, which is why it is not automated. Paste the block as a whole — it defines a
 prompt helper first, so the passwords are never typed on a command line and never
 land in PowerShell history.
@@ -237,7 +237,7 @@ wide-open, world-editable public server. Any path that renders an empty password
 publishes exactly that. **No future change may make an empty password render
 successfully** (§7).
 
-### 1.4 Discord application — ⬜ TODO after the first deploy
+### 1.4 Discord application — ⬜ TODO (the first deploy is done; do this now)
 
 Non-secret values (safe to record here; the bot token is not):
 
@@ -253,7 +253,9 @@ After the stack deploys, set the interactions endpoint in the Discord Developer 
 `DiscordBotInteractionsUrl` stack output, then register the commands:
 
 ```powershell
-# AFTER the first deploy. Get the endpoint URL from the stack outputs:
+# The first deploy is DONE. Your interactions endpoint URL is:
+#   https://n68k1uprzl.execute-api.us-east-2.amazonaws.com/interactions
+# (re-read it any time with the command below)
 aws cloudformation describe-stacks --region us-east-2 `
   --stack-name EnshroudedServerStack `
   --query "Stacks[0].Outputs[?OutputKey=='DiscordBotInteractionsUrl'].OutputValue" `
