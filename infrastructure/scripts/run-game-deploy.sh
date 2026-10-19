@@ -40,6 +40,16 @@ DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-${HERE}/deploy-game-server.sh}"
 PROVISION_TIMEOUT="${PROVISION_TIMEOUT:-1500}"
 DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-3000}"
 TEMPLATE="${CONFIG_TEMPLATE:-${HERE}/../config/enshrouded_server.json.tmpl}"
+# First-format acknowledgement (ARCHITECTURE 8.2): a PASS-THROUGH only. This driver never sets or
+# defaults it; an operator supplies it (workflow input allow_first_format) naming the exact
+# volume, e.g. vol-0142d5163b94a5e53, and only the provisioning phase receives it. It is not a
+# boolean and not a secret. Anything that is not a volume id is rejected before it is shipped,
+# which also keeps the value safe to place inside the shell export line below.
+FIRST_FORMAT_ACK="${ENSHROUDED_ALLOW_FIRST_FORMAT:-}"
+if [ -n "$FIRST_FORMAT_ACK" ] && ! [[ "$FIRST_FORMAT_ACK" =~ ^vol-[0-9a-f]+$ ]]; then
+  echo "[run-game-deploy] FATAL: allow_first_format must be a volume id such as vol-0123456789abcdef0 (or empty); got a value that is not" >&2
+  exit 1
+fi
 
 log() { echo "[run-game-deploy] $*"; }
 
@@ -78,12 +88,12 @@ MAINT_SET=1
 log "setting maintenance mode"
 set_maintenance true
 
-# run_phase LABEL SCRIPT TIMEOUT_SECONDS BUNDLE_TEMPLATE(0|1)
+# run_phase LABEL SCRIPT TIMEOUT_SECONDS BUNDLE_TEMPLATE(0|1) [BUNDLE_FIRST_FORMAT_ACK(0|1)]
 # Ships one on-box script via SSM Run Command, polls it, echoes its stdout/stderr.
 # Returns non-zero on any failure. Every step uses an explicit `|| return 1`: callers invoke
 # this in an `||` context where `set -e` is suspended inside the function.
 run_phase() {
-  local label="$1" script="$2" timeout="$3" bundle_template="$4"
+  local label="$1" script="$2" timeout="$3" bundle_template="$4" bundle_ack="${5:-0}"
   local cmd_id status
   log "=== phase: ${label} ==="
   if [ -n "$PARAMS_FILE" ]; then rm -f "$PARAMS_FILE"; fi   # previous phase's payload
@@ -93,6 +103,10 @@ run_phase() {
     if [ "$bundle_template" = "1" ]; then
       # The template is base64 (placeholders only, no secrets).
       echo "export ENSHROUDED_CONFIG_TEMPLATE_B64='$(base64 < "$TEMPLATE" | tr -d '\n')'"
+    fi
+    if [ "$bundle_ack" = "1" ] && [ -n "$FIRST_FORMAT_ACK" ]; then
+      # Validated above as ^vol-[0-9a-f]+$, so single-quoting is safe.
+      echo "export ENSHROUDED_ALLOW_FIRST_FORMAT='${FIRST_FORMAT_ACK}'"
     fi
     cat "$script"
   } | python3 -c '
@@ -142,7 +156,7 @@ print(json.dumps({"commands": [sys.stdin.read()], "executionTimeout": [sys.argv[
   log "${label} succeeded"
 }
 
-if ! run_phase provisioning "$PROVISION_SCRIPT" "$PROVISION_TIMEOUT" 0; then
+if ! run_phase provisioning "$PROVISION_SCRIPT" "$PROVISION_TIMEOUT" 0 1; then
   echo "[run-game-deploy] FATAL: provisioning phase FAILED; the game deploy phase was NOT attempted" >&2
   exit 1
 fi

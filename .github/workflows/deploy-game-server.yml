@@ -4,6 +4,16 @@ name: deploy-game-server
 # Manual only: a deploy restarts the game, so it must be a deliberate act.
 on:
   workflow_dispatch:
+    inputs:
+      allow_first_format:
+        description: >-
+          FIRST PROVISION ONLY. Leave empty normally. To let provisioning format a brand-new,
+          empty data volume, enter that volume's id exactly (e.g. vol-0142d5163b94a5e53). A
+          mismatch is refused. Never needed for instance replacement or a snapshot restore
+          (ARCHITECTURE 8.2).
+        required: false
+        default: ''
+        type: string
 
 # One deploy at a time; never cancel one midway (the driver script clears maintenance mode on exit).
 concurrency:
@@ -33,4 +43,7 @@ jobs:
       - name: Deploy game server
         env:
           ENSHROUDED_INSTANCE_ID: ${{ vars.ENSHROUDED_INSTANCE_ID }}
+          # Pass-through of the operator's input; empty unless they typed a volume id. The driver
+          # validates it and ships it to the provisioning phase only.
+          ENSHROUDED_ALLOW_FIRST_FORMAT: ${{ inputs.allow_first_format }}
         run: bash infrastructure/scripts/run-game-deploy.sh

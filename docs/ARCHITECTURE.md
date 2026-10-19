@@ -2068,6 +2068,70 @@ instance in that AZ, boot, and confirm the world and a built structure are intac
 the elapsed time, because that number is the real recovery objective and nobody currently
 knows it.
 
+#### 8.2 The blank-disk guard — what may format the data volume
+
+`provision-host.sh` formats the data volume on first provision. That is the one operation
+in this project that can destroy the world outright, so the conditions under which it is
+allowed are specified here rather than left to the script. **This control was previously
+implemented but undocumented, which is part of why it went wrong.**
+
+**The all-zeros condition is REMOVED. Do not reinstate it.**
+
+**VERIFIED by observation on the real instance** (2026-10-19): a freshly created,
+never-written, **encrypted** 40 GiB EBS volume (`vol-0142d5163b94a5e53`, `SnapshotId:
+null`) reads as zeros for the first 4 KiB and **pseudo-random bytes from offset `0x1000`
+onward**. It passed all three signature checks (`wipefs` empty, `blkid -p` rc 2, no
+partition table) and failed only "first 1 MiB is zeros", so provisioning aborted on a
+provably correct and genuinely empty disk.
+
+**ASSUMED — mechanism only:** that EBS decrypts never-written blocks through the volume
+key, so their plaintext is pseudo-random. Plausible and consistent with the observation,
+but no authoritative AWS documentation was found. **The mechanism does not matter to the
+ruling** — see below.
+
+**Why removing it does not weaken the guard.** The threat is formatting a disk that holds
+the world. The world always lives on an **ext4 filesystem**, and any volume that has ever
+held a filesystem carries a superblock signature that `wipefs` and `blkid` detect
+reliably. The three signature checks therefore catch both realistic failure paths — wrong
+device selected, and the script re-run on an already-provisioned box — completely.
+
+The zeros check only added coverage for a disk holding *non-filesystem* data, which our
+world never is. Against that marginal gain: **on encrypted EBS it returns "not blank" for
+every volume, blank or not.** A check that always fails is not a safety control, it is an
+outage — and worse, it is the kind of thing a frustrated operator eventually deletes
+*along with the checks that matter*. Removing it protects the guard.
+
+This is why the ruling does not wait on confirming the mechanism: a non-discriminating
+check is wrong whatever the reason its bytes look random.
+
+**Replacements — both, because they cover different things.**
+
+1. **Positive volume-identity verification (automatable, and stronger than the check it
+   replaces).** The script already resolves the NVMe serial to an EBS volume id. It must
+   additionally assert via `DescribeVolumes` that the resolved id **is the volume this
+   stack expects** — passed in from CDK/SSM, or matched by the `project=enshroudedproj`
+   tag — and refuse otherwise. This is *positive identification* rather than a heuristic
+   about content, so for the wrong-device threat it is strictly better than the zeros
+   check ever was.
+2. **Explicit first-format acknowledgement, naming the volume.**
+   `ENSHROUDED_ALLOW_FIRST_FORMAT=vol-0142d5163b94a5e53` — **not a boolean.** The script
+   formats only when the value matches the volume id it resolved. A bare `=1` is a
+   rubber stamp that gets set once and left in a wrapper script forever; naming the volume
+   makes it a genuine confirmation of *this disk*, and it fails safe if the expected
+   volume ever changes. `run-game-deploy.sh` must **not** set it.
+
+   **The friction is correctly placed and nearly free.** A format is only ever needed at
+   true first provision, or when deliberately starting a fresh world on a new blank
+   volume. It is **not** needed on instance replacement or on a cross-AZ restore (§8.1) —
+   both present a volume that already has a filesystem, so the script skips formatting
+   entirely. The gate therefore fires exactly when a human should be thinking, and never
+   on the paths §6.4 and §8.1 promise are cheap.
+
+**Keep the property that worked.** The guard refused rather than guessing, and failed
+loudly and specifically. Every replacement must do the same: on refusal, print the
+resolved device, the resolved volume id, which condition failed, and the exact variable to
+set. A safety control that fails obscurely gets disabled.
+
 **Restore must be rehearsed, not assumed.** WP-16 includes an actual drill: wipe the data
 volume's `savegame/`, restore from S3, boot, and confirm the world and a player's base are
 intact. A backup that has never been restored is a hypothesis.
@@ -2300,7 +2364,7 @@ account.
 | --- | --- | --- | --- | --- | --- |
 | **WP-03** | Core server construct: SG allowing **only** UDP 15636 + 15637 from `0.0.0.0/0`; instance role with `AmazonSSMManagedInstanceCore` + scoped `ssm:GetParameter` on **`/enshroudedproj/server/*` only, plus an explicit `Deny` on `discord/*` (§6.6)** + `kms:Decrypt` via ssm; **Ubuntu 24.04 LTS** `r6i.large` (exposed as a construct prop so the WP-07 resize is a one-line change); gp3 root sized ~20-30 GB (Linux needs far less than the Windows 50 GB); EIP. No key pair. **Pin the subnet/AZ explicitly and export `ENSHROUDED_AZ` + `ENSHROUDED_SUBNET_ID` from `lib/enshrouded/constants.ts` as the single source of truth WP-04 consumes (§6.3.1)** — do not rely on CDK's default subnet selection. Commit `cdk.context.json`. **Confirm the chosen Canonical AMI ships the SSM Agent (§6.1.4); install it in `provision-host.sh` if not.** | `lib/enshrouded/server.ts`, `test/server.test.ts` | WP-01 | Tests assert: no ingress on any port but 15636/15637 udp; no 22 (and no 3389) anywhere in the synthesised stack; no `KeyName`; all resources carry both tags. | R |
 | **WP-04** | World storage: separate gp3 data volume **in `ENSHROUDED_AZ` (§6.3.1), read from the shared constant — never re-derived**, with `RemovalPolicy.RETAIN` + `CfnVolumeAttachment`; versioned/encrypted/private S3 backup bucket with lifecycle; DLM daily snapshot policy; instance-role grants scoped to the `savegame/*` prefix. | `lib/enshrouded/world-storage.ts`, `test/world-storage.test.ts` | WP-03 (owns `ENSHROUDED_AZ`) | Synth shows `DeletionPolicy: Retain` on the volume. Bucket has versioning, `BlockPublicAccess.BLOCK_ALL`, SSE, `enforceSSL`. Test asserts changing `instanceType` does **not** produce a volume replacement in `cdk diff`. **Test asserts the volume's `AvailabilityZone` equals the instance's resolved AZ in the same synthesised template** — the §6.3.1 divergence guard. | R, with an **A** review of the retention wiring and the AZ pin. |
-| **WP-05** | **Host provisioning, `provision-host.sh`.** **Idempotently ensure the SSM Agent is installed and running** (`snap list amazon-ssm-agent || snap install amazon-ssm-agent`, then enable the service) — in **both** the instance user data and this script, since the script itself arrives over SSM (§6.1.4); mount the retained data volume at `/srv/enshrouded`; create the unprivileged `enshrouded` user; install SteamCMD; install the **pinned, SHA256-verified GE-Proton 10-26** (§6.1.3) with an S3 mirror fallback; write `enshrouded.service` with **`KillSignal=SIGINT`, `KillMode=control-group`, `TimeoutStopSec=120`, `Restart=no`, `WINEDEBUG=-all`** and the `STEAM_COMPAT_*` paths pointed at the data volume; write `enshrouded-update.service` (oneshot, `Before=`); open UDP 15636/15637 in the host firewall; install the CloudWatch agent for the game log. | `infrastructure/scripts/provision-host.sh`, `infrastructure/systemd/enshrouded.service`, `infrastructure/systemd/enshrouded-update.service`, `test/host-scripts.test.ts` | WP-03 | Script is idempotent (safe to re-run). Test greps the unit for `KillSignal=SIGINT`, `KillMode=control-group` and `TimeoutStopSec>=120` and **fails if any is absent or left at a systemd default**. **The instance reports `PingStatus=Online` in `ssm:DescribeInstanceInformation` and is reachable in Session Manager** — with no SSH and no key pair, an instance that fails this is unrecoverable, so it gates the WP. Manual: `systemctl stop enshrouded` takes longer than a SIGTERM default would, leaves `Result=success`, and produces a fresh `savegame/` mtime. Confirm whether `STEAM_COMPAT_*` are genuinely required (§6.1.3). | **A** — invariants §1.3 and §1.4 both live here; this is the data-loss-critical package. |
+| **WP-05** | **Host provisioning, `provision-host.sh`.** **Idempotently ensure the SSM Agent is installed and running** (`snap list amazon-ssm-agent || snap install amazon-ssm-agent`, then enable the service) — in **both** the instance user data and this script, since the script itself arrives over SSM (§6.1.4); mount the retained data volume at `/srv/enshrouded`, formatting it **only** under the §8.2 blank-disk guard (three signature checks + positive volume-identity verification + `ENSHROUDED_ALLOW_FIRST_FORMAT=<volume-id>`; **the all-zeros condition is removed — do not reinstate it, §8.2**); create the unprivileged `enshrouded` user; install SteamCMD; install the **pinned, SHA256-verified GE-Proton 10-26** (§6.1.3) with an S3 mirror fallback; write `enshrouded.service` with **`KillSignal=SIGINT`, `KillMode=control-group`, `TimeoutStopSec=120`, `Restart=no`, `WINEDEBUG=-all`** and the `STEAM_COMPAT_*` paths pointed at the data volume; write `enshrouded-update.service` (oneshot, `Before=`); open UDP 15636/15637 in the host firewall; install the CloudWatch agent for the game log. | `infrastructure/scripts/provision-host.sh`, `infrastructure/systemd/enshrouded.service`, `infrastructure/systemd/enshrouded-update.service`, `test/host-scripts.test.ts` | WP-03 | Script is idempotent (safe to re-run). Test greps the unit for `KillSignal=SIGINT`, `KillMode=control-group` and `TimeoutStopSec>=120` and **fails if any is absent or left at a systemd default**. **The instance reports `PingStatus=Online` in `ssm:DescribeInstanceInformation` and is reachable in Session Manager** — with no SSH and no key pair, an instance that fails this is unrecoverable, so it gates the WP. Manual: `systemctl stop enshrouded` takes longer than a SIGTERM default would, leaves `Result=success`, and produces a fresh `savegame/` mtime. Confirm whether `STEAM_COMPAT_*` are genuinely required (§6.1.3). | **A** — invariants §1.3 and §1.4 both live here; this is the data-loss-critical package. |
 | **WP-06** | Game install + config templating + deploy pipeline: `steamcmd +@sSteamCmdForcePlatformType windows +app_update 2278520 validate` (the platform flag is mandatory and fails silently if omitted — §7); render `enshrouded_server.json` from the template with SSM SecureStrings, `chmod 600`; restart the unit; wait for ready; set/clear maintenance mode around the whole thing. Workflow to trigger it. | `scripts/deploy-game-server.sh`, `config/enshrouded_server.json.tmpl`, `lib/enshrouded/game-deploy.ts`, `.github/workflows/deploy-game-server.yml` | WP-05 | A dispatch of the workflow installs/updates the server and leaves it running with the configured name and slot count. No secret appears in any workflow log. Maintenance mode is set before and cleared after, even on failure. | R, given a written spec of the config keys. |
 | **WP-18** | **SSM namespace remediation (§6.6) — small follow-up, not a rework.** Re-scope the already-built `server.ts` instance role from `parameter/enshroudedproj/*` to `parameter/enshroudedproj/server/*`, add the explicit `Deny` on `discord/*`, and remove any SSM write. Re-scope the already-built `discord-bot.ts` to `discord/*` + `state/*` plus the single admin-password ARN. Move the bot token parameter from `/enshroudedproj/discord-bot-token` to `/enshroudedproj/discord/bot-token` and update the runbook's operator `put-parameter` command. Add the scoping test. | edits to `lib/enshrouded/server.ts` and `lib/enshrouded/discord-bot.ts`; `test/ssm-scoping.test.ts`; `docs/RUNBOOK.md` | WP-03, WP-11 | `test/ssm-scoping.test.ts` passes and **fails if the instance role's prefix is widened back**. The access matrix in §6.6.2 matches the synthesised template row for row. The bot token is re-created at its new path and the old parameter deleted. | R — mechanical, but **blocking**: WP-09, 10, 12, 13, 14 and 15 must not write their IAM grants until this convention is in the codebase, or six more packages bake in the flat namespace. |
 
@@ -2415,6 +2479,14 @@ account.
   separately — they are expected to differ substantially (§3.1).
 - **(j) Save-file churn.** Does an idle server with no players stop rewriting the save
   across two autosave cycles? (Qualifies the §5.4 reserve mechanism.)
+- **(k2) Fresh encrypted EBS read pattern — convert §8.2's inference to VERIFIED.** On a
+  newly created, never-written **encrypted** volume, record `hexdump -C` of the first few
+  MiB and whether `wipefs`/`blkid`/`partx` report clean. Repeat on an **unencrypted**
+  volume for contrast. This settles whether "unwritten blocks read as zeros" fails
+  specifically because of encryption, or for some other reason.
+  **This does not gate the §8.2 fix** — a check that always fails is wrong regardless of
+  why — but it closes the last ASSUMED label in §8 and tells us whether any other tooling
+  we adopt later might make the same bad assumption.
 - **(k) Proton sanity — new.** Confirm the server runs headless with **no Xvfb or display
   shim** (expected: yes, §6.1.2). Record the exact GE-Proton version in use, whether
   `STEAM_COMPAT_CLIENT_INSTALL_PATH` / `STEAM_COMPAT_DATA_PATH` are actually required
