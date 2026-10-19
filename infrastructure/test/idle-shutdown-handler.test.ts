@@ -269,9 +269,59 @@ describe('handler: gates', () => {
     mockWorld.params.set(P.lastActive, String(NOW - 5 * 60 * MIN)); // 5 hours stale
     const r = await handler();
     expect(r.action).toBe('launch-grace');
-    expect(probeCalls()).toBe(0);
+    expect(probeCalls()).toBe(1); // grace PROBES (cannot stop yet, but can observe)
     expect(invokes()).toHaveLength(0);
     expect(mockWorld.params.get(P.lastActive)).toBe(String(NOW));
+  });
+
+  // THE BUG THAT REACHED PRODUCTION: launch 17:21:33, a real player connected ~17:30 and left, and the
+  // whole log was "within grace - not stopping". Grace returned BEFORE the probe, so last-player-seen was
+  // never written and graceful-stop's save check had no evidence a player had ever been present.
+  test('a player detected INSIDE grace writes last-player-seen, and grace still does not stop', async () => {
+    mockWorld.instance = { State: { Name: 'running' }, LaunchTime: new Date(NOW - 11.4 * MIN) };
+    probeReturns(probeLine({ a2sOk: true, players: 1, logOk: false, mCount: null }));
+    const r = await handler();
+    expect(r.action).toBe('launch-grace');
+    expect(mockWorld.params.get(P.playerSeen)).toBe(String(NOW));
+    expect(invokes()).toHaveLength(0);
+  });
+
+  test('a log-only exact detection inside grace also writes last-player-seen', async () => {
+    mockWorld.instance = { State: { Name: 'running' }, LaunchTime: new Date(NOW - 3 * MIN) };
+    probeReturns(probeLine({ a2sOk: false, players: null, logOk: true, mCount: 2 }));
+    await handler();
+    expect(mockWorld.params.get(P.playerSeen)).toBe(String(NOW));
+  });
+
+  test('a heuristic-only ACTIVE inside grace does NOT write last-player-seen', async () => {
+    mockWorld.instance = { State: { Name: 'running' }, LaunchTime: new Date(NOW - 3 * MIN) };
+    probeReturns(probeLine({ udpRate: 500, cpuRate: 2 })); // exact signals say zero
+    await handler();
+    expect(mockWorld.params.has(P.playerSeen)).toBe(false);
+  });
+
+  // last-active is a CONTROL variable (6.6.0). The unconditional grace write IS the race fix; narrowing it
+  // to "only when ACTIVE" would let a fresh boot inherit a stale clock.
+  test.each([
+    ['a player is present', probeLine({ players: 1 })],
+    ['no player (exact zero, quiet)', probeLine()],
+    ['probe INDETERMINATE', probeLine({ a2sOk: false, players: null, logOk: false, mCount: null })],
+  ])('grace writes last-active = now UNCONDITIONALLY and never stops (%s)', async (_n, line) => {
+    mockWorld.instance = { State: { Name: 'running' }, LaunchTime: new Date(NOW - 5 * MIN) };
+    mockWorld.params.set(P.lastActive, String(NOW - 5 * 60 * MIN));
+    probeReturns(line);
+    expect((await handler()).action).toBe('launch-grace');
+    expect(mockWorld.params.get(P.lastActive)).toBe(String(NOW));
+    expect(invokes()).toHaveLength(0);
+  });
+
+  test('grace with a failed probe still writes last-active and does not stop', async () => {
+    mockWorld.instance = { State: { Name: 'running' }, LaunchTime: new Date(NOW - 5 * MIN) };
+    mockWorld.params.set(P.lastActive, String(NOW - 5 * 60 * MIN));
+    probeFails('Failed');
+    expect((await handler()).action).toBe('launch-grace');
+    expect(mockWorld.params.get(P.lastActive)).toBe(String(NOW));
+    expect(invokes()).toHaveLength(0);
   });
 
   test('grace exceeds the idle threshold: 11 minutes after launch is still protected', async () => {
@@ -295,7 +345,7 @@ describe('handler: gates', () => {
     mockWorld.instance = { State: { Name: 'running' }, LaunchTime: undefined as unknown as Date };
     await handler();
     expect(invokes()).toHaveLength(0);
-    expect(probeCalls()).toBe(0);
+    expect(probeCalls()).toBe(1);
   });
 });
 
@@ -421,6 +471,18 @@ describe('handler: classification outcomes', () => {
     expect(input.InvocationType).toBe('Event');
     expect(JSON.parse(Buffer.from(input.Payload).toString())).toEqual({ reason: 'idle' });
     expect(mockWorld.params.get(P.runState)).toBe('stopping');
+  });
+
+  // Live: "Idle for 10.0 minutes (threshold 10)" printed on a tick that correctly did NOT stop (true value
+  // ~9.996). The display is floored so it can never render the threshold while the gate still holds.
+  test('9.996 idle minutes -> waits, and the log never renders the threshold', async () => {
+    mockWorld.params.set(P.lastActive, String(NOW - 9.996 * MIN));
+    const log = jest.spyOn(console, 'log');
+    const r = await handler();
+    expect(r.action).toBe('idle-waiting');
+    expect(invokes()).toHaveLength(0);
+    const line = log.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('Idle for'));
+    expect(line).toBe('Idle for 9.9 minutes (threshold 10).');
   });
 
   test('IDLE for < 10 minutes -> waits, no stop, clock untouched', async () => {

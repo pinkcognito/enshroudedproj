@@ -894,6 +894,26 @@ snapshot() {
     END { printf "%d %s\n", n, (n ? newest : 0) }'
 }
 
+# "Was any player ever present this boot?" - yes | no | unreadable. Retrospective evidence for the
+# absent-last-player-seen case (ARCHITECTURE 3.2 step 12b). The WHOLE file is searched, deliberately: the game
+# deletes the log on every launch, so the file IS this boot, and "[server] Remove Player" is an ordinary
+# interleaved line that sits far above the last 30 s Session dump. (Session blocks are a periodic status
+# dump, not a per-boot header - do NOT scope this to the newest one.) Only the PRESENCE of a leave line or
+# an m#N (N>=1) row is tested; log timestamps are uptime-relative and are never read or compared.
+# An unreadable log is "unreadable", never "no".
+log_player() {
+  local log=/srv/enshrouded/logs/enshrouded_server.log
+  local rc
+  [ -r "$log" ] || { echo unreadable; return; }
+  # An empty log is absence of evidence, not evidence of absence. Report unreadable so the
+  # PASS is metered, never "no" - "nobody played" must rest on a log that actually said so.
+  [ -s "$log" ] || { echo unreadable; return; }
+  grep -Eq "\[server\] Remove Player|(^|[^[:alnum:]_#])m#[1-9][0-9]*([^0-9]|\$)" "$log" 2>/dev/null
+  rc=$?
+  # grep exits 0 on a match, 1 on "no match", 2 on an error.
+  case "$rc" in 0) echo yes ;; 1) echo no ;; *) echo unreadable ;; esac
+}
+
 mode="${1:-}"
 case "$mode" in
   stop)
@@ -920,6 +940,7 @@ case "$mode" in
     echo "DRAIN_EXEC_MAIN_CODE=$exec_code"
     echo "DRAIN_EXEC_MAIN_STATUS=$exec_status"
     echo "DRAIN_GAME_PIDS=$game_pids"
+    echo "DRAIN_LOG_PLAYER=$(log_player)"
     echo "DRAIN_DONE=1"
     exit 0
     ;;

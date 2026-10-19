@@ -1,6 +1,8 @@
 // WP-09: graceful-stop. DATA-LOSS CRITICAL. The invariant under test:
 //   StopInstances is unreachable unless save verification passes (and the S3 sync succeeds).
+import * as cp from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib/core';
 import { Template } from 'aws-cdk-lib/assertions';
@@ -33,6 +35,8 @@ interface Facts {
   execMainCode?: string;
   execMainStatus?: string;
   gamePids?: number;
+  /** Game-log verdict: was any player present this boot? Default 'no'; 'omit' drops the line entirely. */
+  logPlayer?: string;
 }
 
 function drainStdout(f: Facts): string {
@@ -48,6 +52,7 @@ function drainStdout(f: Facts): string {
     `DRAIN_EXEC_MAIN_CODE=${f.execMainCode ?? '1'}`,
     `DRAIN_EXEC_MAIN_STATUS=${f.execMainStatus ?? '0'}`,
     `DRAIN_GAME_PIDS=${f.gamePids ?? 0}`,
+    ...(f.logPlayer === 'omit' ? [] : [`DRAIN_LOG_PLAYER=${f.logPlayer ?? 'no'}`]),
     'DRAIN_DONE=1',
   ].join('\n');
 }
@@ -261,6 +266,97 @@ describe('save verification table (ARCHITECTURE 3.2 step 12b), every row, throug
     const { calls, result } = await run({ facts: { postCount: 3, postNewest: 1_000 }, lastPlayerSeen: null });
     expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'covered-by-disconnect-save' });
     expect(stopped(calls)).toBe(true);
+  });
+
+  // THE BUG THAT REACHED PRODUCTION: a session happened entirely inside launch grace, idle-shutdown never
+  // probed, so last-player-seen was never written. Absent used to mean "covered" -> silent PASS. The game
+  // log is evidence a probe that never ran cannot miss. (Non-empty world from an EARLIER boot: postNewest
+  // is long before LaunchTime.)
+  describe('last-player-seen ABSENT: the game log closes the fail-open', () => {
+    const OLD_SAVE = { postCount: 11, postNewest: LAUNCH_MS / 1000 - 3600 }; // from a previous boot
+
+    test('absent + log shows NO player this boot -> PASS (nobody played, nothing lost), no Unverifiable metric', async () => {
+      const { calls, metrics, result } = await run({ facts: { ...OLD_SAVE, logPlayer: 'no' }, lastPlayerSeen: null });
+      expect(result).toMatchObject({ outcome: 'stopped', stopped: true });
+      expect(stopped(calls)).toBe(true);
+      expect(metrics).not.toContain('SaveVerificationUnverifiable');
+    });
+
+    test('absent + log shows a player + NO save newer than LaunchTime -> FAIL, maintenance set, never stops', async () => {
+      const { calls, params, metrics, result } = await run({
+        facts: { ...OLD_SAVE, logPlayer: 'yes' },
+        lastPlayerSeen: null,
+      });
+      expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
+      expect(result.detail).toMatch(/player-in-log-no-save/);
+      expect(stopped(calls)).toBe(false);
+      expect(params[maint]).toBe('true');
+      expect(metrics).toContain('SaveVerificationFailed');
+    });
+
+    test('absent + log shows a player + EMPTY savegame/ -> FAIL', async () => {
+      const { calls, result } = await run({ facts: { postCount: 0, postNewest: 0, logPlayer: 'yes' }, lastPlayerSeen: null });
+      expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
+      expect(stopped(calls)).toBe(false);
+    });
+
+    test('absent + log shows a player + a save NEWER than LaunchTime -> PASS (the session was saved)', async () => {
+      const { calls, result } = await run({
+        facts: { postCount: 11, postNewest: LAUNCH_MS / 1000 + 600, logPlayer: 'yes' },
+        lastPlayerSeen: null,
+      });
+      expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'covered-by-save-this-boot' });
+      expect(stopped(calls)).toBe(true);
+    });
+
+    test('absent + log UNREADABLE -> PASS (do not wedge) AND the distinct SaveVerificationUnverifiable metric', async () => {
+      for (const facts of [
+        { ...OLD_SAVE, logPlayer: 'unreadable' },
+        { postCount: 0, postNewest: 0, logPlayer: 'unreadable' },
+        { ...OLD_SAVE, logPlayer: 'omit' }, // a drain script that predates the field is "unreadable", not "no"
+      ]) {
+        const { calls, params, metrics, result } = await run({ facts, lastPlayerSeen: null });
+        expect(result.outcome).toBe('stopped');
+        expect(stopped(calls)).toBe(true);
+        expect(params[maint]).toBeUndefined();
+        expect(metrics).toContain('SaveVerificationUnverifiable');
+        expect(metrics).not.toContain('SaveVerificationFailed');
+      }
+    });
+
+    test('last-player-seen PRESENT: the log is ignored and rows 1-3 apply exactly as before', async () => {
+      // A log saying "yes" must not fail a covered world; a log saying "no" must not rescue row 3.
+      const covered = await run({ facts: { ...COVERED, logPlayer: 'yes' } });
+      expect(covered.result.outcome).toBe('stopped');
+      const row3 = await run({ facts: { postCount: 11, postNewest: SEEN_MS / 1000 - 600, logPlayer: 'no' } });
+      expect(row3.result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
+      expect(covered.metrics).not.toContain('SaveVerificationUnverifiable');
+    });
+
+    test('a shutdown save (row 1) passes whatever the log says, and is not flagged unverifiable', async () => {
+      const { result, metrics } = await run({
+        facts: { postCount: 11, postNewest: T0 + 3, logPlayer: 'unreadable' },
+        lastPlayerSeen: null,
+      });
+      expect(result.outcome).toBe('stopped');
+      expect(metrics).not.toContain('SaveVerificationUnverifiable');
+    });
+
+    test('evaluateSave stays pure and reports unverifiable only on a PASS that relied on the missing evidence', () => {
+      const f = (logPlayer: string) => mod.parseDrainFacts(drainStdout({ postCount: 5, postNewest: 400_000, logPlayer }));
+      const ev = (logPlayer: string) => mod.evaluateSave(f(logPlayer), { lastPlayerSeenMs: null, launchTimeMs: LAUNCH_MS });
+      expect(ev('no')).toMatchObject({ pass: true, unverifiable: false });
+      expect(ev('unreadable')).toMatchObject({ pass: true, unverifiable: true });
+      expect(ev('yes')).toMatchObject({ pass: false, unverifiable: false });
+    });
+  });
+
+  test('the verdict is logged on the success path, including the unverifiable flag', async () => {
+    const spy = jest.spyOn(console, 'log');
+    await run({ facts: { postCount: 3, postNewest: 1_000, logPlayer: 'unreadable' }, lastPlayerSeen: null });
+    expect(spy).toHaveBeenCalledWith('graceful-stop: verified saveCheck=covered-by-disconnect-save unverifiable=true');
+    await run({ facts: COVERED });
+    expect(spy).toHaveBeenCalledWith('graceful-stop: verified saveCheck=covered-by-disconnect-save unverifiable=false');
   });
 
   test('row 3: non-empty, newest well before last-player-seen, nothing newer than t0 -> FAIL (the real data-loss signature)', async () => {
@@ -514,8 +610,22 @@ describe('wall-clock discipline', () => {
         .split('\n')
         .filter((l) => !/^\s*#|^\s*\/\//.test(l)) // comments may explain the rule
         .join('\n');
-      expect(code).not.toMatch(/enshrouded_server\.log|\/logs\/|journalctl|--since/);
+      expect(code).not.toMatch(/journalctl|--since/);
     }
+    // The handler never touches the log at all. The drain script reads it for PRESENCE only (a leave
+    // line or an m#N row) via grep -q: it must not extract, parse or compare any timestamp from it.
+    const handler = fs
+      .readFileSync(HANDLER_PATH, 'utf8')
+      .split('\n')
+      .filter((l) => !/^\s*\/\//.test(l))
+      .join('\n');
+    expect(handler).not.toMatch(/enshrouded_server\.log|\/logs\//);
+    const logLines = fs
+      .readFileSync(DRAIN_PATH, 'utf8')
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l) && /\$log\b|enshrouded_server\.log/.test(l));
+    expect(logLines.length).toBeGreaterThan(0);
+    for (const l of logLines) expect(l).not.toMatch(/\b(awk|sed|date|sort)\b/); // position (tail/cut) is fine, time is not
   });
 });
 
@@ -545,6 +655,49 @@ describe('drain-and-save.sh', () => {
     expect(sh).toMatch(/aws s3 sync/);
     expect(sh).not.toMatch(/--delete/);
     expect(sh).toMatch(/pgrep -x "\$GAME_COMM"/);
+  });
+  describe('log_player(): the WHOLE log is this boot (the game deletes it on every launch)', () => {
+    // Real captured shapes (probe-players.test.ts). Session blocks are a PERIODIC 30 s status dump, not a
+    // per-boot header: 75 of them were counted in one 37-minute boot. "[server] Remove Player" is an
+    // ordinary interleaved line, NOT inside a block.
+    const NL = String.fromCharCode(10);
+    const M0 = [
+      '[I 00:37:03,430] -------------- Session ----------------',
+      '[I 00:37:03,430] Machines:',
+      '[I 00:37:03,430]   m#0(128): up 0 (0), down 0 (0), remote 0 (0), limit 256, lost 0, ping 0 ms, EstablishingBaseline',
+      '[I 00:37:03,430] ---------------------------------------',
+    ].join(NL) + NL;
+    const M1_ROW = '[I 00:11:03,046]   m#1(129): up 92 (114), down 40 (51), remote 92 (114), limit 453, lost 2, ping 45 ms, OperatingNormally';
+    const M1 = M0.replace('[I 00:37:03,430] ---------------------------------------', `${M1_ROW}${NL}[I 00:37:03,430] ---------------------------------------`);
+    const LEAVE = "[I 00:23:12,100] [server] Remove Player 'Dave'" + NL;
+    const runFn = (log: string): string => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'logplayer-'));
+      const logFile = path.join(dir, 'game.log').split(path.sep).join('/');
+      fs.writeFileSync(logFile, log);
+      const fn = /log_player\(\) \{[\s\S]*?\n\}\n/.exec(raw)![0].replace(/local log=.*/, `local log='${logFile}'`);
+      const r = cp.spawnSync('bash', ['-c', `${fn}\nlog_player`], { encoding: 'utf8' });
+      fs.rmSync(dir, { recursive: true, force: true });
+      return r.stdout.trim();
+    };
+    const bashOk = cp.spawnSync('bash', ['-c', 'true']).status === 0;
+    (bashOk ? test : test.skip)('REGRESSION: an EARLY leave line, 75 later empty Session blocks, none in the final block -> yes', () => {
+      expect(runFn(M1 + LEAVE + M0.repeat(75))).toBe('yes');
+    });
+    (bashOk ? test : test.skip)('an m#N>=1 row alone (no leave line yet) -> yes', () => {
+      expect(runFn(M0 + M1)).toBe('yes');
+    });
+    (bashOk ? test : test.skip)('only m#0 Session blocks, no leave line -> no', () => {
+      expect(runFn(M0.repeat(5))).toBe('no');
+    });
+    (bashOk ? test : test.skip)('a readable but EMPTY log -> unreadable, never no', () => {
+      // Absence of evidence is not evidence of absence. "no" is a positive claim that nobody
+      // played; an empty file supports neither answer, so the PASS must be metered instead.
+      expect(runFn('')).toBe('unreadable');
+    });
+    (bashOk ? test : test.skip)('a missing log -> unreadable, never no', () => {
+      const fn = /log_player\(\) \{[\s\S]*?\n\}\n/.exec(raw)![0].replace(/local log=.*/, "local log='/nonexistent/x.log'");
+      expect(cp.spawnSync('bash', ['-c', `${fn}\nlog_player`], { encoding: 'utf8' }).stdout.trim()).toBe('unreadable');
+    });
   });
   test('provision-host.sh delivers a byte-identical copy as a root-owned 0755 helper', () => {
     const provision = fs.readFileSync(PROVISION_PATH, 'utf8');
@@ -605,6 +758,10 @@ describe('construct / IAM', () => {
     expect(res(put[0])).toContain('enshroudedproj/state/*');
     expect(res(put[0])).not.toContain('discord');
   });
+  test('memory is 256 MB (116-121 MB measured live against the 128 MB default)', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', { FunctionName: 'enshrouded-graceful-stop', MemorySize: 256 });
+  });
+
   test('async retries are disabled so a drain is never re-run automatically', () => {
     template.hasResourceProperties('AWS::Lambda::EventInvokeConfig', { MaximumRetryAttempts: 0 });
   });

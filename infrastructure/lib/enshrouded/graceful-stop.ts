@@ -127,6 +127,9 @@ export class GracefulStop extends Construct {
       code: lambda.Code.fromAsset(path.join(__dirname, 'lambda'), { exclude: ['**/*.d.ts'] }),
       // probe (<=60s) + stop (<=~125s, SSM allows 240s) + sync (<=300s) + polling slack.
       timeout: cdk.Duration.minutes(12),
+      // Measured live: 116-121 MB used of the 128 MB default (three SDK clients + fetch). This is the one Lambda
+      // whose job is not losing the world; an OOM kill must not be one allocation away.
+      memorySize: 256,
       // A drain must never be retried automatically by the async-invoke machinery.
       retryAttempts: 0,
       environment: {
