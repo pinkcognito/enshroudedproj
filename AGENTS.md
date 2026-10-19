@@ -1,0 +1,24 @@
+# AGENTS.md — enshroudedproj
+
+Enshrouded dedicated server on AWS (Ubuntu 24.04 + GE-Proton, `r6i.large`, us-east-2), started on demand and auto-stopped when idle. Design lives in `docs/ARCHITECTURE.md` — read the relevant section before changing a subsystem. Infra is AWS CDK (TypeScript) in `infrastructure/`; see `infrastructure/AGENTS.md`.
+
+## WARNING — a live, unrelated project shares this AWS account
+Account `334953720182` (us-east-2) also hosts the running UOPrivateServer game server. Its stacks are **`InfrastructureStack`, `AdminUiStack`, `GithubOidcStack`** (plus `CDKToolkit`, and IAM roles `github-actions-*`). **Never create, name, import, or touch any of these.** Every stack here is named `Enshrouded*` with an explicit `stackName`; never rely on the construct-id default; never `cdk deploy --all`. `infrastructure/test/stack-naming.test.ts` enforces this — never weaken it.
+
+## Guardrails (these override "just ship it")
+- **Never `cdk deploy` locally — no exceptions.** Infra reaches AWS *only* through the GitHub workflow on merge to `main` (GitHub OIDC). This is what keeps every change to a shared account reviewed and auditable.
+- **Every feature-branch PR must post its `cdk diff` as a PR comment**, so what is about to change is visible before the merge that applies it. A PR with infra changes and no diff comment is not reviewable.
+- **`cdk bootstrap` is permitted when needed.** CI structurally cannot bootstrap the credentials it runs with, so this is a human/assistant step. Already done: qualifier `enshrd1`, stack `CDKToolkitEnshrouded` (see `docs/RUNBOOK.md` §1.1).
+- **`EnshroudedOidcStack` is the one hand-deployed stack**, and is excluded from `deploy.yml` permanently — it defines the role CI authenticates as, so CI redeploying it can lock CI out of fixing itself (`docs/RUNBOOK.md` §1.6). Review the diff every time.
+- Validate locally with `npm run build`, `npx cdk synth` and `npx cdk diff` — all read-only.
+- **Never push to `main`. Ever.** Every change reaches main through a pull request — including docs-only and one-line commits. Branch *before* making the edit. `.githooks/pre-push` blocks it; enable per clone with `git config core.hooksPath .githooks`, and never bypass with `--no-verify`.
+- **Tag every AWS resource** `project=enshroudedproj`, `repo=pinkcognito/enshroudedproj` (applied at App level in `bin/enshrouded.ts`; do not remove).
+- Stop and ask before anything that could affect a non-`Enshrouded*` resource.
+
+## Script language
+- **Operator/tooling scripts (seeding, rotation, ops helpers, diagnostics): Python.** Not PowerShell — it ties a script to Windows and to PowerShell 5.1's quirks. Matches the existing convention in `.github/scripts/` (`check-invariants.py`, `check-diff-stacks.py`, `render-diff-comment.py`) and WP-08's `probe-players.py`.
+- **Scripts that run on the game host: bash.** They are delivered over SSM to Ubuntu and must stay LF (`.gitattributes` enforces it).
+- `scripts/seed-parameters.ps1` predates this convention and is deliberately left as-is.
+
+## Build / check
+`cd infrastructure && npm run build && npm run lint && npm test && npx cdk synth` — must be clean before opening a PR.
