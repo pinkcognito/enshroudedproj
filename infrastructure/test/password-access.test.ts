@@ -1,4 +1,4 @@
-const { ACCESS_PREFIX, parseAccessMapping, authorizePasswordAccess, sendPasswordDm } =
+const { ACCESS_PREFIX, GROUPS, parseAccessMapping, authorizePasswordAccess, sendPasswordDm } =
   jest.requireActual('../lib/enshrouded/lambda/discord-bot/password-access');
 
 const guildId = '123456789012345678';
@@ -15,11 +15,12 @@ const passwords = { admin: 'test-only-admin-secret', friend: 'test-only-friend-s
 const response = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 const caller = (roleIds: string[] = Object.values(roles)) => ({ guildId, userId, roleIds });
 const access = (groups = ['visitor']) => ({ guildId, userId, groups });
-const privateContent = (result: { body: string }) => {
-  const body = JSON.parse(result.body);
-  expect(body).toMatchObject({ type: 4, data: { flags: 64 } });
-  expect(body.data.content).not.toMatch(/test-only-|https:\/\//);
-  return body.data.content as string;
+// sendPasswordDm returns plain text for the deferred (editOriginalResponse) reply, not a
+// synchronous interaction response; the reply itself is made ephemeral by the defer.
+const privateContent = (result: { ok: boolean; content: string }) => {
+  expect(typeof result.ok).toBe('boolean');
+  expect(result.content).not.toMatch(/test-only-|https:\/\//);
+  return result.content;
 };
 
 beforeEach(() => {
@@ -205,4 +206,11 @@ describe('password delivery only to the signed caller DM', () => {
     expect(privateContent(await sendPasswordDm(caller(), access(), values, { botToken, fetch }))).toContain('Unable');
     expect(fetch).not.toHaveBeenCalled();
   });
+});
+
+// ARCHITECTURE 1.16. This is deliberately a literal, ordered assertion on GROUPS itself.
+// The multi-role cascade tests above and the per-group DM-body assertion are the behavioural
+// cover; this one exists so that an editor reordering the array sees a sentence, not a diff.
+test('GROUPS is privilege-descending: reordering it grants visitors the admin password (§1.16)', () => {
+  expect(GROUPS).toEqual(['admin', 'friend', 'guest', 'visitor']);
 });

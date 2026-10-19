@@ -101,20 +101,50 @@ export class DiscordBot extends Construct {
         resources: [ssmParamArn('state/*'), ssmParamArn('state')],
       }),
     );
-    // NAMED CROSS-BOUNDARY EXCEPTION (§6.6.2): `/enshrouded password` must return a group
-    // password, so the bot needs exactly one server/ value. Granted on this SINGLE parameter
-    // ARN, never the server/ prefix. Do not widen it "because the bot needs a password".
+    // NAMED CROSS-BOUNDARY GRANT (ARCHITECTURE 6.6.2a): widened from one ARN to FOUR. The bot
+    // generates and writes the rotation (W) and /enshrouded pw reads the tier cascade (R).
+    // Exactly these four ARNs - never a server/ prefix. Do not widen it further.
+    const passwordArns = ['admin', 'friend', 'guest', 'visitor'].map((g) =>
+      ssmParamArn(`server/user-groups/${g}-password`));
     role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter'],
-        resources: [ssmParamArn('server/user-groups/admin-password')],
+        resources: passwordArns,
       }),
     );
     role.addToPolicy(
       new iam.PolicyStatement({
+        actions: ['ssm:PutParameter'],
+        resources: passwordArns,
+      }),
+    );
+    // kms:Encrypt is REQUIRED to write a standard-tier SecureString; without it rotation fails
+    // AccessDenied in the start path immediately before StartInstances. Parameter Store supplies
+    // the PARAMETER_ARN encryption context, so Resource '*' stays pinned to named parameters.
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['kms:Encrypt'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: {
+            'kms:ViaService': `ssm.${stack.region}.amazonaws.com`,
+            'kms:EncryptionContext:PARAMETER_ARN': passwordArns,
+          },
+        },
+      }),
+    );
+    // The bot reads exactly FIVE SecureStrings: the bot token plus the four passwords. Every
+    // other parameter it reads is a plain String. No unconditioned KMS statement may remain.
+    role.addToPolicy(
+      new iam.PolicyStatement({
         actions: ['kms:Decrypt'],
         resources: ['*'],
-        conditions: { StringEquals: { 'kms:ViaService': `ssm.${stack.region}.amazonaws.com` } },
+        conditions: {
+          StringEquals: {
+            'kms:ViaService': `ssm.${stack.region}.amazonaws.com`,
+            'kms:EncryptionContext:PARAMETER_ARN': [ssmParamArn('discord/bot-token'), ...passwordArns],
+          },
+        },
       }),
     );
 

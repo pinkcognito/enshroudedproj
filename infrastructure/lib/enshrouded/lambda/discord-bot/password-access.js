@@ -1,4 +1,4 @@
-const { DISCORD_API, DISCORD_USER_AGENT, CALLBACK_TYPE, jsonResponse } = require('../shared/discord');
+const { DISCORD_API, DISCORD_USER_AGENT } = require('../shared/discord');
 const { isSnowflake } = require('../shared/status-channel-config');
 
 const ACCESS_PREFIX = '/enshroudedproj/discord/password-access';
@@ -59,15 +59,17 @@ async function authorizePasswordAccess(request, mapping, { botToken, fetch: fetc
   }
 }
 
-function privateReply(content) {
-  return jsonResponse({ type: CALLBACK_TYPE.CHANNEL_MESSAGE, data: { flags: 64, content } });
+// Returns plain text for the caller's ephemeral deferred reply (editOriginalResponse). This
+// used to be a synchronous interaction response, which cannot work on a deferred path.
+function privateReply(content, ok) {
+  return { ok, content };
 }
 
 /** Supply the authorization result above and only passwords allowed by the eventual
  * generation/readiness guard. No public-channel or interaction-token secret fallback.
  */
 async function sendPasswordDm(request, access, passwords, { botToken, fetch: fetchRequest = globalThis.fetch } = {}) {
-  const failure = () => privateReply('Unable to send passwords by direct message. Check your privacy settings and try again.');
+  const failure = () => privateReply('Unable to send passwords by direct message. Check your privacy settings and try again.', false);
   try {
     if (!validCaller(request) || !access || access.guildId !== request.guildId || access.userId !== request.userId ||
         typeof botToken !== 'string' || !botToken || !Array.isArray(access.groups) || !access.groups.length) return failure();
@@ -92,10 +94,10 @@ async function sendPasswordDm(request, access, passwords, { botToken, fetch: fet
       method: 'POST', headers: headers(botToken), body: JSON.stringify({ content, allowed_mentions: { parse: [] } }),
       signal: AbortSignal.timeout(2000), redirect: 'error',
     });
-    return message.ok ? privateReply('Sent your passwords in a direct message.') : failure();
+    return message.ok ? privateReply('Sent your passwords in a direct message.', true) : failure();
   } catch {
     return failure();
   }
 }
 
-module.exports = { ACCESS_PREFIX, parseAccessMapping, authorizePasswordAccess, sendPasswordDm };
+module.exports = { ACCESS_PREFIX, GROUPS, parseAccessMapping, authorizePasswordAccess, sendPasswordDm };

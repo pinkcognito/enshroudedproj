@@ -1,0 +1,27 @@
+This repository vendors third-party material. The notices below must be retained.
+
+--------------------------------------------------------------------------------
+EFF Long Wordlist
+--------------------------------------------------------------------------------
+
+Vendored at: infrastructure/lib/enshrouded/lambda/discord-bot/eff-large-wordlist.js
+
+  Work:    "EFF Long Wordlist" (2016), 7,776 words
+  Source:  https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt
+  Author:  Electronic Frontier Foundation
+  License: Creative Commons Attribution 3.0 United States (CC BY 3.0 US)
+           https://creativecommons.org/licenses/by/3.0/us/
+
+Changes made: the dice numbers were removed and the word list was filtered, so the
+vendored copy is a modified subset (6,627 words, sorted alphabetically). Removed
+were the four hyphenated entries (the hyphen is our password separator), a short
+hand-reviewed blocklist of words that read as profane, sexual, violent or
+ridiculous in a credential, and one word of every pair differing by a single
+substituted letter, for spoken clarity.
+
+The Electronic Frontier Foundation does not endorse this project.
+
+This file exists in addition to the attribution header inside the vendored file
+itself. The header is one build step away from disappearing: that file is copied
+into cdk.out/asset.* and any future bundling or minification strips comments and
+would silently drop the notice. A repository-level NOTICE survives that.
