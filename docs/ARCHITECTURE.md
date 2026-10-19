@@ -229,6 +229,11 @@ EventBridge (1 min) ──> idle-shutdown λ ──SSM RunCommand──> box
    `/proc/net/udp`, matched as an uppercase-hex local port. PATCH the message with coarse
    progress ("world loading…").
 
+   **`[Session] 'HostOnline' (up)!` is now VERIFIED**, observed at 00:00:03,670 followed by
+   `finished transition from 'Lobby' to 'Host_Online'`. The socket predicate **remains the
+   gate** (PID-free, no log parsing, §6.1.2), but the string is now a confirmed source for
+   human-facing progress text rather than a REPORTED one.
+
    **This resolves a divergence the WP-06 review caught:** WP-06 implemented readiness as
    unit-active + process + UDP 15637 bound, while this section previously also leaned on
    the `[Session] 'HostOnline' (up)!` log line, leaving WP-06 and WP-12 with two different
@@ -314,8 +319,38 @@ the retained data volume so this is a one-time cost, but WP-07 should record bot
     `SIGTERM` — to the game process and waits for it to exit. See §4.
 12. **Save verification**, in the same script, all three of:
     a. `systemctl is-active enshrouded` reports `inactive` (not `deactivating`).
-    b. At least one file under `/srv/enshrouded/savegame/` has an mtime newer than `t0`
-       (`find /srv/enshrouded/savegame -newermt "@$t0" -type f | head -1`).
+    b. **The save check, corrected 2026-10-19 — compare BEFORE and AFTER, not just
+       "did a file appear".** **VERIFIED:** `savegame/` is **empty on a running server**
+       ~30 s after start; the world is deserialised into memory and nothing is written
+       until the first autosave (~10 min) or shutdown. The original rule — "a file with
+       mtime > `t0` must exist" — therefore fails on a legitimate short session, refuses
+       `StopInstances`, and sets maintenance mode. **That is the wedge failure mode, and
+       the very first idle shutdown after a fresh provision would hit it**, since
+       `savegame/` is empty at that point by definition. Not an exotic case.
+
+       The check must ask *"did we lose anything?"*, not *"did a file appear?"*. Snapshot
+       the directory listing **before** issuing the stop, then:
+
+       | before | after | verdict |
+       | --- | --- | --- |
+       | non-empty | a file has mtime > `t0` | **PASS** |
+       | non-empty | nothing newer than `t0` | **FAIL** — a world existed on disk and the clean shutdown did not write. This is the case the gate exists for. |
+       | **empty** | still empty | **PASS**, emit a `SaveSkippedEmptyWorld` metric. There was no world on disk to lose. |
+       | empty | a file appeared | **PASS** |
+
+       The S3 sync (step 13) is then a natural no-op in the empty case.
+
+       **The remaining blind spot, stated rather than hidden:** "empty before, empty after"
+       is only *provably* safe if nothing happened. A player could join a brand-new world,
+       build for nine minutes, and a failed shutdown-save would lose that while this rule
+       passes. Narrow it with the signal we already have — `graceful-stop` knows whether
+       `last-active` was ever updated after `LaunchTime`, i.e. whether any player connected
+       this boot. **If a player connected and `savegame/` is still empty after a clean
+       stop, that is a FAIL.** If no player ever connected, passing is correct.
+
+       **WP-07 can retire this whole branch:** does a clean shutdown of a never-saved world
+       write a file? If it always does, the empty/empty row can never legitimately occur
+       and the rule tightens to "a file must appear, always". Added as WP-07 (g5).
     c. The unit's exit status does **not** indicate a truncated stop. Read
        `systemctl show enshrouded -p Result -p ExecMainCode -p ExecMainStatus` and fail
        **only** on the two signatures that unambiguously mean the save was cut short:
@@ -546,6 +581,67 @@ WP-07 (d2) / (g2) / (g4) observations were framed against **10-26** and must be 
 against 11-9**, not carried over. The contract is sound; its supporting measurements are
 stale.
 
+##### 4.3.2 Resolve the PID once, then signal and wait on THAT pid (2026-10-19 correction)
+
+**VERIFIED on the running server:** `pgrep -f '[e]nshrouded_server\.exe'` matches **two**
+processes —
+
+```
+8416 python3 .../GE-Proton11-9/proton run enshrouded_server.exe   <- launcher
+8474 Z:\srv\enshrouded\enshrouded_server.exe                     <- the game
+```
+
+`wineserver` is still correctly excluded (its command line is just `wineserver`), so the
+§4.3.1 invariant holds. But the pattern is now too broad for both halves of the job.
+
+**The discriminator is `comm`, and it does work — just not the way it was tried.** The
+kernel truncates `comm` to 15 characters, so it is **`enshrouded_serv`**, which is exactly
+what the `ss` output shows (`("enshrouded_serv",pid=8474,…)`). The launcher's `comm` is
+`python3`. So:
+
+```sh
+pgrep -x enshrouded_serv     # matches the game only — exact match on truncated comm
+```
+
+`pgrep -x enshrouded_server.exe` fails *because* of the truncation, not because `comm` is
+unusable. This selector is better than any argv pattern: it does not depend on the
+relative-vs-absolute path (§6.1.3a requirement 4 changed that), on `Z:` drive mapping, or
+on Proton's argv shape.
+
+**The structural fix matters more than the selector, because the current loop has a
+dangerous failure direction.** `stop-game.sh` re-evaluates a pattern each iteration and
+treats *no match* as "the game exited". If the pattern is ever wrong, "no match" means
+"pattern broken", the script exits 0 **immediately**, systemd proceeds to `KillMode`, and
+a mid-save game is SIGKILLed. **A pattern bug and a successful save are indistinguishable
+to that loop**, and they fail in opposite directions.
+
+**Required shape:**
+
+1. **Resolve the game PID once, before signalling.** Require **exactly one** match from
+   `pgrep -x enshrouded_serv`. Zero or two or more → **abort loudly without signalling
+   anything**, and let the verification gate (§3.2 step 12) see a failed stop. Never guess.
+2. **Signal that PID directly** — `kill -INT "$pid"` — not `pkill -f`. This also settles
+   the "is signalling the Proton launcher harmful?" question by not doing it. Unknown
+   remains unknown, and precision costs nothing. (The reference does signal both via
+   `pkill -f` and is known to work, so this is not urgent — but there is no reason to
+   inherit the broader blast radius.)
+3. **Wait on that PID, not on a pattern** — `while [ -d /proc/$pid ]; do sleep 1; done`,
+   bounded at 110 s. Waiting on a resolved PID is immune to pattern drift: the only way it
+   reports "gone" is if the process is actually gone.
+4. `KillMode=control-group` still reaps the launcher and `wineserver` afterwards, which is
+   exactly its job (§4.3.1).
+
+**Consequences for WP-05a's test suite**, which currently asserts the `pkill -f` pattern:
+the assertions must move to the new shape — exactly-one-PID resolution, `kill -INT` on a
+resolved PID, `/proc/$pid` wait. **The invariant being protected is unchanged and in fact
+strengthened** (we now signal exactly one process and never `wineserver`), so the mutation
+tests that reject signalling `wineserver` and a bare `pkill -2` should be kept and joined
+by one that rejects *pattern-based waiting*.
+
+This also resolves WP-07 (g4): the launcher does appear in the old predicate, as predicted,
+so the headroom concern was real — and resolving the PID up front removes it entirely
+rather than merely narrowing it.
+
 **Honesty about this reasoning:** it is inference from how Wine and systemd are documented
 to behave, **not an observation**. It could be wrong in either direction — `wineserver`
 might tolerate SIGINT gracefully, or might already be excluded for some reason we have not
@@ -682,18 +778,34 @@ literal inside the Lambda.
 This mechanism shares no code path, no protocol and no process with A2S. It observes the
 kernel's packet counters.
 
-> **Independence caveat — read before relying on this.** M1 and M2 are independent in
-> *implementation* but may not be independent in their *premise*. Both assume player
-> traffic physically transits this instance's UDP ports. Some sources claim that only
-> UDP 15637 is public and that **game traffic is carried over Steam's networking /
-> datagram relay**, in which case little or no player packet flow would reach the NIC and
-> M2 would read "idle" with a full server — a false negative that kicks live players, the
-> worst possible failure. Counter-evidence: people demonstrably add these servers by raw
-> `ip:15636`, which is hard to reconcile with a pure relay, and the hosting-industry
-> material making the relay claim reads like low-quality SEO content. **Status: unresolved
-> and not resolvable by reasoning.** WP-07 settles it by packet-level observation
-> (§5.6 (b)). Until it does, M1 and M2 must be treated as *possibly correlated*, which is
-> exactly why M3 below exists.
+> **Independence caveat — RESOLVED 2026-10-19, and the answer does not break M2.**
+> The relay claim was **correct and I was wrong to dismiss it as SEO content.**
+> **VERIFIED on the running server:** only UDP **15637** is bound; **15636 is not bound at
+> all**, and the log shows `Server connected to Steam successfully`,
+> `Initializing P2P api: NetworkingMessages` and a `Server SteamId`. Game traffic goes
+> over Steam's P2P / datagram relay, not a direct game port.
+>
+> **M2 survives this, for a reason that was lucky rather than clever: M2 was never
+> port-scoped.** §5.1 records that per-port and per-process UDP counters do not exist on
+> Linux, so M2 reads `/proc/net/snmp` `Udp: InDatagrams` — a **system-wide, all-ports**
+> counter. Player traffic still has to reach this instance's NIC as UDP datagrams,
+> whatever port or relay carries it: the server is running the simulation, so it must be
+> receiving player input. M2 counts those datagrams regardless of which port they land on.
+>
+> **So M1 and M2 ARE independent after all.** The shared premise was "traffic transits the
+> instance's UDP ports". That premise is **false for 15636** and **true system-wide**, and
+> M2 only ever depended on the system-wide reading. See §5.6 for the re-ruled decision
+> table.
+>
+> **Two genuinely new risks the finding creates, neither fatal:**
+> 1. **The idle floor may be much higher than estimated.** The server now holds a standing
+>    Steam connection and relay keepalives even with zero players, so §5.3's "an empty
+>    server receives only a few datagrams per second" is probably wrong. The *signal* is
+>    intact; the *separation* may be worse. WP-07 (c) must measure the idle floor **with
+>    Steam connected**, which it now will be by default.
+> 2. **Relay traffic may not scale cleanly with player count.** Datagram rate should still
+>    jump on join, but the shape is unknown. M2 remains a presence detector, not a counter
+>    — which is all §3.2 step 6 ever asked of it.
 
 ```sh
 a=$(awk '/^Udp:/{getline; print $1}' /proc/net/snmp)   # Udp InDatagrams, cumulative
@@ -785,6 +897,32 @@ no players eventually stops rewriting the save, or writes a byte-identical one. 
 idle signal, immune to every transport question. Its ~20-minute resolution is too coarse to
 be primary but is perfectly adequate as a last-resort mechanism (§5.6).
 
+### 5.4a A fourth candidate the transport finding opened up (M4)
+
+Now that we know the server uses Steam **NetworkingMessages** rather than a listening game
+port, a more direct signal may exist: **does the game hold a socket or file descriptor per
+connected peer?**
+
+```sh
+pid=$(pgrep -x enshrouded_serv)
+ls /proc/$pid/fd | wc -l          # fd count
+ss -u -a -p | grep -c "pid=$pid"  # udp sockets owned by the game
+```
+
+If either number moves by a fixed amount per joining player, that is a **direct, exact
+player count** — better than all three existing mechanisms, immune to transport questions,
+and requiring no protocol parsing. The observed `ss` output already shows the game holding
+`fd=98` on the query socket, so fds are at least enumerable.
+
+**ASSUMED — and quite likely false:** the Steamworks networking SDK typically multiplexes
+all peers over a single socket, in which case neither number moves on join. **Cost to find
+out is one command with one player connected**, so WP-07 should check it before settling
+for a heuristic. Added as WP-07 (d3). A cheap long shot with a large payoff.
+
+Rejected while here: querying the **Steam Web API** for the server's player count by its
+`SteamId`. It would work, but it adds an external dependency, an API key to store and a
+third-party availability risk to the stop path. Not worth it when on-box signals exist.
+
 ### 5.5 Safety rails around all mechanisms
 
 - **Never stop on a failed measurement.** INDETERMINATE keeps the box up (§3.2 step 7).
@@ -806,10 +944,30 @@ The architecture must survive every outcome of the spike, not just the happy one
 table is the contract: WP-07 reports, and the owning engineer applies the matching row
 without re-opening the design.
 
+##### Re-ruled 2026-10-19, now that the transport is known
+
+WP-07 question (b) is **answered**: game traffic is Steam P2P / relay, only 15637 is bound
+(§5.3). Applying the table below, we land on **row (b) — but not the row's consequence**,
+because the row was written assuming "traffic does not transit the instance's UDP ports"
+implied M2 was dead. It does not: M2 is system-wide, not port-scoped, so it is **not
+deleted**. The corrected ruling for the transport we actually have:
+
+| | mechanism | status |
+| --- | --- | --- |
+| **primary** | **M3 — cgroup-wide process activity** | The transport-independent one, and §5.4's cgroup form is now clearly primary rather than a hedge (see §5.4's PID finding). |
+| **secondary** | **M2 — system-wide UDP datagram rate** | Alive. Separation may be worse than estimated because of Steam keepalives; WP-07 (c) measures it. |
+| **corroborating** | **M1 — A2S on 15637** | 15637 *is* bound, so the probe can run. Whether its `players` byte reflects P2P-connected players is **still unverified** — that was question (a), which remains open. |
+
+Disagreement still resolves toward ACTIVE, and §3.2 step 6's rule is unchanged in shape.
+
+**Phase 3 is unblocked on the transport question.** It remains blocked on question (a) —
+whether A2S reports a live player count — and on (c)/(d) calibration, which is what
+decides whether M3 or M2 carries the primary role in practice.
+
 | WP-07 finding | Authoritative mechanism | Secondary | Consequence |
 | --- | --- | --- | --- |
 | (a) A2S answers with a live, accurate `players` | **M1** | M2 + M3 as corroboration; disagreement → ACTIVE | The design as written. Best case. |
-| (b) Player traffic does **not** transit the instance's UDP ports (Steam relay is real) | **M3** | log scraping if lines exist | **M2 is deleted, not demoted** — it would be a confident false "idle". M1 may still work (the query port is public by assumption either way) and becomes secondary. |
+| (b) Player traffic does **not** transit the instance's UDP ports (Steam relay is real) | **M3** | log scraping if lines exist | ~~M2 is deleted~~ **— SUPERSEDED. This row's consequence was wrong**: it assumed "not on our port" meant "not on our NIC". M2 reads a system-wide counter, so relayed traffic still counts. M2 is **demoted to secondary, not deleted**. See the re-ruling above. |
 | (c) A2S answers but `players` is stale or always `0` | **M3** | M2 (only if (b) is disproved) | M1 downgraded to a liveness probe for readiness gate 3 only, never for stop decisions. |
 | (d) Unambiguous join/leave lines exist in the log | **log-derived count** | M1, M3 | Promote log scraping to primary — it is the only mechanism that reports *identity*, not just activity, and cannot be fooled by an external scanner. Note the log is wiped on launch (§5.7), so state is per-session. |
 | (e) **M1, M2 and M3 all prove unreliable** | — | — | **Fallback of last resort, below.** |
@@ -1684,6 +1842,34 @@ Reuse `vpc-09a5eec05a40dccc2` via `ec2.Vpc.fromLookup({ isDefault: true })` with
 means no NAT Gateway (which alone would cost ~$33/month — more than the game server). Network
 isolation from the UO box is provided by the security group, not the VPC.
 
+#### 6.3.0 UDP 15636 — a provisionally dead rule, kept deliberately
+
+**VERIFIED 2026-10-19:** the server binds **only UDP 15637**. Nothing listens on 15636
+(§5.3). The security-group rule for 15636 currently admits traffic to a closed port.
+
+**Decision: keep it for now, documented as provisional, with a named removal trigger.**
+
+- **Keeping it is not a security problem.** With nothing listening, packets to 15636 are
+  dropped by the host. The objection is tidiness — an unjustified rule — not exposure.
+- **Removing it prematurely is a real risk.** It is not yet settled how players actually
+  connect (§5.3 raises this for WP-12's join message). If direct-IP joining is a fallback
+  path that binds on demand, or if a future Enshrouded version restores a listening game
+  port, removing the rule breaks joining in a way that is awkward to diagnose — the
+  symptom would be "some players can't connect" long after anyone remembers the change.
+
+**Removal trigger, so this does not rot into permanent cruft:** once **WP-07 and WP-12
+have confirmed how players actually connect** and that no path needs 15636, delete the
+rule and update `test/server.test.ts` to assert **15637 only**. That test currently
+encodes 15636 as expected, so the removal is a deliberate two-file change with a
+reviewable diff — which is the right amount of friction.
+
+**Worth noting what this implies about the security group generally.** If gameplay is
+carried over Steam's relay, that traffic is **outbound-initiated** and needs no inbound
+rule at all. The plausible reading is that **15637 serves only the server-browser query**,
+and that the SG may need no inbound gameplay rule whatsoever. That is a meaningful
+simplification if WP-07 confirms it, and it makes the §1.7 "only the game ports are
+exposed" invariant even narrower than designed.
+
 #### 6.3.1 The availability zone is pinned, and it is a durability control
 
 **The gap WP-03 surfaced.** WP-03 placed the instance with CDK's default subnet selection.
@@ -1763,6 +1949,21 @@ the right target**; it satisfies Keen's number outright and leaves ~8 GB of slac
 Linux rates are **VERIFIED** for `r6i.large` in `us-east-2` via the AWS Price List API
 ($0.126/hr, `licenseModel=No License required`); the others are the standard published
 on-demand Linux rates and are **ESTIMATED** to the same basis.
+
+##### First live resource datapoint (2026-10-19) — not yet actionable
+
+30 s after start, zero players: exe RSS **702 MB**, cgroup `memory.current` **776 MB**,
+cgroup `cpu.stat` usage **10.85 s**. That is far below the ~4.4 GB idle figure every
+secondary source reports.
+
+**Do not resize on this.** A world deserialised 844 ms earlier with nobody connected is
+the least representative moment in a session — the research figure plausibly describes a
+warm server with chunks streamed in. What it does establish is that **the ~4.4 GB number
+is not a floor reached at startup**, so WP-07 (d)/(e) must sample under real load over
+several minutes rather than taking an early reading. If the steady-state figure with 2–4
+players also lands near 1 GB, then 16 GiB is substantially over-provisioned and
+`r6i.large` could drop to a smaller class — a cost conversation worth having **after**
+measurement, not before.
 
 #### The CPU caveat — say it out loud
 
@@ -2681,6 +2882,22 @@ account.
   separately — they are expected to differ substantially (§3.1).
 - **(j) Save-file churn.** Does an idle server with no players stop rewriting the save
   across two autosave cycles? (Qualifies the §5.4 reserve mechanism.)
+- **(d3) Does the game hold a socket or fd per connected peer? (§5.4a)** With one player
+  connected, compare `ls /proc/$pid/fd | wc -l` and `ss -u -a -p | grep -c "pid=$pid"`
+  against the idle baseline. If either moves by a fixed amount per player this is an exact
+  player count and supersedes M1/M2/M3. Likely false (Steamworks usually multiplexes), but
+  it is one command and the payoff is large.
+- **(g5) Does a clean shutdown of a never-saved world write a file?** Start a fresh world,
+  connect nobody, stop cleanly inside the autosave window, and check whether `savegame/`
+  gains a file. **If it always does, §3.2 step 12b's "empty before, empty after" branch
+  can never legitimately occur and the rule tightens to "a file must appear, always"** —
+  removing a fail-open branch from the save gate, which is worth retiring if we can.
+- **(b) — ANSWERED, 2026-10-19.** Game traffic is Steam P2P / relay; only UDP 15637 is
+  bound. See §5.3 and the §5.6 re-ruling. What remains open from the original (b) is only
+  the *calibration* that (c) and (d) cover.
+- **(g4) — ANSWERED.** `pgrep -f` matches the launcher as well as the game, as predicted.
+  Resolved structurally in §4.3.2 (resolve the PID once, wait on `/proc/$pid`) rather than
+  by narrowing the pattern.
 - **(k3) Proton 11-9 on Ubuntu 24.04 — untested combination.** The reference runs
   **Debian 13**; we run **Ubuntu 24.04**. A glibc or library-version difference is
   possible and nothing has validated 11-9 on 24.04. Record the glibc version on both sides
@@ -2732,7 +2949,7 @@ account.
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
 | **WP-11** | Interactions endpoint: HTTP API, Ed25519 verify (401 on bad signature), PING, deferred ack, async self-invoke. `/enshrouded start` and `/enshrouded status`. Command definitions + the manual registration script. | `lib/enshrouded/discord-bot.ts`, `lambda/discord-bot/{index.js,commands.js}`, `lambda/shared/discord.js`, `scripts/register-discord-commands.js`, `test/discord-commands.test.ts` | WP-03 | Discord accepts the endpoint URL. `/enshrouded start` acks in <3 s. Anti-drift test fails if the handler reads an option `commands.js` does not register. | R — close port of the reference. |
-| **WP-12** | `boot-watcher`: the three readiness gates, progress PATCHes, the final join-info message, 8-minute give-up naming the failed gate. | `lambda/boot-watcher/index.js` | WP-08, WP-11 | A cold `/enshrouded start` ends with an edited message containing `ip:15636` and the add-server instructions, and the time from command to that message is recorded. A blocked firewall reproduces a gate-3 failure message. | R, with an **A** review of the gate ordering. |
+| **WP-12** | `boot-watcher`: the three readiness gates, progress PATCHes, the final join-info message — **blocked on settling how players actually connect: only UDP 15637 is bound and gameplay runs over Steam P2P/relay (§5.3), so an `ip:15636` join string is probably wrong.** Determine the real join path (Steam server browser by name, Steam friends/invite, or direct IP on 15637) before writing the text; a confidently wrong join message is worse than a vague one — 8-minute give-up naming the failed gate. | `lambda/boot-watcher/index.js` | WP-08, WP-11 | A cold `/enshrouded start` ends with an edited message containing `ip:15636` and the add-server instructions, and the time from command to that message is recorded. A blocked firewall reproduces a gate-3 failure message. | R, with an **A** review of the gate ordering. |
 | **WP-13** | Remaining commands: `/enshrouded stop` (routes to `graceful-stop`, never raw `StopInstances`), `/enshrouded password` (**ephemeral**, `flags: 64`), `/enshrouded update`, `/enshrouded backup`. Permission gating on the admin ones (`ADMINISTRATOR`/`MANAGE_GUILD` bits, checked in the handler as defence in depth, not only in the portal). | updates to `lambda/discord-bot/`, `commands.js` | WP-09, WP-11 | A non-admin invoking `/enshrouded update` is refused by the handler itself. `/enshrouded password` output is ephemeral; grep the repo and CloudWatch logs to confirm no password is ever logged. | R |
 | **WP-14** | Status channel: EventBridge on EC2 state change → rename the Discord channel `enshrouded-online` / `-offline`. | `lib/enshrouded/status-channel.ts`, `lambda/status-channel/index.js` | WP-11 | Channel name tracks the real instance state within a minute of each transition. | R — direct port. |
 
