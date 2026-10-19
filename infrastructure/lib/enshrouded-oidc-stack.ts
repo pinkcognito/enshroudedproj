@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib/core';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+import { githubOidcSubs } from './enshrouded/constants';
 
 /** GitHub repo allowed to assume the CI roles (matches the project-wide `repo` tag). */
 export const OIDC_GITHUB_REPO = 'pinkcognito/enshroudedproj';
@@ -37,24 +38,6 @@ export class EnshroudedOidcStack extends cdk.Stack {
       EXISTING_GITHUB_OIDC_PROVIDER_ARN,
     );
 
-    // GitHub now issues OIDC subjects with IMMUTABLE NUMERIC IDS embedded:
-    //   repo:<owner>@<owner_id>/<repo>@<repo_id>:<context>
-    // not the `repo:<owner>/<repo>:<context>` form that virtually every guide (and
-    // the AWS docs) still show. Confirmed from CloudTrail on a real failed
-    // AssumeRoleWithWebIdentity from this repo's PR workflow:
-    //   repo:pinkcognito@7524041/enshroudedproj@1424007989:pull_request
-    // A policy written only against the documented form fails with the unhelpful
-    // "Not authorized to perform sts:AssumeRoleWithWebIdentity".
-    //
-    // Both spellings are accepted so the roles survive GitHub sending either. The
-    // ID form is the stronger of the two - numeric ids do not change on a rename,
-    // so it cannot be captured by someone who later squats a freed repo name.
-    const OIDC_GITHUB_REPO_BY_ID = 'pinkcognito@7524041/enshroudedproj@1424007989';
-    const repoSubs = (context: string): string[] => [
-      `repo:${OIDC_GITHUB_REPO_BY_ID}:${context}`,
-      `repo:${OIDC_GITHUB_REPO}:${context}`,
-    ];
-
     const bootstrapRole = (kind: string): string =>
       `arn:${this.partition}:iam::${this.account}:role/cdk-${BOOTSTRAP_QUALIFIER}-${kind}-role-${this.account}-${this.region}`;
 
@@ -66,7 +49,7 @@ export class EnshroudedOidcStack extends cdk.Stack {
         StringEquals: { [`${OIDC_HOST}:aud`]: 'sts.amazonaws.com' },
         // A list is an OR. No wildcards here: the branch context stays exact, so
         // this is still main-only - only the repo spelling has two accepted forms.
-        StringLike: { [`${OIDC_HOST}:sub`]: repoSubs('ref:refs/heads/main') },
+        StringLike: { [`${OIDC_HOST}:sub`]: githubOidcSubs('ref:refs/heads/main') },
       }),
       maxSessionDuration: cdk.Duration.hours(1),
     });
@@ -84,7 +67,7 @@ export class EnshroudedOidcStack extends cdk.Stack {
       description: 'GitHub Actions (any branch/PR): read-only cdk diff via the enshrd1 lookup role',
       assumedBy: new iam.WebIdentityPrincipal(provider.openIdConnectProviderArn, {
         StringEquals: { [`${OIDC_HOST}:aud`]: 'sts.amazonaws.com' },
-        StringLike: { [`${OIDC_HOST}:sub`]: repoSubs('*') },
+        StringLike: { [`${OIDC_HOST}:sub`]: githubOidcSubs('*') },
       }),
       maxSessionDuration: cdk.Duration.hours(1),
     });
