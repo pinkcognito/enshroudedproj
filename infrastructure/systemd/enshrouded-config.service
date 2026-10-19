@@ -1,0 +1,21 @@
+[Unit]
+Description=Render Enshrouded server config (passwords) from SSM before the game starts
+# Render AFTER steamcmd validate, never before: validate can restore or replace files in the install
+# directory. (deploy-game-server.sh installs the config after steamcmd for the same reason.)
+After=network-online.target enshrouded-update.service
+Wants=network-online.target
+# It writes into /srv/enshrouded; refuse to render onto the root volume if the data volume is absent.
+RequiresMountsFor=/srv/enshrouded
+
+[Service]
+Type=oneshot
+# Deliberately NOT yes. With "no" the unit goes inactive after it runs, so every activation of
+# enshrouded.service (boot, manual restart, deploy) re-runs the render. No activation can skip it.
+RemainAfterExit=no
+# Root (no User=): it must chown the output to the game user and chmod it 600.
+# The single shared renderer; its bounded retry (5 attempts, about 90 s worst case) lives INSIDE the
+# script. Do not add Restart= here: for a oneshot pulled in by Requires= it gives no in-boot retry,
+# because the dependent start job has already failed by the time a restart job is queued.
+ExecStart=/usr/local/lib/enshrouded/render-config.sh /srv/enshrouded/enshrouded_server.json
+# Sized above the in-script retry budget.
+TimeoutStartSec=120

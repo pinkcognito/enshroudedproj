@@ -177,7 +177,7 @@ jobs:
           persist-credentials: false
       - name: systemd-analyze verify
         # sudo: as root there is no unrelated host-unit permission noise. The script filters exactly
-        # the 3 expected "binary not installed on the runner" notices and fails on anything else.
+        # the 4 expected "binary not installed on the runner" notices and fails on anything else.
         run: |
           systemd-analyze --version | head -1
           sudo bash .github/scripts/verify-systemd.sh infrastructure/systemd

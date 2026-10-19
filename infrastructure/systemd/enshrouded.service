@@ -1,8 +1,11 @@
 [Unit]
 Description=Enshrouded dedicated server (GE-Proton 11-9)
 Documentation=file:///srv/enshrouded
-After=network-online.target enshrouded-update.service
+After=network-online.target enshrouded-update.service enshrouded-config.service
 Wants=network-online.target enshrouded-update.service
+# Invariant 1.12: never start on a config that was not just rendered from SSM. BOTH Requires= and
+# After= are needed (Requires= alone does not order; After= alone does not block). Never Wants=.
+Requires=enshrouded-config.service
 # The world lives on the retained data volume. If it is not mounted, REFUSE to start
 # rather than silently writing a brand-new world onto the root volume (fstab uses nofail).
 RequiresMountsFor=/srv/enshrouded

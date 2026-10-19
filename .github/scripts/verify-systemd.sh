@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Runs `systemd-analyze verify` over infrastructure/systemd/*.service and fails on anything unexpected.
 #
-# The runner is not the game host, so exactly three "Command ... is not executable: No such file or
+# The runner is not the game host, so exactly four "Command ... is not executable: No such file or
 # directory" lines are EXPECTED (the binaries only exist after provision-host.sh has run on the host):
 #   - the GE-Proton `proton` launcher
-#   - /usr/local/lib/enshrouded/stop-game.sh   (written by provision-host.sh)
-#   - /usr/local/lib/enshrouded/update-game.sh (written by provision-host.sh)
+#   - /usr/local/lib/enshrouded/stop-game.sh    (written by provision-host.sh)
+#   - /usr/local/lib/enshrouded/update-game.sh  (written by provision-host.sh)
+#   - /usr/local/lib/enshrouded/render-config.sh (written by provision-host.sh; ExecStart of enshrouded-config.service)
 # Those are filtered by exact path. Everything else - unknown directives, bad values, dependency
 # cycles - is an error. This is deliberately NOT a blanket ignore.
 set -uo pipefail
@@ -20,7 +21,7 @@ cd "$work" || exit 2
 out="$(systemd-analyze verify --man=no ./*.service 2>&1)"
 rc=$?
 
-expected='^(enshrouded|enshrouded-update)\.service: Command (/opt/steamcmd/compatibilitytools\.d/GE-Proton[0-9A-Za-z._-]*/proton|/usr/local/lib/enshrouded/(stop|update)-game\.sh) is not executable: No such file or directory$'
+expected='^((enshrouded|enshrouded-update)\.service: Command (/opt/steamcmd/compatibilitytools\.d/GE-Proton[0-9A-Za-z._-]*/proton|/usr/local/lib/enshrouded/(stop|update)-game\.sh)|enshrouded-config\.service: Command /usr/local/lib/enshrouded/render-config\.sh) is not executable: No such file or directory$'
 unexpected="$(printf '%s\n' "$out" | grep -Ev "$expected" | grep -v '^$' || true)"
 
 echo "--- systemd-analyze verify (raw, rc=$rc) ---"
@@ -34,4 +35,4 @@ if [ -n "$unexpected" ]; then
   printf '%s\n' "$unexpected" >&2
   exit 1
 fi
-echo "systemd units OK (only the 3 expected missing-binary notices were filtered)"
+echo "systemd units OK (only the 4 expected missing-binary notices were filtered)"
