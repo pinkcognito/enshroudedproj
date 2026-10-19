@@ -369,6 +369,127 @@ describe('maintenance mode is cleared on every exit path (run-game-deploy.sh)', 
   });
 });
 
+describe('provisioning runs before the game deploy (run-game-deploy.sh, two SSM commands)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wp06prov-'));
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(tmp, 'prov.sh'), '#!/bin/bash\necho MARKER-PROVISION-BODY\n');
+  fs.writeFileSync(path.join(tmp, 'dep.sh'), '#!/bin/bash\necho MARKER-DEPLOY-BODY\n');
+
+  // The stub records every call and copies each send-command payload file so the test can
+  // inspect what each phase actually shipped. Status is selectable per phase.
+  function drive(env: Record<string, string>) {
+    const id = Math.random().toString(36).slice(2);
+    const log = path.join(tmp, `calls-${id}.log`);
+    const payloads = path.join(tmp, `payloads-${id}`);
+    fs.mkdirSync(payloads);
+    const stub =
+      `aws() { echo "$*" >> "${fwd(log)}"; ` +
+      `case "$*" in ` +
+      `*put-parameter*) return 0;; ` +
+      `*send-command*) a="$*"; f="\${a#*file://}"; f="\${f%% *}"; ` +
+      `case "$*" in *"game provisioning"*) n=prov;; *) n=deploy;; esac; ` +
+      `cp "$f" "${fwd(payloads)}/$n.json"; echo "cmd-$n";; ` +
+      `*"--command-id cmd-prov"*"--query Status"*) echo "\${PROV_STATUS:-Success}";; ` +
+      `*"--command-id cmd-deploy"*"--query Status"*) echo "\${DEPLOY_STATUS:-Success}";; ` +
+      `*) echo output;; esac; }; export -f aws; ` +
+      `bash "${fwd(path.join(ROOT, DRIVER))}"`;
+    const r = runBash(stub, {
+      ENSHROUDED_INSTANCE_ID: 'i-testtest', POLL_SECONDS: '0', MAX_POLLS: '3',
+      PROVISION_SCRIPT: fwd(path.join(tmp, 'prov.sh')), DEPLOY_SCRIPT: fwd(path.join(tmp, 'dep.sh')),
+      ...env,
+    });
+    const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
+    const payload = (n: string): string | undefined => {
+      const f = path.join(payloads, `${n}.json`);
+      return fs.existsSync(f) ? (JSON.parse(fs.readFileSync(f, 'utf8')) as { commands: string[] }).commands[0] : undefined;
+    };
+    const timeout = (n: string): string[] | undefined => {
+      const f = path.join(payloads, `${n}.json`);
+      return fs.existsSync(f) ? (JSON.parse(fs.readFileSync(f, 'utf8')) as { executionTimeout: string[] }).executionTimeout : undefined;
+    };
+    return { r, calls, prov: payload('prov'), dep: payload('deploy'), timeouts: { prov: timeout('prov'), deploy: timeout('deploy') } };
+  }
+  const sends = (calls: string[]) => calls.filter((c) => c.includes('send-command'));
+  const lastPut = (calls: string[]) => calls.filter((c) => c.includes('put-parameter')).pop() ?? '';
+
+  bashTest('ORDER: provision-host.sh is sent first, deploy-game-server.sh second, inside the maintenance window', () => {
+    if (!HAVE_PY) return;
+    const { r, calls, prov, dep } = drive({});
+    expect({ s: r.status, e: r.stderr }).toEqual({ s: 0, e: '' });
+    const s = sends(calls);
+    expect(s).toHaveLength(2);
+    expect(s[0]).toContain('game provisioning');
+    expect(s[1]).toContain('game deploy');
+    expect(prov).toContain('MARKER-PROVISION-BODY');
+    expect(prov).not.toContain('MARKER-DEPLOY-BODY');
+    expect(dep).toContain('MARKER-DEPLOY-BODY');
+    expect(dep).not.toContain('MARKER-PROVISION-BODY');
+    const iSet = calls.findIndex((c) => c.includes('--value true'));
+    const iProv = calls.findIndex((c) => c.includes('send-command') && c.includes('game provisioning'));
+    const iDep = calls.findIndex((c) => c.includes('send-command') && c.includes('game deploy'));
+    const iClear = calls.findIndex((c) => c.includes('--value false'));
+    expect(iSet).toBeLessThan(iProv);
+    expect(iProv).toBeLessThan(iDep);
+    expect(iDep).toBeLessThan(iClear);
+    // provisioning must have FINISHED (its status polled) before the deploy was sent
+    const iProvPoll = calls.findIndex((c) => c.includes('--command-id cmd-prov') && c.includes('--query Status'));
+    expect(iProvPoll).toBeGreaterThan(iProv);
+    expect(iProvPoll).toBeLessThan(iDep);
+    expect(r.stdout).toContain('phase: provisioning');
+    expect(r.stdout).toContain('phase: game deploy');
+  });
+
+  bashTest('provisioning FAILS: the game deploy is never sent, clear-on-exit still runs, phase is named', () => {
+    if (!HAVE_PY) return;
+    for (const status of ['Failed', 'TimedOut', 'Cancelled']) {
+      const { r, calls, dep } = drive({ PROV_STATUS: status });
+      expect(r.status).not.toBe(0);
+      expect(sends(calls)).toHaveLength(1);
+      expect(sends(calls)[0]).toContain('game provisioning');
+      expect(dep).toBeUndefined();
+      expect(calls.some((c) => c.includes('cmd-deploy'))).toBe(false);
+      expect(r.stderr).toMatch(/provisioning phase FAILED/);
+      expect(r.stderr).toMatch(/game deploy phase was NOT attempted/);
+      expect(lastPut(calls)).toContain('--value false');
+    }
+  });
+
+  bashTest('deploy FAILS after good provisioning: names the deploy phase, maintenance still cleared', () => {
+    if (!HAVE_PY) return;
+    const { r, calls } = drive({ DEPLOY_STATUS: 'Failed' });
+    expect(r.status).not.toBe(0);
+    expect(sends(calls)).toHaveLength(2);
+    expect(r.stderr).toMatch(/game deploy phase FAILED/);
+    expect(r.stderr).not.toMatch(/provisioning phase FAILED/);
+    expect(lastPut(calls)).toContain('--value false');
+  });
+
+  bashTest('the config template (ENSHROUDED_CONFIG_TEMPLATE_B64) is bundled with the deploy phase ONLY', () => {
+    if (!HAVE_PY) return;
+    const { prov, dep } = drive({});
+    expect(dep).toMatch(/^#!\/bin\/bash\nexport ENSHROUDED_CONFIG_TEMPLATE_B64='[A-Za-z0-9+/=]+'\n/);
+    expect(prov).toBeDefined();
+    expect(prov).not.toContain('ENSHROUDED_CONFIG_TEMPLATE_B64');
+    expect(prov?.startsWith('#!/bin/bash\n')).toBe(true);
+  });
+
+  bashTest('execution timeouts: provisioning 1500s, deploy 3000s', () => {
+    if (!HAVE_PY) return;
+    const { r, timeouts } = drive({});
+    expect(r.status).toBe(0);
+    expect(timeouts).toEqual({ prov: ['1500'], deploy: ['3000'] });
+  });
+
+  test('static: defaults are the two real on-box scripts; one shared send/poll implementation', () => {
+    const c = code(driver);
+    expect(c).toContain('provision-host.sh');
+    expect(c).toContain('deploy-game-server.sh');
+    expect(c.indexOf('run_phase provisioning')).toBeGreaterThan(0);
+    expect(c.indexOf('run_phase provisioning')).toBeLessThan(c.indexOf('run_phase "game deploy"'));
+    expect(c.match(/send-command/g)).toHaveLength(1);
+  });
+});
+
 describe('deploy workflow', () => {
   const wf = fs.readFileSync(WORKFLOW, 'utf8');
 
@@ -505,6 +626,46 @@ describe('GameDeploy construct', () => {
     for (const pol of Object.values(t.findResources('AWS::IAM::Policy'))) {
       if (!(pol.Properties.Roles as { Ref: string }[]).some((r) => r.Ref === id)) continue;
       expect(JSON.stringify(pol.Properties.PolicyDocument)).not.toMatch(/ssm:Put/);
+    }
+  });
+});
+
+describe('run-game-deploy.sh poll budget', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'run-game-deploy.sh'), 'utf8');
+
+  // A fixed MAX_POLLS silently went stale: DEPLOY_TIMEOUT=3000s against an 1800s
+  // window meant a slow deploy would be reported failed while SSM was still running
+  // it, and the EXIT trap would clear maintenance mode mid-install. The budget is now
+  // derived from the phase timeout, so this asserts the derivation exists rather than
+  // re-checking two numbers that can drift apart again.
+  test('polls are derived from the phase timeout, not a fixed count', () => {
+    expect(src).toMatch(/polls=\$\(\(\s*\(\s*timeout\s*\+\s*POLL_GRACE\s*\)\s*\/\s*\w+\s*\)\)/);
+    expect(src).toMatch(/seq 1 "\$polls"/);
+    expect(src).not.toMatch(/seq 1 "\$MAX_POLLS"/);
+    // The divisor must be guarded: POLL_SECONDS=0 (used by these tests, and by anyone
+    // tuning for speed) would otherwise be a division-by-zero at runtime.
+    expect(src).toMatch(/_interval=1/);
+  });
+
+  test('every declared phase timeout fits inside its derived window', () => {
+    // Read the default out of `NAME="${NAME:-123}"` without a heavily escaped regex:
+    // find the declaration line, take the digits. Simpler to read, and it survives
+    // the quoting style changing.
+    const num = (name: string): number => {
+      const line = src
+        .split('\n')
+        .find((l) => l.startsWith(`${name}=`) && l.includes(`${name}:-`));
+      if (!line) throw new Error(`${name} declaration not found in run-game-deploy.sh`);
+      const digits = line.match(/:-(\d+)\}/);
+      if (!digits) throw new Error(`${name} has no numeric default: ${line}`);
+      return Number(digits[1]);
+    };
+    const pollSeconds = num('POLL_SECONDS');
+    const grace = num('POLL_GRACE');
+    const floor = num('MAX_POLLS');
+    for (const t of [num('PROVISION_TIMEOUT'), num('DEPLOY_TIMEOUT')]) {
+      const window = Math.max(Math.floor((t + grace) / pollSeconds), floor) * pollSeconds;
+      expect(window).toBeGreaterThan(t);
     }
   });
 });
