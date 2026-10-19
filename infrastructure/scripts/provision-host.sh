@@ -5,7 +5,11 @@
 # Architecture refs: section 4 (shutdown), 6.1.2-6.1.4 (Proton, pinning, SSM Agent), 7 (install).
 #
 # NEVER-DO list (data-loss critical):
-#   * never mkfs a device that has ANY signature or non-zero data in its first MiB
+#   * never mkfs a device that carries ANY filesystem/RAID/LVM/partition signature
+#   * never mkfs unless the disk is positively identified as THE data volume (SSM param
+#     /enshroudedproj/server/data-volume-id == the volume id behind the NVMe serial)
+#   * never mkfs unless ENSHROUDED_ALLOW_FIRST_FORMAT names that exact volume id
+#   (the rules and their rationale are ARCHITECTURE section 8.2)
 #   * never start/stop/restart enshrouded.service from here (a re-run on a live host must
 #     not interrupt a session or trigger a stop)
 #   * never extract or use a GE-Proton tarball whose SHA256 does not match
@@ -42,6 +46,12 @@ ENSHROUDED_MIRROR_S3_URI="${ENSHROUDED_MIRROR_S3_URI:-}"
 
 # Optional hint: the data volume id (vol-0123...). Matches the NVMe serial. Never required.
 ENSHROUDED_DATA_VOLUME_ID="${ENSHROUDED_DATA_VOLUME_ID:-}"
+# First-format acknowledgement (ARCHITECTURE 8.2). NOT a boolean: it must equal the volume id the
+# script resolved from the NVMe serial (e.g. vol-0142d5163b94a5e53), so it confirms THIS disk and
+# fails safe if the expected volume ever changes. Only needed on true first provision.
+ENSHROUDED_ALLOW_FIRST_FORMAT="${ENSHROUDED_ALLOW_FIRST_FORMAT:-}"
+# Published by WP-04's WorldStorage; the source of truth for which volume is the data volume.
+DATA_VOLUME_ID_PARAM="/enshroudedproj/server/data-volume-id"
 # The device name WP-04 attaches the volume as (Nitro surfaces it as NVMe; this name may not exist).
 DATA_DEVICE_HINT="sdf"
 
@@ -202,45 +212,106 @@ wait_for_data_device() {
   return 1
 }
 
-# True ONLY if the device is provably empty: no filesystem/RAID/LVM signature (wipefs),
-# nothing blkid recognises, and the first MiB is all zeroes. Any doubt => false.
+# Volume id behind a disk's NVMe serial ("vol0123abc" -> "vol-0123abc"). Fails if the serial is
+# not an EBS volume serial.
+device_volume_id() {
+  local serial
+  serial="$(lsblk -dno SERIAL "$1" 2>/dev/null | tr -d ' ')" || return 1
+  case "$serial" in
+    vol[0-9a-f]*) echo "vol-${serial#vol}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The volume id this stack expects, from SSM. Prints it; fails (with a reason on stderr) if it
+# cannot be read or is not a volume id. Never guesses.
+read_expected_volume_id() {
+  local v
+  v="$(aws ssm get-parameter --region "${REGION:-us-east-2}" --name "$DATA_VOLUME_ID_PARAM" \
+        --query Parameter.Value --output text 2>/dev/null)" || {
+    echo "cannot read SSM parameter ${DATA_VOLUME_ID_PARAM} (not yet created by the EnshroudedServerStack deploy, or the instance role cannot read it)" >&2
+    return 1
+  }
+  case "$v" in
+    vol-[0-9a-f]*) echo "$v" ;;
+    *) echo "SSM parameter ${DATA_VOLUME_ID_PARAM} holds '${v}', which is not a volume id" >&2; return 1 ;;
+  esac
+}
+
+# Positive identification (ARCHITECTURE 8.2): the disk we are about to use must BE the volume the
+# stack created. Prints the resolved volume id. Applies whether or not a filesystem exists.
+verify_volume_identity() {
+  local dev="$1" expected="$2" resolved
+  resolved="$(device_volume_id "$dev")" \
+    || die "refusing to use $dev: its NVMe serial is not an EBS volume id, so it cannot be identified.
+  device:             $dev
+  expected volume id: $expected (from SSM ${DATA_VOLUME_ID_PARAM})
+  failed condition:   volume identity (no vol-... serial on the device)"
+  if [ "$resolved" != "$expected" ]; then
+    die "refusing to use $dev: it is NOT the data volume this stack expects.
+  device:             $dev
+  resolved volume id: $resolved
+  expected volume id: $expected (from SSM ${DATA_VOLUME_ID_PARAM})
+  failed condition:   volume identity (resolved id != expected id)
+  Nothing was changed. Find out why a different volume is attached before doing anything else."
+  fi
+  echo "$resolved"
+}
+
+# True ONLY if the device carries no signature of any kind: no filesystem/RAID/LVM signature
+# (wipefs), nothing blkid recognises (rc 2 = nothing found), and no partition table. Any doubt =>
+# false, with the failed condition left in BLANK_FAIL for the error message.
+#
+# DO NOT REINSTATE an "all-zeros in the first MiB" condition (ARCHITECTURE 8.2). On an ENCRYPTED
+# EBS volume never-written blocks read back as pseudo-random bytes (observed: zeros for 4 KiB,
+# random from 0x1000), so that test fails for EVERY volume, blank or not. It is not a safety
+# control, it is an outage - and it is what gets a guard deleted along with the checks that
+# matter. The world always lives on ext4, and any volume that held one carries a superblock
+# signature that the checks below detect; volume identity + the named acknowledgement cover the
+# rest.
 device_is_blank() {
-  local dev="$1" sigs nonzero rc=0
-  sigs="$(wipefs --noheadings --no-act "$dev")" || return 1
-  [ -z "$sigs" ] || return 1
+  local dev="$1" sigs pttype rc=0
+  BLANK_FAIL=""
+  sigs="$(wipefs --noheadings --no-act "$dev")" || { BLANK_FAIL="wipefs could not probe $dev"; return 1; }
+  if [ -n "$sigs" ]; then BLANK_FAIL="wipefs reports a signature on $dev"; return 1; fi
   blkid -p "$dev" >/dev/null 2>&1 || rc=$?
-  [ "$rc" -eq 2 ] || return 1
-  nonzero="$(head -c 1048576 "$dev" | tr -d '\0' | wc -c)" || return 1
-  [ "$nonzero" -eq 0 ]
+  if [ "$rc" -ne 2 ]; then BLANK_FAIL="blkid -p found something on $dev (rc=$rc, expected 2)"; return 1; fi
+  pttype="$(blkid -p -o value -s PTTYPE "$dev" 2>/dev/null || true)"
+  if [ -n "$pttype" ]; then BLANK_FAIL="$dev has a partition table ($pttype)"; return 1; fi
+  return 0
 }
 
 # The ONLY place a filesystem is ever created. No -F: mke2fs itself also refuses to
 # overwrite a detected filesystem when it is not forced.
+# format_if_blank <device> <resolved-volume-id>
 format_if_blank() {
-  local dev="$1"
-  device_is_blank "$dev" || die "refusing to format $dev: not provably blank"
-  log "first boot: $dev is blank, creating ext4 (label enshrouded-data)"
+  local dev="$1" vol="$2" given
+  device_is_blank "$dev" || die "refusing to format $dev: not blank.
+  device:             $dev
+  resolved volume id: $vol
+  failed condition:   ${BLANK_FAIL:-unknown}"
+  if [ "$ENSHROUDED_ALLOW_FIRST_FORMAT" != "$vol" ]; then
+    given="unset or empty"
+    if [ -n "$ENSHROUDED_ALLOW_FIRST_FORMAT" ]; then given="'${ENSHROUDED_ALLOW_FIRST_FORMAT}' (does not match)"; fi
+    die "refusing to format $dev: first format not acknowledged for this volume.
+  device:             $dev
+  resolved volume id: $vol
+  failed condition:   ENSHROUDED_ALLOW_FIRST_FORMAT is ${given}; it must equal the resolved volume id
+  To format this (empty, never-used) volume, set exactly:
+    ENSHROUDED_ALLOW_FIRST_FORMAT=$vol
+  (deploy-game-server workflow: run it with the allow_first_format input set to $vol)
+  Formatting a volume that holds a world destroys it; only acknowledge a volume you know is new."
+  fi
+  log "first boot: $dev ($vol) is blank and acknowledged, creating ext4 (label enshrouded-data)"
   mkfs.ext4 -q -L enshrouded-data "$dev"
   udevadm settle || true
 }
 
-ensure_data_volume() {
-  local dev fstype rc pttype uuid
-  if mountpoint -q "$DATA_MOUNT"; then
-    fstype="$(findmnt -n -o FSTYPE "$DATA_MOUNT")"
-    case "$fstype" in
-      ext4|xfs) log "$DATA_MOUNT already mounted ($fstype); leaving it untouched"; return 0 ;;
-      *) die "$DATA_MOUNT is mounted with unexpected fs type '$fstype'" ;;
-    esac
-  fi
-
-  dev="$(wait_for_data_device)" || die "could not identify the data volume (no unambiguous non-root disk)"
-  log "data volume device: $dev"
-  if lsblk -nro MOUNTPOINT "$dev" | grep -q .; then
-    die "$dev (or a partition) is mounted somewhere else; refusing to touch it"
-  fi
-
-  rc=0
+# Decide what to do with the filesystem on <device> (volume <resolved-volume-id>). An existing
+# ext4/xfs filesystem means we NEVER format (instance replacement and the 8.1 cross-AZ restore
+# both land here, so they stay cheap and need no acknowledgement).
+ensure_filesystem() {
+  local dev="$1" vol="$2" rc=0 fstype pttype
   fstype="$(blkid -p -o value -s TYPE "$dev" 2>/dev/null)" || rc=$?
   if [ "$rc" -eq 0 ] && [ -n "$fstype" ]; then
     case "$fstype" in
@@ -250,10 +321,35 @@ ensure_data_volume() {
   elif [ "$rc" -eq 2 ]; then
     pttype="$(blkid -p -o value -s PTTYPE "$dev" 2>/dev/null || true)"
     [ -z "$pttype" ] || die "$dev has a partition table ($pttype); refusing to touch it"
-    format_if_blank "$dev"
+    format_if_blank "$dev" "$vol"
   else
     die "blkid failed (rc=$rc) on $dev; refusing to guess"
   fi
+}
+
+ensure_data_volume() {
+  local dev fstype uuid expected_id resolved_id
+  if mountpoint -q "$DATA_MOUNT"; then
+    fstype="$(findmnt -n -o FSTYPE "$DATA_MOUNT")"
+    case "$fstype" in
+      ext4|xfs) log "$DATA_MOUNT already mounted ($fstype); leaving it untouched"; return 0 ;;
+      *) die "$DATA_MOUNT is mounted with unexpected fs type '$fstype'" ;;
+    esac
+  fi
+
+  # The expected volume id is the source of truth; it also makes device lookup exact (strategy 1).
+  expected_id="$(read_expected_volume_id)" || die "cannot establish which volume is the data volume; refusing to touch any disk"
+  if [ -z "$ENSHROUDED_DATA_VOLUME_ID" ]; then ENSHROUDED_DATA_VOLUME_ID="$expected_id"; fi
+
+  dev="$(wait_for_data_device)" || die "could not identify the data volume (no unambiguous non-root disk)"
+  log "data volume device: $dev"
+  resolved_id="$(verify_volume_identity "$dev" "$expected_id")" || exit 1
+  log "data volume identity verified: $resolved_id matches ${DATA_VOLUME_ID_PARAM}"
+  if lsblk -nro MOUNTPOINT "$dev" | grep -q .; then
+    die "$dev (or a partition) is mounted somewhere else; refusing to touch it"
+  fi
+
+  ensure_filesystem "$dev" "$resolved_id"
 
   uuid="$(blkid -p -o value -s UUID "$dev")"
   [ -n "$uuid" ] || die "no UUID on $dev after probe"

@@ -3,6 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as dlm from 'aws-cdk-lib/aws-dlm';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { ENSHROUDED_AZ } from './constants';
 
@@ -12,6 +13,14 @@ export const SNAPSHOT_TAG_VALUE = 'world';
 
 /** Device name for the data volume (mounted at /srv/enshrouded by provisioning, WP-05). */
 export const DATA_DEVICE_NAME = '/dev/sdf';
+
+/**
+ * SSM parameter publishing the data volume's id. provision-host.sh reads it on the box and
+ * refuses to touch a disk whose NVMe serial is not this volume (ARCHITECTURE 8.2, positive
+ * volume-identity verification). It lives under server/ because the instance reads it
+ * (6.6); the instance role's SSM scope is NOT widened for it.
+ */
+export const DATA_VOLUME_ID_PARAM_PATH = '/enshroudedproj/server/data-volume-id';
 
 export interface WorldStorageProps {
   /** The game server instance the data volume attaches to. */
@@ -45,6 +54,12 @@ export class WorldStorage extends Construct {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
     cdk.Tags.of(this.volume).add(SNAPSHOT_TAG_KEY, SNAPSHOT_TAG_VALUE);
+
+    new ssm.StringParameter(this, 'DataVolumeIdParam', {
+      parameterName: DATA_VOLUME_ID_PARAM_PATH,
+      stringValue: this.volume.volumeId,
+      description: 'World data volume id (read by provision-host.sh to positively identify the disk before any format decision)',
+    });
 
     this.attachment = new ec2.CfnVolumeAttachment(this, 'DataVolumeAttachment', {
       instanceId: props.instance.instanceId,
