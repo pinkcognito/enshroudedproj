@@ -1,0 +1,34 @@
+# Trivy suppressions - one entry per finding, each with a written reason.
+# NEVER add a blanket ignore (no severity-wide, no path-wide-without-id). Review these when the
+# design changes.
+#
+# Used by the "IaC / config scan" job in .github/workflows/security.yml (scans the CDK-synthesised
+# CloudFormation in infrastructure/cdk.out).
+misconfigurations:
+  # Server security group: CDK's default "allow all outbound" rule. The game host must reach
+  # SteamCMD/Steam CDNs (dynamic IP ranges), GitHub/ProtonGE downloads, apt mirrors, and the
+  # regional S3/SSM/EC2 endpoints (no NAT gateway or VPC endpoints - cost). Egress cannot be
+  # enumerated by CIDR. Ingress is separately restricted to the game UDP ports.
+  - id: AWS-0104
+    paths:
+      - "EnshroudedServerStack.template.json"
+    statement: >-
+      Deliberate: the host needs outbound internet (Steam, GitHub, apt, AWS endpoints) and there
+      is no NAT/VPC-endpoint layer; egress cannot be narrowed to a CIDR list.
+
+  # World-backup S3 bucket uses SSE-S3 (AES256), not a customer-managed KMS key.
+  #
+  # This is NOT a local judgement about one bucket. Customer-managed keys were evaluated
+  # project-wide (covering both these backups and the SSM SecureStrings) and declined by the
+  # user - see ARCHITECTURE.md section 6.6.5, which records the reasoning and the explicit
+  # triggers for revisiting: if the account gains non-admin principals, or the blast radius
+  # of a leaked secret grows, one CMK covering SSM + S3 becomes worth the ~$1/mo.
+  #
+  # Public access is blocked, versioning is on, and enforceSSL is set.
+  - id: AWS-0132
+    paths:
+      - "EnshroudedServerStack.template.json"
+    statement: >-
+      Deliberate, project-wide decision recorded in ARCHITECTURE.md section 6.6.5: SSE-S3 is
+      sufficient for save data under the current threat model (private account, admin-only
+      access). Revisit with that section's stated triggers, not in isolation.

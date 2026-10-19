@@ -1,0 +1,282 @@
+# PR quality gate. Replaces the old single-job lint.yml.
+#
+# Jobs run in parallel; `ci-gate` at the bottom is the ONE check to mark as required in branch
+# protection (it fails if any job failed or was cancelled).
+#
+# No job here has AWS credentials, and none may ever deploy. Anything needing AWS lives in the
+# WP-02 workflows (deploy.yml / pr-aws-diff.yml). Vulnerability scanning is in security.yml.
+#
+# Every third-party action is pinned to a full commit SHA with the version in a trailing comment;
+# Dependabot (github-actions ecosystem) keeps the SHAs current. Tool binaries downloaded below
+# (actionlint) are pinned by version AND sha256 - Dependabot does not track those, bump by hand.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same PR/branch supersedes the running one. Never cancel runs on main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      # --noEmit: tsc normally compiles in place, which leaves stale .js beside every .ts.
+      - run: npx tsc --noEmit
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+
+  unit:
+    name: unit (coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      # Fails if coverage drops below coverageThreshold in jest.config.js (a ratchet - raise it, never lower it).
+      - run: npm run test:coverage
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: coverage
+          path: infrastructure/coverage
+          if-no-files-found: ignore
+          retention-days: 14
+
+  synth:
+    name: synth (no AWS credentials)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    env:
+      # cdk.context.json is committed, so the default-VPC lookup resolves from cache and synth needs
+      # no credentials - but ONLY if the CLI believes it is in the cached account/region. Without
+      # credentials the CLI cannot discover them (it falls back to us-east-1 and then tries a live
+      # lookup), so state them. The account id is an identifier, not a secret. These select the
+      # cache key; they authenticate nothing.
+      CDK_DEFAULT_ACCOUNT: "334953720182"
+      CDK_DEFAULT_REGION: us-east-2
+      AWS_REGION: us-east-2
+      AWS_DEFAULT_REGION: us-east-2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      - name: Assert no AWS credentials are present
+        run: |
+          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE; do
+            if [ -n "${!v:-}" ]; then echo "::error::$v is set; this job must run credential-less"; exit 1; fi
+          done
+      - run: npx cdk synth --quiet
+      - name: Fail if synth had to perform a live context lookup
+        run: |
+          if grep -q '"missing"' cdk.out/manifest.json; then
+            echo "::error::cdk.context.json is stale or incomplete - synth wanted a live AWS lookup"
+            grep -A12 '"missing"' cdk.out/manifest.json
+            exit 1
+          fi
+
+  shell:
+    name: shell (shellcheck + bash -n)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Collect scripts
+        run: |
+          shellcheck --version
+          # Every committed .sh ...
+          find . -name '*.sh' -not -path '*/node_modules/*' -not -path '*/cdk.out/*' | sort > "$RUNNER_TEMP/scripts.txt"
+          # ... plus the scripts provision-host.sh embeds as heredocs on the game host. stop-game.sh is
+          # the data-loss-critical ExecStop helper and would be invisible to a *.sh glob.
+          bash .github/scripts/extract-embedded-scripts.sh "$RUNNER_TEMP/embedded" >> "$RUNNER_TEMP/scripts.txt"
+          echo "Checking:"; cat "$RUNNER_TEMP/scripts.txt"
+      # Any finding of any severity fails the job (shellcheck's default exit behaviour).
+      - name: bash -n
+        run: xargs -a "$RUNNER_TEMP/scripts.txt" -n1 bash -n
+      - name: shellcheck
+        run: xargs -a "$RUNNER_TEMP/scripts.txt" shellcheck
+
+  systemd:
+    name: systemd unit verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: systemd-analyze verify
+        # sudo: as root there is no unrelated host-unit permission noise. The script filters exactly
+        # the 3 expected "binary not installed on the runner" notices and fails on anything else.
+        run: |
+          systemd-analyze --version | head -1
+          sudo bash .github/scripts/verify-systemd.sh infrastructure/systemd
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint (version + sha256 pinned)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+      # actionlint also runs shellcheck over every `run:` block (shellcheck is preinstalled).
+      - run: '"$RUNNER_TEMP/actionlint" -color'
+
+  line-endings:
+    name: line endings (LF only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # .gitattributes forces eol=lf, but an enforcement mechanism nobody checks is an assumption.
+      # A CRLF shebang fails on the host with "bash\r: No such file or directory"; CRLF in a systemd
+      # unit silently corrupts values.
+      - name: Fail on any CR byte in .sh / .service / .py
+        run: |
+          cr="$(printf '\015')"
+          bad="$(grep -rl --include='*.sh' --include='*.service' --include='*.py' --exclude-dir=node_modules --exclude-dir=cdk.out --exclude-dir=.git -e "$cr" . || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::CR (CRLF) bytes found in files that must be LF-only:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "no CR bytes in .sh/.service/.py files"
+
+  project-invariants:
+    name: project invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    env:
+      # See the synth job for why these are set (credential-less synth from the committed lookup cache).
+      CDK_DEFAULT_ACCOUNT: "334953720182"
+      CDK_DEFAULT_REGION: us-east-2
+      AWS_REGION: us-east-2
+      AWS_DEFAULT_REGION: us-east-2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      - run: npx cdk synth --quiet
+      # Account-isolation + world-save guardrails (a live unrelated project shares the AWS account):
+      # no bootstrap qualifier hnb659fds, no InfrastructureStack/AdminUiStack/GithubOidcStack, every IAM
+      # roleName prefixed enshrouded-, GE-Proton SHA256 pin and the SteamCMD windows platform flag
+      # present, KillSignal=SIGINT / KillMode=control-group / TimeoutStopSec>=120 intact.
+      - name: Check project invariants
+        working-directory: .
+        run: python3 -I .github/scripts/check-invariants.py
+
+  # Single required status check for branch protection.
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [typecheck, lint, unit, synth, shell, systemd, actionlint, line-endings, project-invariants]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - name: Require every job to have succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then echo "::error::a required CI job did not succeed ($r)"; exit 1; fi
+          done

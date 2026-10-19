@@ -1,0 +1,78 @@
+# Deploys the CDK stacks on merge to main. This is the ONLY path by which infra reaches AWS
+# (never `cdk deploy` locally). Auth is GitHub OIDC -> enshrouded-github-actions-cdk-deploy, which
+# can only assume our own cdk-enshrd1-* bootstrap roles; those carry the EnshroudedUoGuardrail Deny
+# that keeps a CDK mistake away from the live UOPrivateServer stacks (ARCHITECTURE 6.2).
+#
+# Stacks are named EXPLICITLY. Never use the all-stacks flag: it would deploy whatever the app
+# happens to synthesise. test/oidc.test.ts fails if that flag ever appears in this file.
+#
+# Repo variables (not secrets): AWS_REGION, CDK_DEPLOY_ROLE_ARN, ENSHROUDED_OIDC_PROVIDER_ARN,
+# DISCORD_PUBLIC_KEY, DISCORD_APPLICATION_ID. See docs/RUNBOOK.md section 1.5.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+# One deploy at a time; never cancel one midway (a half-applied CloudFormation update is worse
+# than a queued one).
+concurrency:
+  group: enshrouded-cdk-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: cdk deploy (EnshroudedServerStack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write # GitHub OIDC -> AWS
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure
+    env:
+      # Read by lib/enshrouded-server-stack.ts. GitHub forbids repo variables that start with
+      # GITHUB_, so the variable is ENSHROUDED_OIDC_PROVIDER_ARN and is mapped here.
+      GITHUB_OIDC_PROVIDER_ARN: ${{ vars.ENSHROUDED_OIDC_PROVIDER_ARN }}
+      DISCORD_PUBLIC_KEY: ${{ vars.DISCORD_PUBLIC_KEY }}
+      DISCORD_APPLICATION_ID: ${{ vars.DISCORD_APPLICATION_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: infrastructure/package-lock.json
+      - run: npm ci
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.CDK_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: enshrouded-cdk-deploy
+      - name: Confirm we are the Enshrouded deploy role, not a UO role
+        run: |
+          arn="$(aws sts get-caller-identity --query Arn --output text)"
+          echo "caller: $arn"
+          case "$arn" in
+            *:assumed-role/enshrouded-github-actions-cdk-deploy/*) ;;
+            *) echo "::error::unexpected caller identity (expected enshrouded-github-actions-cdk-deploy)"; exit 1 ;;
+          esac
+      # Synth (named stacks only), then re-run the WP-19 synth-time invariants before AWS is mutated.
+      - name: Synth
+        run: npx cdk synth --quiet EnshroudedServerStack
+      - name: Project invariants (WP-19 script, reused)
+        working-directory: .
+        run: python3 -I .github/scripts/check-invariants.py
+      # --exclusively: only the named stacks, never their dependencies. Role stack first.
+      - name: Deploy
+        # EnshroudedOidcStack is deliberately EXCLUDED. It defines the very role this
+        # workflow authenticates as, so letting CI redeploy it means a bad change can
+        # lock CI out of fixing itself - recovery would need manual admin credentials.
+        # It is deployed by hand as a rare, deliberate step (docs/RUNBOOK.md 1.6).
+        run: npx cdk deploy EnshroudedServerStack --exclusively --require-approval never --concurrency 1

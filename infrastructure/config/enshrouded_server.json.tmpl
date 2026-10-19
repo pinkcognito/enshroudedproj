@@ -1,0 +1,53 @@
+{
+  "name": "${SERVER_NAME}",
+  "saveDirectory": "./savegame",
+  "logDirectory": "./logs",
+  "ip": "0.0.0.0",
+  "queryPort": 15637,
+  "slotCount": "${SLOT_COUNT}",
+  "gameSettingsPreset": "Default",
+  "enableTextChat": true,
+  "userGroups": [
+    {
+      "name": "Admin",
+      "password": "${ADMIN_PASSWORD}",
+      "canKickBan": true,
+      "canAccessInventories": true,
+      "canEditWorld": true,
+      "canEditBase": true,
+      "canExtendBase": true,
+      "reservedSlots": 0
+    },
+    {
+      "name": "Friend",
+      "password": "${FRIEND_PASSWORD}",
+      "canKickBan": false,
+      "canAccessInventories": true,
+      "canEditWorld": true,
+      "canEditBase": true,
+      "canExtendBase": false,
+      "reservedSlots": 0
+    },
+    {
+      "name": "Guest",
+      "password": "${GUEST_PASSWORD}",
+      "canKickBan": false,
+      "canAccessInventories": false,
+      "canEditWorld": false,
+      "canEditBase": true,
+      "canExtendBase": false,
+      "reservedSlots": 0
+    },
+    {
+      "name": "Visitor",
+      "password": "${VISITOR_PASSWORD}",
+      "canKickBan": false,
+      "canAccessInventories": false,
+      "canEditWorld": false,
+      "canEditBase": false,
+      "canExtendBase": false,
+      "reservedSlots": 0
+    }
+  ],
+  "bannedAccounts": []
+}
