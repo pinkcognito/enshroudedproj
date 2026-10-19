@@ -473,6 +473,18 @@ describe('handler: classification outcomes', () => {
     expect(mockWorld.params.get(P.runState)).toBe('stopping');
   });
 
+  // Live: "Idle for 10.0 minutes (threshold 10)" printed on a tick that correctly did NOT stop (true value
+  // ~9.996). The display is floored so it can never render the threshold while the gate still holds.
+  test('9.996 idle minutes -> waits, and the log never renders the threshold', async () => {
+    mockWorld.params.set(P.lastActive, String(NOW - 9.996 * MIN));
+    const log = jest.spyOn(console, 'log');
+    const r = await handler();
+    expect(r.action).toBe('idle-waiting');
+    expect(invokes()).toHaveLength(0);
+    const line = log.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('Idle for'));
+    expect(line).toBe('Idle for 9.9 minutes (threshold 10).');
+  });
+
   test('IDLE for < 10 minutes -> waits, no stop, clock untouched', async () => {
     mockWorld.params.set(P.lastActive, String(NOW - 9 * MIN));
     const r = await handler();

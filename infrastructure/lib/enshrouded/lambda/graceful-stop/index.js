@@ -397,6 +397,7 @@ function createHandler(deps) {
       if (!verification.pass) {
         return await fail('save-verification', verification.reasons.join('; '), { verification: true });
       }
+      console.log(`graceful-stop: verified saveCheck=${verification.saveCheck} unverifiable=${verification.unverifiable}`);
       if (verification.skippedEmptyWorld) {
         await attempt('metric SaveSkippedEmptyWorld', () => deps.putMetric('SaveSkippedEmptyWorld', 1));
       }

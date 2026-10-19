@@ -334,7 +334,8 @@ exports.handler = async () => {
     return { action: 'first-observation', classification };
   }
   const idleMinutes = (now - Number(lastActiveRaw)) / 60000;
-  console.log(`Idle for ${idleMinutes.toFixed(1)} minutes (threshold ${c.idleMinutes}).`);
+  // Floored (not rounded) so the line can never render the threshold while the gate below still holds.
+  console.log(`Idle for ${(Math.floor(idleMinutes * 10) / 10).toFixed(1)} minutes (threshold ${c.idleMinutes}).`);
   if (idleMinutes < c.idleMinutes) return { action: 'idle-waiting', classification };
 
   return { action: await requestStop(c, 'idle'), classification };

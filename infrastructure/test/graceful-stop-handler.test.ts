@@ -351,6 +351,14 @@ describe('save verification table (ARCHITECTURE 3.2 step 12b), every row, throug
     });
   });
 
+  test('the verdict is logged on the success path, including the unverifiable flag', async () => {
+    const spy = jest.spyOn(console, 'log');
+    await run({ facts: { postCount: 3, postNewest: 1_000, logPlayer: 'unreadable' }, lastPlayerSeen: null });
+    expect(spy).toHaveBeenCalledWith('graceful-stop: verified saveCheck=covered-by-disconnect-save unverifiable=true');
+    await run({ facts: COVERED });
+    expect(spy).toHaveBeenCalledWith('graceful-stop: verified saveCheck=covered-by-disconnect-save unverifiable=false');
+  });
+
   test('row 3: non-empty, newest well before last-player-seen, nothing newer than t0 -> FAIL (the real data-loss signature)', async () => {
     const { calls, params, result } = await run({ facts: { postCount: 11, postNewest: SEEN_S - 600 } });
     expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
@@ -648,11 +656,23 @@ describe('drain-and-save.sh', () => {
     expect(sh).not.toMatch(/--delete/);
     expect(sh).toMatch(/pgrep -x "\$GAME_COMM"/);
   });
-  describe('log_player(): presence in the NEWEST Session block only, by position', () => {
-    const MARKER = '-------------- Session ----------------';
+  describe('log_player(): the WHOLE log is this boot (the game deletes it on every launch)', () => {
+    // Real captured shapes (probe-players.test.ts). Session blocks are a PERIODIC 30 s status dump, not a
+    // per-boot header: 75 of them were counted in one 37-minute boot. "[server] Remove Player" is an
+    // ordinary interleaved line, NOT inside a block.
+    const NL = String.fromCharCode(10);
+    const M0 = [
+      '[I 00:37:03,430] -------------- Session ----------------',
+      '[I 00:37:03,430] Machines:',
+      '[I 00:37:03,430]   m#0(128): up 0 (0), down 0 (0), remote 0 (0), limit 256, lost 0, ping 0 ms, EstablishingBaseline',
+      '[I 00:37:03,430] ---------------------------------------',
+    ].join(NL) + NL;
+    const M1_ROW = '[I 00:11:03,046]   m#1(129): up 92 (114), down 40 (51), remote 92 (114), limit 453, lost 2, ping 45 ms, OperatingNormally';
+    const M1 = M0.replace('[I 00:37:03,430] ---------------------------------------', `${M1_ROW}${NL}[I 00:37:03,430] ---------------------------------------`);
+    const LEAVE = "[I 00:23:12,100] [server] Remove Player 'Dave'" + NL;
     const runFn = (log: string): string => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'logplayer-'));
-      const logFile = path.join(dir, 'game.log').replace(/\\/g, '/');
+      const logFile = path.join(dir, 'game.log').split(path.sep).join('/');
       fs.writeFileSync(logFile, log);
       const fn = /log_player\(\) \{[\s\S]*?\n\}\n/.exec(raw)![0].replace(/local log=.*/, `local log='${logFile}'`);
       const r = cp.spawnSync('bash', ['-c', `${fn}\nlog_player`], { encoding: 'utf8' });
@@ -660,22 +680,23 @@ describe('drain-and-save.sh', () => {
       return r.stdout.trim();
     };
     const bashOk = cp.spawnSync('bash', ['-c', 'true']).status === 0;
-    (bashOk ? test : test.skip)('OLDER block has a leave line, NEWEST has none -> no (the false-yes that would wedge)', () => {
-      expect(runFn(`${MARKER}\n[server] Remove Player 'a'\nm#1 x\n${MARKER}\nm#0 only\n`)).toBe('no');
+    (bashOk ? test : test.skip)('REGRESSION: an EARLY leave line, 75 later empty Session blocks, none in the final block -> yes', () => {
+      expect(runFn(M1 + LEAVE + M0.repeat(75))).toBe('yes');
     });
-    (bashOk ? test : test.skip)('leave line or m#N>=1 row in the NEWEST block -> yes', () => {
-      expect(runFn(`${MARKER}\nm#0\n${MARKER}\n[server] Remove Player 'b'\n`)).toBe('yes');
-      expect(runFn(`${MARKER}\nm#0\n${MARKER}\nm#0\nm#2 y\n`)).toBe('yes');
+    (bashOk ? test : test.skip)('an m#N>=1 row alone (no leave line yet) -> yes', () => {
+      expect(runFn(M0 + M1)).toBe('yes');
     });
-    (bashOk ? test : test.skip)('no Session marker -> unreadable, never no; empty log -> unreadable', () => {
-      expect(runFn(`no marker\n[server] Remove Player 'b'\n`)).toBe('unreadable');
+    (bashOk ? test : test.skip)('only m#0 Session blocks, no leave line -> no', () => {
+      expect(runFn(M0.repeat(5))).toBe('no');
+    });
+    (bashOk ? test : test.skip)('a readable but EMPTY log -> unreadable, never no', () => {
+      // Absence of evidence is not evidence of absence. "no" is a positive claim that nobody
+      // played; an empty file supports neither answer, so the PASS must be metered instead.
       expect(runFn('')).toBe('unreadable');
     });
-    test('the Session marker literal is identical in drain-and-save.sh and probe-players.py', () => {
-      const py = fs.readFileSync(path.join(ROOT, 'scripts', 'probe-players.py'), 'utf8');
-      const pyMarker = /SESSION_MARKER = "([^"]+)"/.exec(py)![1];
-      expect(pyMarker).toBe(MARKER);
-      expect(raw).toContain(`marker='${pyMarker}'`);
+    (bashOk ? test : test.skip)('a missing log -> unreadable, never no', () => {
+      const fn = /log_player\(\) \{[\s\S]*?\n\}\n/.exec(raw)![0].replace(/local log=.*/, "local log='/nonexistent/x.log'");
+      expect(cp.spawnSync('bash', ['-c', `${fn}\nlog_player`], { encoding: 'utf8' }).stdout.trim()).toBe('unreadable');
     });
   });
   test('provision-host.sh delivers a byte-identical copy as a root-owned 0755 helper', () => {
@@ -737,6 +758,10 @@ describe('construct / IAM', () => {
     expect(res(put[0])).toContain('enshroudedproj/state/*');
     expect(res(put[0])).not.toContain('discord');
   });
+  test('memory is 256 MB (116-121 MB measured live against the 128 MB default)', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', { FunctionName: 'enshrouded-graceful-stop', MemorySize: 256 });
+  });
+
   test('async retries are disabled so a drain is never re-run automatically', () => {
     template.hasResourceProperties('AWS::Lambda::EventInvokeConfig', { MaximumRetryAttempts: 0 });
   });
