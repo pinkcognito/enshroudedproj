@@ -4,6 +4,7 @@ const {
   verifySignature,
   jsonResponse,
   editOriginalResponse,
+  deferInteraction,
   getSubcommand,
 } = require('../shared/discord');
 
@@ -21,7 +22,7 @@ function ec2() {
 function lambda() {
   if (!lambdaClient) {
     const { LambdaClient } = require('@aws-sdk/client-lambda');
-    lambdaClient = new LambdaClient({});
+    lambdaClient = new LambdaClient({ maxAttempts: 1 });
   }
   return lambdaClient;
 }
@@ -34,7 +35,7 @@ async function describeInstance() {
 
 // Runs as a separate async invocation so the slow part never blocks Discord's 3s ack
 // deadline (EC2 start alone regularly took 3.5-4s). The initial invocation already
-// returned a deferred (type 5) response; we edit it via the interaction token.
+// delivered a deferred (type 5) callback; we edit it via the interaction token.
 async function finishStart(event) {
   const reply = (content) =>
     editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken, content);
@@ -81,23 +82,35 @@ async function finishStatus(event) {
   }
 }
 
-// Self-invoke asynchronously, then ack with a deferred response.
-async function deferAndInvoke(internal, interaction, failureMessage) {
-  const { InvokeCommand } = require('@aws-sdk/client-lambda');
+// Deliver the acknowledgement before SDK loading or the awaited async invocation.
+async function deferAndInvoke(internal, interaction) {
+  if (!(await deferInteraction(interaction.id, interaction.token))) {
+    return { statusCode: 202, body: '' };
+  }
   try {
+    const { InvokeCommand } = require('@aws-sdk/client-lambda');
     await lambda().send(
       new InvokeCommand({
         FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
         InvocationType: 'Event',
         Payload: JSON.stringify({ _internal: internal, interactionToken: interaction.token }),
       }),
+      { abortSignal: AbortSignal.timeout(3000) },
     );
-  } catch (err) {
-    // Must not throw: no response at all looks like a timeout to Discord.
-    console.error(`Failed to kick off ${internal}:`, err);
-    return jsonResponse({ type: CALLBACK_TYPE.CHANNEL_MESSAGE, data: { content: failureMessage } });
+  } catch {
+    console.error(`Failed to kick off ${internal}: invocation-failed`);
+    try {
+      await editOriginalResponse(
+        process.env.DISCORD_APPLICATION_ID,
+        interaction.token,
+        'Unable to confirm request submission; check status before retrying.',
+        2000,
+      );
+    } catch {
+      console.error('Discord failure message PATCH failed: network-or-timeout');
+    }
   }
-  return jsonResponse({ type: CALLBACK_TYPE.DEFERRED_CHANNEL_MESSAGE });
+  return { statusCode: 202, body: '' };
 }
 
 exports.handler = async (event) => {
@@ -152,10 +165,10 @@ exports.handler = async (event) => {
     if (commandName === 'enshrouded') {
       // WP-13 adds stop/password/update/backup as further branches here (and in commands.js).
       if (subcommand === 'start') {
-        return deferAndInvoke('finish-start', interaction, 'Failed to start the server, check CloudWatch logs.');
+        return deferAndInvoke('finish-start', interaction);
       }
       if (subcommand === 'status') {
-        return deferAndInvoke('finish-status', interaction, 'Failed to check server status, check CloudWatch logs.');
+        return deferAndInvoke('finish-status', interaction);
       }
     }
 

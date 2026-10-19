@@ -203,11 +203,19 @@ EventBridge (1 min) ──> idle-shutdown λ ──SSM RunCommand──> box
    `X-Signature-Timestamp || rawBody` using the application's public key. Invalid → `401`
    (Discord requires a 401, not a 400, or it will refuse to register the endpoint). `PING`
    (type 1) → `{"type":1}`.
-3. The handler immediately returns a **deferred** response (`{"type":5}`) — Discord's ack
-   deadline is 3 s and the real work regularly exceeds it. *(Reference-verified: the UO
-   project measured 3.5–4 s for `StartInstances` + a Discord REST call alone.)*
-4. Before returning, it asynchronously self-invokes itself (or the `boot-watcher` Lambda —
-   same pattern as the reference's `finishStartUo`) with the interaction token.
+3. The handler first acknowledges through Discord's interaction callback API with
+   `{"type":5}`, before loading the AWS SDK or dispatching any work. **VERIFIED in
+   production:** awaiting self-invocation before acknowledgement took 3.22 s, exceeding
+   Discord's 3 s deadline; the subsequent reply edit returned 404. Discord explicitly
+   supports callback acknowledgement for HTTP interactions followed by an empty HTTP 202
+   response ([official protocol](https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-callback)).
+4. Only after a confirmed acknowledgement does it load the AWS SDK and await asynchronous
+   self-invocation with the interaction token. It then returns HTTP 202 with no body.
+   A failed or uncertain acknowledgement prevents dispatch and must not trigger a second
+   acknowledgement. A failed dispatch attempts to edit the acknowledged response with an
+   error; an uncertain submission must not be blindly retried. Every callback-handled exit
+   returns an empty HTTP 202. Never rely on work continuing after Lambda returns. Callback
+   requests have a bounded timeout, and logs must never contain tokens or webhook URLs.
 5. The async invocation checks instance state. If already `running`, it jumps to step 9. If
    `stopping`, it replies "shutting down, try again in a minute" and exits (do not race a
    drain). Otherwise it sets `run-state=starting` and calls `ec2:StartInstances`.

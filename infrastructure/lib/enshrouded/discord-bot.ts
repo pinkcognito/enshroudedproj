@@ -52,6 +52,7 @@ export class DiscordBot extends Construct {
       // Parent lambda/ dir so the zip also carries lambda/shared/.
       code: lambda.Code.fromAsset(path.join(__dirname, 'lambda'), { exclude: ['**/*.d.ts'] }),
       timeout: cdk.Duration.seconds(15),
+      memorySize: 256,
       environment: {
         INSTANCE_ID: props.instance.instanceId,
         DISCORD_PUBLIC_KEY: props.discordPublicKey || '0'.repeat(64),
