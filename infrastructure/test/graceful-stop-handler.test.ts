@@ -20,7 +20,9 @@ const mod = require(HANDLER_PATH);
 // ---------------------------------------------------------------------------------------------
 const T0 = 1_000_000; // box wall clock, epoch seconds
 const LAUNCH_MS = 500_000_000; // instance LaunchTime
-const LAST_ACTIVE_MS = 900_000_000; // last-active, after LaunchTime (a player connected this boot)
+const SEEN_MS = 900_000_000; // last-player-seen (FACT), after LaunchTime: a player connected this boot
+const SEEN_PARAM = '/enshroudedproj/state/last-player-seen';
+const LAST_ACTIVE_PARAM = '/enshroudedproj/state/last-active';
 
 interface Facts {
   t0?: number;
@@ -50,8 +52,8 @@ function drainStdout(f: Facts): string {
   ].join('\n');
 }
 
-// A passing world: a disconnect save newer than last-active, nothing new at shutdown.
-const COVERED: Facts = { postCount: 11, postNewest: LAST_ACTIVE_MS / 1000 + 5 };
+// A passing world: a disconnect save newer than last-player-seen, nothing new at shutdown.
+const COVERED: Facts = { postCount: 11, postNewest: SEEN_MS / 1000 + 5 };
 
 interface Opts {
   probe?: object | 'fail';
@@ -60,9 +62,10 @@ interface Opts {
   drainOk?: boolean;
   drainThrows?: boolean;
   syncOk?: boolean;
+  /** Stored last-player-seen (FACT) value; undefined = SEEN_MS, null = parameter absent. */
+  lastPlayerSeen?: string | null;
+  /** last-active is a CONTROL variable graceful-stop must never read; handed a hostile value to prove it is ignored. */
   lastActive?: string | null;
-  /** Stored player-seen-boot value; undefined/null = parameter absent. */
-  playerSeenBoot?: string | null;
   launchTimeMs?: number;
   state?: string;
   stopThrows?: boolean;
@@ -77,8 +80,9 @@ function makeDeps(o: Opts = {}) {
     now: () => 1234,
     getParam: async (n: string) => {
       calls.push(`getParam ${n}`);
-      if (n === '/enshroudedproj/state/player-seen-boot') return o.playerSeenBoot ?? null;
-      return o.lastActive === undefined ? String(LAST_ACTIVE_MS) : o.lastActive;
+      if (n === SEEN_PARAM) return o.lastPlayerSeen === undefined ? String(SEEN_MS) : o.lastPlayerSeen;
+      if (n === LAST_ACTIVE_PARAM) return o.lastActive === undefined ? String(SEEN_MS) : o.lastActive;
+      return null;
     },
     putParam: async (n: string, v: string) => {
       calls.push(`putParam ${n}=${v}`);
@@ -143,7 +147,7 @@ afterAll(() => jest.restoreAllMocks());
 describe('THE INVARIANT: StopInstances is unreachable unless save verification passes', () => {
   test('verification FAILS -> StopInstances is NEVER called, maintenance mode is set, alarm metric emitted, sync never runs', async () => {
     const { calls, params, metrics, result } = await run({
-      facts: { postCount: 11, postNewest: LAST_ACTIVE_MS / 1000 - 600 }, // non-empty, older than last-active
+      facts: { postCount: 11, postNewest: SEEN_MS / 1000 - 600 }, // non-empty, older than last-active
     });
     expect(stopped(calls)).toBe(false);
     expect(calls).not.toContain('drain-sync');
@@ -166,7 +170,7 @@ describe('THE INVARIANT: StopInstances is unreachable unless save verification p
     ['killed/9 (numeric code)', { facts: { ...COVERED, execMainCode: '2', execMainStatus: '9' } }],
     ['killed/9 (text code)', { facts: { ...COVERED, execMainCode: 'killed', execMainStatus: '9' } }],
     ['game process still alive', { facts: { ...COVERED, gamePids: 1 } }],
-    ['last-active unreadable and nothing newer than t0', { lastActive: null }],
+    ['last-player-seen unparseable and nothing newer than t0', { lastPlayerSeen: 'garbage' }],
     ['S3 sync fails (world verified but not backed up)', { syncOk: false }],
     ['StopInstances itself throws', { stopThrows: true }],
   ];
@@ -200,102 +204,160 @@ describe('THE INVARIANT: StopInstances is unreachable unless save verification p
 
 // ---------------------------------------------------------------------------------------------
 describe('save verification table (ARCHITECTURE 3.2 step 12b), every row, through the handler', () => {
+  const SEEN_S = SEEN_MS / 1000; // last-player-seen in the box's epoch SECONDS
+  const maint = '/enshroudedproj/state/maintenance-mode';
+
   test('row 1: a file has mtime > t0 -> PASS (shutdown save written)', async () => {
     const { calls, result } = await run({ facts: { postCount: 11, postNewest: T0 + 3 } });
     expect(result).toMatchObject({ outcome: 'stopped', stopped: true, saveCheck: 'shutdown-save-written' });
     expect(stopped(calls)).toBe(true);
   });
 
-  test('row 2: newest mtime >= last-active (disconnect save covered it) -> PASS', async () => {
-    const { calls, result } = await run({ facts: { postCount: 11, postNewest: LAST_ACTIVE_MS / 1000 + 5 } });
+  test('row 2: newest mtime >= last-player-seen (disconnect save covered it) -> PASS', async () => {
+    const { calls, result } = await run({ facts: { postCount: 11, postNewest: SEEN_S + 5 } });
     expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'covered-by-disconnect-save' });
     expect(stopped(calls)).toBe(true);
   });
 
-  test('row 2 boundary: newest mtime exactly == last-active -> PASS', async () => {
-    const { result } = await run({ facts: { postCount: 2, postNewest: LAST_ACTIVE_MS / 1000 } });
+  test('row 2 boundary: newest mtime exactly == last-player-seen -> PASS', async () => {
+    const { result } = await run({ facts: { postCount: 2, postNewest: SEEN_S } });
     expect(result.outcome).toBe('stopped');
   });
 
-  test('row 3: non-empty, newest < last-active, nothing newer than t0 -> FAIL (the real data-loss signature)', async () => {
-    const { calls, params, result } = await run({ facts: { postCount: 11, postNewest: LAST_ACTIVE_MS / 1000 - 1 } });
-    expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
-    expect(result.detail).toMatch(/save-not-flushed/);
-    expect(stopped(calls)).toBe(false);
-    expect(params['/enshroudedproj/state/maintenance-mode']).toBe('true');
-  });
-
-  // THE WEDGE REGRESSION. last-active is stamped to "now" by idle-shutdown's launch-grace and
-  // INDETERMINATE branches, so on a session nobody joined it is AFTER LaunchTime. The old rule read that as
-  // "a player connected" -> FAIL -> maintenance mode set. Started, nobody showed up, savegame/ empty
-  // must PASS, with last-active deliberately well after LaunchTime and player-seen-boot absent.
-  test('row 4 (WEDGE REGRESSION): empty savegame/, nobody connected, last-active AFTER LaunchTime -> PASS + SaveSkippedEmptyWorld, maintenance mode NOT set', async () => {
+  // THE LIVE-STATE REGRESSION (third instance of the FACT/CONTROL bug, ARCHITECTURE 6.6.0). world0.ksd
+  // mtime 14:42 (written at the player's disconnect), last-player-seen ~14:42, and idle-shutdown's clock
+  // bootstrap stamped last-active ~15:05. The old rule compared against last-active and reported "a player
+  // was present after the last save" - false. Must PASS as covered-by-disconnect-save, no maintenance mode.
+  test('LIVE-STATE REGRESSION: save 14:42, last-player-seen 14:42, last-active 15:05 -> row 2 PASS, maintenance NOT set, StopInstances called', async () => {
+    const at = (h: number, m: number) => Date.UTC(2026, 9, 19, h, m, 0);
     const { calls, params, metrics, result } = await run({
-      facts: { postCount: 0, postNewest: 0 },
-      lastActive: String(LAUNCH_MS + 60_000), // stamped by the grace branch: after LaunchTime
-      playerSeenBoot: null,
+      facts: { postCount: 1, postNewest: at(14, 42) / 1000, t0: at(15, 16) / 1000 },
+      lastPlayerSeen: String(at(14, 42)),
+      lastActive: String(at(15, 5)), // the clock bootstrap; MUST be irrelevant
+      launchTimeMs: at(13, 0),
     });
-    expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'empty-no-player' });
-    expect(metrics).toContain('SaveSkippedEmptyWorld');
+    expect(result).toMatchObject({ outcome: 'stopped', stopped: true, saveCheck: 'covered-by-disconnect-save' });
     expect(stopped(calls)).toBe(true);
-    expect(params['/enshroudedproj/state/maintenance-mode']).toBeUndefined();
+    expect(params[maint]).toBeUndefined();
     expect(metrics).not.toContain('GracefulStopFailed');
   });
 
-  test('row 4: a STALE player-seen-boot (a previous boot) -> not seen -> PASS', async () => {
+  test('row 2 tolerance (120 s, cross-clock skew): a save 60 s older than last-player-seen -> PASS', async () => {
+    const { result } = await run({ facts: { postCount: 4, postNewest: SEEN_S - 60 } });
+    expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'covered-by-disconnect-save' });
+  });
+
+  test('row 2 tolerance edge: exactly 120 s older -> PASS; 121 s older -> FAIL', async () => {
+    expect((await run({ facts: { postCount: 4, postNewest: SEEN_S - 120 } })).result.outcome).toBe('stopped');
+    expect((await run({ facts: { postCount: 4, postNewest: SEEN_S - 121 } })).result.outcome).toBe('failed');
+  });
+
+  test('row 2 tolerance has teeth: a save 10 minutes older than last-player-seen -> FAIL (row 3)', async () => {
+    const { result } = await run({ facts: { postCount: 4, postNewest: SEEN_S - 600 } });
+    expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
+  });
+
+  test('row 2 with last-player-seen ABSENT (no player ever seen) and a non-empty world -> PASS, not a wedge', async () => {
+    const { calls, result } = await run({ facts: { postCount: 3, postNewest: 1_000 }, lastPlayerSeen: null });
+    expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'covered-by-disconnect-save' });
+    expect(stopped(calls)).toBe(true);
+  });
+
+  test('row 3: non-empty, newest well before last-player-seen, nothing newer than t0 -> FAIL (the real data-loss signature)', async () => {
+    const { calls, params, result } = await run({ facts: { postCount: 11, postNewest: SEEN_S - 600 } });
+    expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
+    expect(result.detail).toMatch(/save-not-flushed/);
+    expect(stopped(calls)).toBe(false);
+    expect(params[maint]).toBe('true');
+  });
+
+  test('last-active is IGNORED: a hostile/absent/garbage last-active changes no verdict and is never read', async () => {
+    for (const lastActive of [null, 'garbage', String(SEEN_MS * 10), '0']) {
+      const pass = await run({ facts: { postCount: 11, postNewest: SEEN_S + 5 }, lastActive });
+      expect(pass.result.outcome).toBe('stopped');
+      const fail = await run({ facts: { postCount: 11, postNewest: SEEN_S - 600 }, lastActive });
+      expect(fail.result.outcome).toBe('failed');
+      expect(pass.calls.filter((c) => c.includes('last-active'))).toHaveLength(0);
+    }
+  });
+
+  // THE WEDGE REGRESSION: started, nobody showed up, savegame/ empty must PASS even though idle-shutdown
+  // has stamped last-active = now all through grace (it is irrelevant), and last-player-seen is absent.
+  test('row 4 (WEDGE REGRESSION): empty savegame/, last-player-seen ABSENT, last-active AFTER LaunchTime -> PASS + SaveSkippedEmptyWorld, maintenance NOT set', async () => {
     const { calls, params, metrics, result } = await run({
       facts: { postCount: 0, postNewest: 0 },
-      playerSeenBoot: String(LAUNCH_MS - 3_600_000),
+      lastActive: String(LAUNCH_MS + 60_000),
+      lastPlayerSeen: null,
     });
     expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'empty-no-player' });
     expect(metrics).toContain('SaveSkippedEmptyWorld');
     expect(stopped(calls)).toBe(true);
-    expect(params['/enshroudedproj/state/maintenance-mode']).toBeUndefined();
+    expect(params[maint]).toBeUndefined();
+    expect(metrics).not.toContain('GracefulStopFailed');
   });
 
-  test('row 4: an unparseable player-seen-boot is "not seen", not an error -> PASS', async () => {
-    const { result } = await run({ facts: { postCount: 0, postNewest: 0 }, playerSeenBoot: 'garbage' });
+  test('row 4: a last-player-seen from a PREVIOUS boot (older than LaunchTime) -> PASS + SaveSkippedEmptyWorld', async () => {
+    const { calls, params, metrics, result } = await run({
+      facts: { postCount: 0, postNewest: 0 },
+      lastPlayerSeen: String(LAUNCH_MS - 3_600_000),
+    });
+    expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'empty-no-player' });
+    expect(metrics).toContain('SaveSkippedEmptyWorld');
+    expect(stopped(calls)).toBe(true);
+    expect(params[maint]).toBeUndefined();
+  });
+
+  test('row 4: an unparseable last-player-seen on an EMPTY world is "not seen", not an error -> PASS', async () => {
+    const { result } = await run({ facts: { postCount: 0, postNewest: 0 }, lastPlayerSeen: 'garbage' });
     expect(result).toMatchObject({ outcome: 'stopped', saveCheck: 'empty-no-player' });
   });
 
-  test('row 5: empty savegame/ WITH player-seen-boot == this boot LaunchTime -> FAIL', async () => {
+  test('row 5: empty savegame/ WITH last-player-seen >= LaunchTime -> FAIL', async () => {
     const { calls, params, metrics, result } = await run({
       facts: { postCount: 0, postNewest: 0 },
-      playerSeenBoot: String(LAUNCH_MS),
+      lastPlayerSeen: String(LAUNCH_MS),
     });
     expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
     expect(result.detail).toMatch(/empty-world-after-player/);
     expect(metrics).not.toContain('SaveSkippedEmptyWorld');
     expect(stopped(calls)).toBe(false);
-    expect(params['/enshroudedproj/state/maintenance-mode']).toBe('true');
+    expect(params[maint]).toBe('true');
   });
 
-  test('row 5 does not depend on last-active at all (stale last-active, matching flag -> still FAIL)', async () => {
+  test('row 5 does not depend on last-active at all (stale last-active, seen >= LaunchTime -> still FAIL)', async () => {
     const { result } = await run({
       facts: { postCount: 0, postNewest: 0 },
       lastActive: String(LAUNCH_MS - 1000),
-      playerSeenBoot: String(LAUNCH_MS),
+      lastPlayerSeen: String(LAUNCH_MS + 1),
     });
     expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
   });
 
-  test('player-seen-boot is read before the stop and never written or cleared by graceful-stop', async () => {
+  test('missing LaunchTime on an empty world -> FAIL (cannot tell)', async () => {
+    const { result } = await run({ facts: { postCount: 0, postNewest: 0 }, launchTimeMs: NaN });
+    expect(result).toMatchObject({ outcome: 'failed', check: 'save-verification' });
+    expect(result.detail).toMatch(/empty-world-unknown/);
+  });
+
+  test('last-player-seen is read before the stop and never written or cleared by graceful-stop', async () => {
     const { calls } = await run({ facts: { postCount: 0, postNewest: 0 } });
-    expect(calls.indexOf('getParam /enshroudedproj/state/player-seen-boot')).toBeLessThan(calls.indexOf('drain-stop'));
-    expect(calls.filter((c) => c.startsWith('putParam /enshroudedproj/state/player-seen-boot'))).toHaveLength(0);
+    expect(calls.indexOf(`getParam ${SEEN_PARAM}`)).toBeLessThan(calls.indexOf('drain-stop'));
+    expect(calls.filter((c) => c.startsWith(`putParam ${SEEN_PARAM}`))).toHaveLength(0);
   });
 
   test('the pure verdict function agrees with the table (no handler involved)', () => {
     const f = (postCount: number, postNewest: number) => mod.parseDrainFacts(drainStdout({ postCount, postNewest }));
-    const ev = (facts: object, lastActiveMs: number, playerSeenBootMs = NaN) =>
-      mod.evaluateSave(facts, { lastActiveMs, launchTimeMs: LAUNCH_MS, playerSeenBootMs });
-    expect(ev(f(5, T0 + 1), LAST_ACTIVE_MS).pass).toBe(true);
-    expect(ev(f(5, 800_000), 790_000_000).pass).toBe(true);
-    expect(ev(f(5, 700_000), 790_000_000).pass).toBe(false);
-    expect(ev(f(0, 0), LAUNCH_MS + 1).pass).toBe(true); // last-active after LaunchTime says NOTHING
-    expect(ev(f(0, 0), LAUNCH_MS + 1).skippedEmptyWorld).toBe(true);
-    expect(ev(f(0, 0), LAUNCH_MS + 1, LAUNCH_MS - 5).pass).toBe(true); // stale flag
-    expect(ev(f(0, 0), LAUNCH_MS - 1, LAUNCH_MS).pass).toBe(false); // matching flag
+    const ev = (facts: object, lastPlayerSeenMs: number | null) =>
+      mod.evaluateSave(facts, { lastPlayerSeenMs, launchTimeMs: LAUNCH_MS });
+    expect(ev(f(5, T0 + 1), SEEN_MS).pass).toBe(true); // row 1
+    expect(ev(f(5, 800_000), 800_000_000 + 119_000).pass).toBe(true); // row 2, inside tolerance
+    expect(ev(f(5, 700_000), 800_000_000).pass).toBe(false); // row 3
+    expect(ev(f(5, 700_000), null).pass).toBe(true); // absent
+    expect(ev(f(5, 700_000), NaN).pass).toBe(false); // unparseable is not absent
+    expect(ev(f(0, 0), null).pass).toBe(true); // row 4
+    expect(ev(f(0, 0), null).skippedEmptyWorld).toBe(true);
+    expect(ev(f(0, 0), LAUNCH_MS - 5).pass).toBe(true); // row 4, previous boot
+    expect(ev(f(0, 0), LAUNCH_MS).pass).toBe(false); // row 5, boundary
   });
 });
 
@@ -357,7 +419,8 @@ describe('player re-check', () => {
     expect(params['/enshroudedproj/state/maintenance-mode']).toBeUndefined(); // NOT a failure
     expect(metrics).toEqual([]); // no alarm
     expect(calls).not.toContain('discord ops');
-    expect(params['/enshroudedproj/state/last-active']).toBe('1234'); // 3.2 step 10
+    // graceful-stop never writes the CONTROL variable (6.6.0); idle-shutdown's next tick resets it itself.
+    expect(Object.keys(params).filter((k) => k.includes('last-active'))).toEqual([]);
     expect(params['/enshroudedproj/state/run-state']).toBe('none');
   });
 
@@ -383,13 +446,13 @@ describe('player re-check', () => {
 
 // ---------------------------------------------------------------------------------------------
 describe('ordering', () => {
-  test('happy path order: recheck, last-active read, stop+verify, S3 sync, THEN StopInstances', async () => {
+  test('happy path order: recheck, last-player-seen read, stop+verify, S3 sync, THEN StopInstances', async () => {
     const { calls, result } = await run();
     expect(result.outcome).toBe('stopped');
     const idx = (s: string) => calls.indexOf(s);
     expect(idx('probe')).toBeGreaterThanOrEqual(0);
     expect(idx('probe')).toBeLessThan(idx('drain-stop'));
-    expect(idx('getParam /enshroudedproj/state/last-active')).toBeLessThan(idx('drain-stop'));
+    expect(idx(`getParam ${SEEN_PARAM}`)).toBeLessThan(idx('drain-stop'));
     expect(idx('drain-stop')).toBeLessThan(idx('drain-sync'));
     expect(idx('drain-sync')).toBeLessThan(idx('StopInstances'));
     expect(calls.filter((c) => c === 'StopInstances')).toHaveLength(1);
@@ -421,6 +484,25 @@ describe('payload tolerance', () => {
       expect(result.outcome).toBe('stopped');
     },
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('FACT/CONTROL discipline (ARCHITECTURE 6.6.0)', () => {
+  // The structural guard against the fourth instance of "a parameter written for one purpose read as
+  // evidence of another". last-active is a CONTROL variable with exactly one legitimate consumer:
+  // idle-shutdown's own idle test. graceful-stop must not so much as name it.
+  test('graceful-stop source has NO reference to the last-active parameter (name, constant or env var)', () => {
+    const code = fs
+      .readFileSync(HANDLER_PATH, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .filter((l) => !/^\s*\/\//.test(l)) // comments may explain the rule
+      .join('\n');
+    expect(code).not.toMatch(/last[-_ ]?active/i);
+  });
+  test('player-seen-boot is gone from the handler', () => {
+    expect(fs.readFileSync(HANDLER_PATH, 'utf8')).not.toMatch(/player-seen-boot|PLAYER_SEEN_BOOT|playerSeenBoot/);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -580,7 +662,8 @@ describe('stack wiring: idle-shutdown -> graceful-stop', () => {
     const inv = idle.filter((s) => acts(s).includes('lambda:InvokeFunction'));
     expect(inv).toHaveLength(1);
     expect(JSON.stringify(inv[0].Resource)).toContain(gsId);
-    expect(vars.PLAYER_SEEN_BOOT_PARAM).toBe('/enshroudedproj/state/player-seen-boot');
+    expect(vars.LAST_PLAYER_SEEN_PARAM).toBe(SEEN_PARAM);
+    expect(vars.PLAYER_SEEN_BOOT_PARAM).toBeUndefined();
   });
   test('the idle-shutdown payload {reason:"idle"} is accepted by the graceful-stop handler (no throw, a verdict)', async () => {
     const { result } = await run({}, { reason: 'idle' });

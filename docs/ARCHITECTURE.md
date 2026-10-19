@@ -382,10 +382,10 @@ the retained data volume so this is a one-time cost, but WP-07 should record bot
        | condition | verdict |
        | --- | --- |
        | a `savegame/` file has mtime > `t0` | **PASS** — a shutdown save was written |
-       | newest `savegame/` mtime ≥ `last-active` | **PASS** — nothing could be unflushed; the disconnect save already covered it |
-       | `savegame/` non-empty but newest mtime < `last-active` | **FAIL** — a player was present *after* the last save and nothing flushed. This is the real data-loss signature and the case the gate exists for. |
-       | `savegame/` empty, and **`player-seen-boot` does not match this boot** | **PASS**, `SaveSkippedEmptyWorld` metric |
-       | `savegame/` empty, and **`player-seen-boot` matches this boot** | **FAIL** |
+       | newest `savegame/` mtime ≥ **`last-player-seen`** (−120 s tolerance) | **PASS** — nothing could be unflushed; the disconnect save already covered it |
+       | `savegame/` non-empty but newest mtime < **`last-player-seen`** | **FAIL** — a player was present *after* the last save and nothing flushed. The real data-loss signature, and the case the gate exists for. |
+       | `savegame/` empty, and **`last-player-seen` < `LaunchTime`** (nobody connected this boot) | **PASS**, `SaveSkippedEmptyWorld` metric |
+       | `savegame/` empty, and **`last-player-seen` ≥ `LaunchTime`** (someone did connect) | **FAIL** |
 
        **CORRECTED 2026-10-19 (third revision) — the discriminator, not the rows.** The
        rows are right; the way "did a player connect this boot" was to be determined was
@@ -410,20 +410,21 @@ the retained data volume so this is a one-time cost, but WP-07 should record bot
        for: a stop→start cycle faster than the 1-minute schedule leaves the flag stale
        `true` from the previous boot, and the next empty session wedges exactly as before.
 
-       So **`/enshroudedproj/state/player-seen-boot` stores the `LaunchTime` it pertains
-       to**, not a boolean:
+So the fact we need is recorded explicitly. **Simplified in the fourth revision: one
+       parameter, `/enshroudedproj/state/last-player-seen`, serves both this row and rows
+       2/3**, replacing the separate `player-seen-boot`:
 
-       - **Written** (to the current `LaunchTime`, as epoch ms) the first time a probe
+       - **Written** as a wall-clock epoch-ms timestamp the first and every time a probe
          *affirmatively* detects a player.
-       - **Read** as "a player connected this boot" **iff its value equals the instance's
-         current `LaunchTime`.** Any other value, or absent, means no.
-       - **Never explicitly cleared.** A stale value from a previous boot simply fails to
-         match, so there is nothing to race.
+       - **Read** as "a player connected this boot" **iff `lastPlayerSeen >= LaunchTime`.**
+       - **Never explicitly cleared.** A stale value from a previous boot is necessarily
+         *older* than the new `LaunchTime`, so it fails the comparison. Nothing to race.
 
-       This reuses the one timestamp that **cannot** be raced — `LaunchTime` is written
-       atomically by EC2 itself — which is the same property the original race fix leans
-       on. Applying the hard-won trick to the new flag rather than inventing a second
-       mechanism is the point.
+       This leans on the one timestamp that **cannot** be raced — `LaunchTime` is written
+       atomically by EC2 itself — which is the property the original race fix relies on.
+       Wall-clock time is monotonic across boots and `LaunchTime` advances, so the
+       comparison is raceless without needing a clear step. One parameter, one meaning,
+       two consumers (§6.6.0).
 
        **Only the EXACT signals may set it** — `(a2sOk and players > 0)` or
        `(logOk and mCount > 0)` — never `udpRate`/`cpuRate`. Those are heuristics that can
@@ -434,8 +435,38 @@ the retained data volume so this is a one-time cost, but WP-07 should record bot
        combination therefore genuinely means "a disconnect happened and no save was
        written", which is exactly the data-loss signature this row exists to catch.
 
-       Use **file mtimes and the SSM parameter**, both wall-clock. **Never a log
-       timestamp** — those are uptime-relative (§5.6).
+       Use **file mtimes and `last-player-seen`**, both wall-clock. **Never a log
+       timestamp** — those are uptime-relative (§5.6). **And never `last-active`** — see
+       below.
+
+       **CORRECTED 2026-10-19 (fourth revision) — rows 2 and 3 had the identical defect as
+       row 4, and it would have fired on the first genuine run.** `idle-shutdown` writes
+       `last-active = now` as a **clock bootstrap** on its first IDLE observation (ported
+       faithfully from the UO reference — the deadline needs a start value). Live example:
+       `world0.ksd` mtime 14:42, written when the player disconnected; nobody active since;
+       the first idle tick bootstraps `last-active ≈ 15:05`; ten minutes later the drain
+       finds `14:42 < 15:05` and reports row 3, *"a player was present after the last save
+       and nothing flushed"*. **False.** The player left and the save was written, both at
+       14:42. The verdict was manufactured entirely by the bootstrap write.
+
+       **A 120-second tolerance is applied to the row-2 comparison** for a reason unrelated
+       to this bug: save mtimes come from the **instance** clock while `last-player-seen`
+       is written by the **Lambda** (AWS clock). Both are chrony-synced to Amazon Time
+       Sync, so skew should be sub-millisecond — but a two-minute margin costs nothing in
+       detection power (the signature being caught is "played for ages, nothing ever
+       saved", a gap of many minutes) and removes a whole class of clock-skew false
+       positives.
+
+       **Rows 2/3 are NOT dropped (option (c) rejected), and this is the important
+       judgement.** The tempting move is to delete the check that has now produced two
+       false positives. But the check is correct; its *input* was wrong. Rows 2/3 are the
+       only thing catching a specific, plausible, otherwise-silent loss: a player plays,
+       the disconnect-save **fails** (disk full on a 40 GB volume holding the install, the
+       Proton prefix and ten rolling saves; or permissions after a bad deploy), the server
+       idles, the shutdown-save also writes nothing, and the unit exits cleanly. Every
+       other check passes and hours of play are gone. **Deleting rows 2/3 would trade a
+       fixable false positive for an unfixable false negative on the exact failure mode the
+       whole gate exists for.**
 
        **WP-07 (g5) — partly answered, and the branch stays.** A never-saved world *did*
        get a file, but at **disconnect**, not at stop. So the empty→empty branch remains
@@ -2245,7 +2276,50 @@ boundary** — each one maps to exactly one answer to "who is allowed to see thi
 | `/enshroudedproj/state/maintenance-mode` | String | `true`/`false` |
 | `/enshroudedproj/state/last-active` | String | Epoch ms |
 | `/enshroudedproj/state/run-state` | String | `starting`/`stopping`/**`none`** — **not empty**: SSM rejects an empty `Value`, so the idle value is the literal string `none`. WP-10 treats only `stopping` as meaningful, so the two are compatible. |
-| `/enshroudedproj/state/player-seen-boot` | String | The `LaunchTime` (epoch ms) during which a player was last *affirmatively* observed. Equal to the current `LaunchTime` ⟺ a player connected this boot (§3.2 step 12b). Never cleared — a stale value simply fails to match. |
+| `/enshroudedproj/state/last-player-seen` | String | **FACT.** Wall-clock epoch ms at which an *exact* signal last reported ≥1 player. Written **only** on `(a2sOk and players>0)` or `(logOk and mCount>0)` — never on a heuristic, never by any other code path. Consumed by §3.2 step 12b. **Supersedes `player-seen-boot`**, which it subsumes: "a player connected this boot" is `lastPlayerSeen >= LaunchTime`. |
+
+#### 6.6.0 Every state parameter is a FACT or a CONTROL variable — label it
+
+**This classification exists because the same bug has now occurred three times**
+(§3.2 step 12b rows 2, 3 and 4). Each time, code reasoned about the world from a parameter
+that a control loop writes for its own purposes.
+
+| kind | meaning | may be read as evidence? |
+| --- | --- | --- |
+| **FACT** | An observation of the world. Exactly one meaning. One writer, one trigger. | **Yes** |
+| **CONTROL** | A control-loop variable, written by its owner whenever its own logic requires — including for bootstrapping, resets and grace periods that have nothing to do with the world. | **Never.** Only its owning loop may read it. |
+
+| parameter | kind | owner |
+| --- | --- | --- |
+| `state/last-active` | **CONTROL** | `idle-shutdown` **only** |
+| `state/last-player-seen` | **FACT** | written by `idle-shutdown`, read by `graceful-stop` |
+| `state/run-state` | CONTROL | the lifecycle Lambdas |
+| `state/maintenance-mode` | FACT (operator intent) | operator / deploy workflow / `graceful-stop` |
+
+##### `last-active` is a CONTROL variable. Do not narrow its writes — forbid its reads.
+
+It is written on **five** triggers, only one of which is activity: on ACTIVE, as a
+**clock bootstrap** on the first IDLE observation, on the **not-running reset**, during
+**launch grace**, and on **INDETERMINATE**.
+
+The instinct is to narrow those writes so the name becomes true. **Resist it.** Every one
+of them is correct *for what the parameter actually is* — the base timestamp from which
+idle minutes are counted — and three of them are the hard-won UO race fixes (§3.2 steps
+3, 4 and 7). Removing any would reintroduce a race to fix a naming problem.
+
+**The defect was never the writes. It was reading a control variable as a fact.** So the
+enforceable rule is:
+
+> **`graceful-stop` must never read `last-active`.** `last-active` has exactly one
+> legitimate consumer — `idle-shutdown`'s `now - last-active >= IDLE_MINUTES` test.
+
+**WP-18 adds a test asserting this**: `graceful-stop`'s source contains no reference to the
+`last-active` parameter. That single assertion is what prevents instance #4, and it is
+cheaper than any amount of care.
+
+Its name is now misleading, but it is **deployed and in use — do not rename it.** A
+rename is a migration with a window in which the old and new names disagree, on the one
+parameter whose misreading has already caused three wedges. The label above is the fix.
 
 Nesting the four group passwords under `user-groups/` lets the box fetch them in one
 `GetParametersByPath --recursive` call while keeping them individually ARN-addressable.
@@ -2266,7 +2340,7 @@ Every remaining WP reads its row from here rather than inventing a scope. **R** 
 | `status-channel` Lambda | — | **R** | — | WP-14 |
 | GitHub Actions game-deploy role | — | — | **W** on `maintenance-mode` only | WP-06 |
 
-`player-seen-boot` needs no new grant: it lives under `state/*`, which `idle-shutdown`
+`last-player-seen` needs no new grant: it lives under `state/*`, which `idle-shutdown`
 (writer) and `graceful-stop` (reader) already hold **R/W** on.
 
 **The one deliberate cross-boundary grant.** `/enshrouded password` must return a group
@@ -2953,7 +3027,7 @@ account.
 | **WP-04** | World storage: separate gp3 data volume **in `ENSHROUDED_AZ` (§6.3.1), read from the shared constant — never re-derived**, with `RemovalPolicy.RETAIN` + `CfnVolumeAttachment`; versioned/encrypted/private S3 backup bucket with lifecycle; DLM daily snapshot policy; instance-role grants scoped to the `savegame/*` prefix. | `lib/enshrouded/world-storage.ts`, `test/world-storage.test.ts` | WP-03 (owns `ENSHROUDED_AZ`) | Synth shows `DeletionPolicy: Retain` on the volume. Bucket has versioning, `BlockPublicAccess.BLOCK_ALL`, SSE, `enforceSSL`. Test asserts changing `instanceType` does **not** produce a volume replacement in `cdk diff`. **Test asserts the volume's `AvailabilityZone` equals the instance's resolved AZ in the same synthesised template** — the §6.3.1 divergence guard. | R, with an **A** review of the retention wiring and the AZ pin. |
 | **WP-05** | **Host provisioning, `provision-host.sh`.** **Idempotently ensure the SSM Agent is installed and running** (`snap list amazon-ssm-agent || snap install amazon-ssm-agent`, then enable the service) — in **both** the instance user data and this script, since the script itself arrives over SSM (§6.1.4); mount the retained data volume at `/srv/enshrouded`, formatting it **only** under the §8.2 blank-disk guard (three signature checks + positive volume-identity verification + `ENSHROUDED_ALLOW_FIRST_FORMAT=<volume-id>`; **the all-zeros condition is removed — do not reinstate it, §8.2**); create the unprivileged `enshrouded` user; install SteamCMD; install the **pinned, SHA256-verified GE-Proton 10-26** (§6.1.3) with an S3 mirror fallback; write `enshrouded.service` with **`KillSignal=SIGINT`, `KillMode=control-group`, `TimeoutStopSec=120`, `Restart=no`, `WINEDEBUG=-all`** and the `STEAM_COMPAT_*` paths pointed at the data volume; write `enshrouded-update.service` (oneshot, `Before=`); open UDP 15636/15637 in the host firewall; install the CloudWatch agent for the game log. | `infrastructure/scripts/provision-host.sh`, `infrastructure/systemd/enshrouded.service`, `infrastructure/systemd/enshrouded-update.service`, `test/host-scripts.test.ts` | WP-03 | Script is idempotent (safe to re-run). Test greps the unit for `KillSignal=SIGINT`, `KillMode=control-group` and `TimeoutStopSec>=120` and **fails if any is absent or left at a systemd default**. **The instance reports `PingStatus=Online` in `ssm:DescribeInstanceInformation` and is reachable in Session Manager** — with no SSH and no key pair, an instance that fails this is unrecoverable, so it gates the WP. Manual: `systemctl stop enshrouded` takes longer than a SIGTERM default would, leaves `Result=success`, and produces a fresh `savegame/` mtime. Confirm whether `STEAM_COMPAT_*` are genuinely required (§6.1.3). | **A** — invariants §1.3 and §1.4 both live here; this is the data-loss-critical package. |
 | **WP-06** | Game install + config templating + deploy pipeline: `steamcmd +@sSteamCmdForcePlatformType windows +app_update 2278520 validate` (the platform flag is mandatory and fails silently if omitted — §7); render `enshrouded_server.json` from the template with SSM SecureStrings, `chmod 600`; restart the unit; wait for ready; set/clear maintenance mode around the whole thing. Workflow to trigger it. | `scripts/deploy-game-server.sh`, `config/enshrouded_server.json.tmpl`, `lib/enshrouded/game-deploy.ts`, `.github/workflows/deploy-game-server.yml` | WP-05 | A dispatch of the workflow installs/updates the server and leaves it running with the configured name and slot count. No secret appears in any workflow log. Maintenance mode is set before and cleared after, even on failure. | R, given a written spec of the config keys. |
-| **WP-18** | **SSM namespace remediation (§6.6) — small follow-up, not a rework.** Re-scope the already-built `server.ts` instance role from `parameter/enshroudedproj/*` to `parameter/enshroudedproj/server/*`, add the explicit `Deny` on `discord/*`, and remove any SSM write. Re-scope the already-built `discord-bot.ts` to `discord/*` + `state/*` plus the single admin-password ARN. Move the bot token parameter from `/enshroudedproj/discord-bot-token` to `/enshroudedproj/discord/bot-token` and update the runbook's operator `put-parameter` command. Add the scoping test. | edits to `lib/enshrouded/server.ts` and `lib/enshrouded/discord-bot.ts`; `test/ssm-scoping.test.ts`; `docs/RUNBOOK.md` | WP-03, WP-11 | `test/ssm-scoping.test.ts` passes and **fails if the instance role's prefix is widened back**. The access matrix in §6.6.2 matches the synthesised template row for row. The bot token is re-created at its new path and the old parameter deleted. | R — mechanical, but **blocking**: WP-09, 10, 12, 13, 14 and 15 must not write their IAM grants until this convention is in the codebase, or six more packages bake in the flat namespace. |
+| **WP-18** | **SSM namespace remediation (§6.6) — small follow-up, not a rework.** Re-scope the already-built `server.ts` instance role from `parameter/enshroudedproj/*` to `parameter/enshroudedproj/server/*`, add the explicit `Deny` on `discord/*`, and remove any SSM write. Re-scope the already-built `discord-bot.ts` to `discord/*` + `state/*` plus the single admin-password ARN. Move the bot token parameter from `/enshroudedproj/discord-bot-token` to `/enshroudedproj/discord/bot-token` and update the runbook's operator `put-parameter` command. Add the scoping test. **Also add the §6.6.0 guard test: `graceful-stop`'s source must contain no reference to the `last-active` parameter** — `last-active` is a CONTROL variable with exactly one legitimate consumer, and misreading it has now caused three separate wedges. One assertion, and it is what prevents the fourth. | edits to `lib/enshrouded/server.ts` and `lib/enshrouded/discord-bot.ts`; `test/ssm-scoping.test.ts`; `docs/RUNBOOK.md` | WP-03, WP-11 | `test/ssm-scoping.test.ts` passes and **fails if the instance role's prefix is widened back**. The access matrix in §6.6.2 matches the synthesised template row for row. The bot token is re-created at its new path and the old parameter deleted. | R — mechanical, but **blocking**: WP-09, 10, 12, 13, 14 and 15 must not write their IAM grants until this convention is in the codebase, or six more packages bake in the flat namespace. |
 
 ### Phase 2 — **the spike that unblocks everything downstream**
 
@@ -3144,7 +3218,7 @@ account.
 | --- | --- | --- | --- | --- | --- |
 | **WP-08** | A2S client module: build request, handle `S2C_CHALLENGE` retry, parse `S2A_INFO_SRC`, time out cleanly. Plus the on-box probe script (Python 3, stdlib only) emitting one JSON line with **`a2sOk, players, logOk, mCount, udpRate, cpuRate`** — the exact field set §5.6's classification rule consumes. **Parse the last Session block by file position (`tail`), never by timestamp — game-log timestamps are uptime-relative, not wall-clock (§5.6).** Ignore `A2S_PLAYER` (names come back empty) and ignore RSS (does not separate). | `lib/enshrouded/lambda/shared/a2s.js`, `scripts/probe-players.py`, `test/a2s.test.ts` | WP-07 — **unblocked, §5.6 final ruling** | Unit tests pass against captured fixture bytes, including the challenge path and a truncated/garbage response. Probe script prints valid JSON in <15 s and never throws. | R |
 | **WP-09** | `graceful-stop` Lambda + `drain-and-save.sh`: re-check, `systemctl stop`, the three-part save verification (`is-active`, savegame mtime, `systemctl show -p Result` not `timeout`/137), S3 sync, **then** `StopInstances`; failure path sets maintenance mode and alarms. Invocable by both `idle-shutdown` and the Discord `/stop`. | `lib/enshrouded/graceful-stop.ts`, `lambda/graceful-stop/index.js`, `scripts/drain-and-save.sh`, `test/graceful-stop-handler.test.ts` | WP-05, WP-07, WP-08 | Unit test: with the SSM verification step mocked to fail, `StopInstances` is **never** called and maintenance mode is set. Live test: a drain against the real box produces a fresh `savegame/` mtime and an S3 object. | **A** — invariant 6. |
-| **WP-10** | `idle-shutdown` Lambda: maintenance gate, not-running reset, 15-minute `LaunchTime` grace, probe, **the §5.6 classification rule verbatim** (ACTIVE on any one signal; IDLE only when an *exact* signal affirmatively reports zero AND both heuristics are below threshold; otherwise INDETERMINATE), with `UDP_RATE_THRESHOLD=10` and `CPU_RATE_THRESHOLD=0.6`. **Also writes `state/player-seen-boot = <current LaunchTime>` the first time an *exact* signal reports a player (never on a heuristic-only ACTIVE), for §3.2 step 12b row 4/5**, INDETERMINATE = stay up, max-uptime cap, CloudWatch metrics. 1-minute EventBridge rule, **10-minute idle threshold**. | `lib/enshrouded/idle-shutdown.ts`, `lambda/idle-shutdown/index.js`, `test/idle-shutdown-handler.test.ts` | WP-07 — **answered**; WP-09 | Unit tests cover each branch, explicitly including: stale-timestamp-after-fast-restart does not stop the box; a failed SSM command does not stop the box; a secondary mechanism reporting activity overrides a primary reporting zero. **No refuted mechanism is wired in** — no RSS/memory signal and no fd/socket signal anywhere. A unit test asserts CPU rate alone can never produce IDLE, and that INDETERMINATE never stops the instance. Raw `players`/`udpRate`/`cpuRate` are emitted as CloudWatch metrics on every check so the n=1 thresholds can be retuned from real data (§5.6). | **A** — port the reference's race fixes faithfully; they were hard-won. |
+| **WP-10** | `idle-shutdown` Lambda: maintenance gate, not-running reset, 15-minute `LaunchTime` grace, probe, **the §5.6 classification rule verbatim** (ACTIVE on any one signal; IDLE only when an *exact* signal affirmatively reports zero AND both heuristics are below threshold; otherwise INDETERMINATE), with `UDP_RATE_THRESHOLD=10` and `CPU_RATE_THRESHOLD=0.6`. **Also writes `state/last-player-seen = <now>` whenever an *exact* signal reports a player (never on a heuristic-only ACTIVE) — a FACT parameter per §6.6.0, consumed by §3.2 step 12b rows 2–5**, INDETERMINATE = stay up, max-uptime cap, CloudWatch metrics. 1-minute EventBridge rule, **10-minute idle threshold**. | `lib/enshrouded/idle-shutdown.ts`, `lambda/idle-shutdown/index.js`, `test/idle-shutdown-handler.test.ts` | WP-07 — **answered**; WP-09 | Unit tests cover each branch, explicitly including: stale-timestamp-after-fast-restart does not stop the box; a failed SSM command does not stop the box; a secondary mechanism reporting activity overrides a primary reporting zero. **No refuted mechanism is wired in** — no RSS/memory signal and no fd/socket signal anywhere. A unit test asserts CPU rate alone can never produce IDLE, and that INDETERMINATE never stops the instance. Raw `players`/`udpRate`/`cpuRate` are emitted as CloudWatch metrics on every check so the n=1 thresholds can be retuned from real data (§5.6). | **A** — port the reference's race fixes faithfully; they were hard-won. |
 
 ### Phase 4 — Discord
 

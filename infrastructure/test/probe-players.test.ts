@@ -11,6 +11,14 @@ const PROBE = path.join(ROOT, 'scripts', 'probe-players.py');
 const PROVISION = path.join(ROOT, 'scripts', 'provision-host.sh');
 const probeSrc = fs.readFileSync(PROBE, 'utf8');
 
+// Almost every test here spawns a real Python interpreter, and Jest's default
+// per-test budget is 5 s. Interpreter startup on a loaded machine (CI running
+// other suites in parallel, or a dev box mid-build) intermittently blows that,
+// which produced a flaky failure roughly 1 run in 6 - always in this file, never
+// reproducible on a quiet machine. A flaky check in a merge gate is worse than a
+// slow one: it teaches people to re-run instead of look.
+jest.setTimeout(20000);
+
 const PY = ['python3', 'python'].find((c) => {
   const r = spawnSync(c, ['-c', 'import sys; sys.exit(0 if sys.version_info[0]==3 else 1)']);
   return r.status === 0;
