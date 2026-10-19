@@ -13,6 +13,15 @@ name: deploy
 on:
   push:
     branches: [main]
+    # Without this, ANY push to main redeploys AWS - a README or RUNBOOK edit would
+    # run CloudFormation. Observed: a docs-only commit triggered a full deploy.
+    # Workflow changes are included so a change to how we deploy is exercised.
+    paths:
+      - 'infrastructure/**'
+      - '.github/workflows/deploy.yml'
+  # Still reachable by hand when a deploy is wanted without an infrastructure change
+  # (e.g. re-running after a failed deploy, or applying a drifted stack).
+  workflow_dispatch:
 
 # One deploy at a time; never cancel one midway (a half-applied CloudFormation update is worse
 # than a queued one).
