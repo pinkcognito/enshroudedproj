@@ -6,6 +6,7 @@ import { DiscordBot } from './enshrouded/discord-bot';
 import { GameDeploy } from './enshrouded/game-deploy';
 import { GracefulStop } from './enshrouded/graceful-stop';
 import { IdleShutdown } from './enshrouded/idle-shutdown';
+import { StatusChannel } from './enshrouded/status-channel';
 
 export class EnshroudedServerStack extends cdk.Stack {
   public readonly server: EnshroudedServer;
@@ -14,6 +15,7 @@ export class EnshroudedServerStack extends cdk.Stack {
   public readonly gameDeploy: GameDeploy;
   public readonly gracefulStop: GracefulStop;
   public readonly idleShutdown: IdleShutdown;
+  public readonly statusChannel: StatusChannel;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -40,5 +42,6 @@ export class EnshroudedServerStack extends cdk.Stack {
       instance: this.server.instance,
       stopFunction: this.gracefulStop.stopFunction,
     });
+    this.statusChannel = new StatusChannel(this, 'StatusChannel', { instance: this.server.instance });
   }
 }

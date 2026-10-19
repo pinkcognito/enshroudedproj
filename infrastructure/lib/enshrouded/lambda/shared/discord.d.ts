@@ -6,6 +6,7 @@ export const OPTION_TYPE: { SUB_COMMAND: number; SUB_COMMAND_GROUP: number; STRI
 export function verifySignature(publicKeyHex: string, rawBody: string, signatureHex: string, timestamp: string): boolean;
 export function jsonResponse(body: unknown): { statusCode: number; headers: Record<string, string>; body: string };
 export function getBotToken(): Promise<string>;
-export function editOriginalResponse(applicationId: string, interactionToken: string, content: string): Promise<boolean>;
+export function deferInteraction(interactionId: string, interactionToken: string, options?: { ephemeral?: boolean }): Promise<boolean>;
+export function editOriginalResponse(applicationId: string, interactionToken: string, content: string, timeoutMs?: number): Promise<boolean>;
 export function getSubcommand(interaction: unknown): { name: string; options?: unknown[] } | null;
 export function getOption(interaction: unknown, name: string): unknown;

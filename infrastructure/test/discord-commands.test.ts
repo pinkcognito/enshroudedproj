@@ -9,19 +9,26 @@ import { handler } from '../lib/enshrouded/lambda/discord-bot/index';
 
 // The AWS SDK is provided by the Lambda runtime and is not a local dependency.
 const sentCommands: unknown[] = [];
+const mockSend = jest.fn();
+const mockSdkLoaded = jest.fn();
+let mockSdkFailure = false;
 jest.mock(
   '@aws-sdk/client-lambda',
-  () => ({
+  () => {
+    mockSdkLoaded();
+    if (mockSdkFailure) throw new Error("SDK load secret-token");
+    return {
     LambdaClient: class {
-      send(cmd: unknown) {
+      send(cmd: unknown, options: unknown) {
         sentCommands.push(cmd);
-        return Promise.resolve({});
+        return mockSend(options);
       }
     },
     InvokeCommand: class {
       constructor(public input: unknown) {}
     },
-  }),
+    };
+  },
   { virtual: true },
 );
 
@@ -64,10 +71,11 @@ export function findDrift(source: string, cmds: Command[]): string[] {
 }
 
 describe('command definitions', () => {
-  test('/enshrouded is a single command with start and status subcommands (type 1)', () => {
+  test('/enshrouded is a single command with channel, start and status subcommands (type 1)', () => {
     expect(commandList.map((c) => c.name)).toEqual(['enshrouded']);
     const subs = commandList[0].options ?? [];
-    expect(subs.map((s) => s.name).sort()).toEqual(['start', 'status']);
+    expect(subs.map((s) => s.name).sort()).toEqual(['channel', 'start', 'status']);
+    expect(subs.find((s) => s.name === 'channel')?.options ?? []).toEqual([]);
     for (const s of subs) expect(s.type).toBe(1);
   });
 
@@ -94,7 +102,7 @@ describe('anti-drift: handler vs commands.js', () => {
   test('the handler actually dispatches on something (extractor is not vacuous)', () => {
     const usage = extractHandlerUsage(handlerSource);
     expect(usage.commandNames).toContain('enshrouded');
-    expect([...usage.subcommandNames].sort()).toEqual(['start', 'status']);
+    expect([...usage.subcommandNames].sort()).toEqual(['channel', 'start', 'status']);
   });
 
   test('fails when the handler reads an option commands.js does not register', () => {
@@ -139,6 +147,15 @@ describe('handler: signature verification, PING, deferred ack', () => {
   beforeEach(() => {
     process.env = { ...OLD_ENV, DISCORD_PUBLIC_KEY: publicKeyHex, AWS_LAMBDA_FUNCTION_NAME: 'enshrouded-discord-bot' };
     sentCommands.length = 0;
+    mockSdkFailure = false;
+    mockSend.mockReset().mockResolvedValue({});
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 204 } as Response);
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    process.env = OLD_ENV;
   });
   afterAll(() => {
     process.env = OLD_ENV;
@@ -180,12 +197,16 @@ describe('handler: signature verification, PING, deferred ack', () => {
     const res = await handler(
       signedEvent({
         type: 2,
+        id: 'interaction-id',
         token: 'tok',
         data: { name: 'enshrouded', options: [{ type: 1, name: 'start' }] },
       }),
     );
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body as string)).toEqual({ type: 5 });
+    expect(res).toEqual({ statusCode: 202, body: '' });
+    expect(fetch).toHaveBeenCalledWith(
+      'https://discord.com/api/v10/interactions/interaction-id/tok/callback',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ type: 5 }), signal: expect.any(AbortSignal) }),
+    );
     expect(sentCommands).toHaveLength(1);
     const input = (sentCommands[0] as { input: { InvocationType: string; Payload: string } }).input;
     expect(input.InvocationType).toBe('Event');
@@ -196,11 +217,205 @@ describe('handler: signature verification, PING, deferred ack', () => {
     const res = await handler(
       signedEvent({
         type: 2,
+        id: 'interaction-id',
         token: 'tok',
         data: { name: 'enshrouded', options: [{ type: 1, name: 'status' }] },
       }),
     );
-    expect(JSON.parse(res.body as string)).toEqual({ type: 5 });
+    expect(res).toEqual({ statusCode: 202, body: '' });
     expect(JSON.parse((sentCommands[0] as { input: { Payload: string } }).input.Payload)._internal).toBe('finish-status');
   });
+
+  function commandEvent() {
+    return signedEvent({ id: 'interaction-id', type: 2, token: 'secret-token',
+      data: { name: 'enshrouded', options: [{ type: 1, name: 'start' }] } });
+  }
+
+  const channelRequest = {
+    guild_id: '123456789012345678', channel_id: '234567890123456789',
+    channel: { type: 0 }, member: { permissions: '32' }, app_permissions: '3088',
+  };
+  function channelEvent(overrides: object = {}) {
+    return signedEvent({ type: 2, id: 'interaction-id', token: 'tok', ...channelRequest,
+      data: { name: 'enshrouded', options: [{ type: 1, name: 'channel' }] }, ...overrides });
+  }
+
+  test.each([
+    { member: undefined }, { member: { permissions: '0' } }, { member: { permissions: 'invalid' } },
+    { guild_id: undefined }, { guild_id: 'bad' }, { channel_id: 'bad' },
+    ...[1, 2, 5, 10, 11, 12, 13, 15, 16].map((type) => ({ channel: { type } })),
+    { channel: undefined }, { app_permissions: '3072' }, { app_permissions: '1040' },
+    { app_permissions: '2064' }, { app_permissions: undefined },
+    { data: { name: 'enshrouded', options: [{ type: 1, name: 'channel', options: [{ name: 'channel', value: 'other' }] }] } },
+  ])('channel rejection is ephemeral with no fetch or SDK load: %j', async (overrides) => {
+    const loads = mockSdkLoaded.mock.calls.length;
+    const res = await handler(channelEvent(overrides));
+    expect(JSON.parse(res.body as string)).toMatchObject({ type: 4, data: { flags: 64 } });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mockSdkLoaded).toHaveBeenCalledTimes(loads);
+    expect(sentCommands).toHaveLength(0);
+  });
+
+  test.each(['32', '8'])('signed channel command accepts member permissions %s and defers ephemerally', async (permissions) => {
+    expect(await handler(channelEvent({ member: { permissions }, app_permissions: '8' })))
+      .toEqual({ statusCode: 202, body: '' });
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/callback'),
+      expect.objectContaining({ body: JSON.stringify({ type: 5, data: { flags: 64 } }) }));
+    expect(JSON.parse((sentCommands[0] as { input: { Payload: string } }).input.Payload)).toEqual({
+      _internal: 'finish-channel', interactionToken: 'tok', guildId: channelRequest.guild_id,
+      channelId: channelRequest.channel_id, channelType: 0, memberPermissions: permissions, appPermissions: '8',
+    });
+  });
+
+  test('channel failed acknowledgement never dispatches', async () => {
+    jest.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 429 } as Response);
+    expect(await handler(channelEvent())).toEqual({ statusCode: 202, body: '' });
+    expect(sentCommands).toHaveLength(0);
+  });
+
+  test('invalid signed channel request never dispatches', async () => {
+    const event = channelEvent();
+    event.headers['X-Signature-Timestamp'] = 'tampered';
+    expect((await handler(event)).statusCode).toBe(401);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(sentCommands).toHaveLength(0);
+  });
+
+  test('ack completes before SDK load and dispatch even when invocation stays pending', async () => {
+    jest.resetModules();
+    let coldHandler!: typeof handler;
+    jest.isolateModules(() => {
+      coldHandler = jest.requireActual('../lib/enshrouded/lambda/discord-bot/index').handler;
+    });
+    let acknowledge!: (response: Response) => void;
+    let submit!: (value: object) => void;
+    const ack = new Promise<Response>((resolve) => { acknowledge = resolve; });
+    const submission = new Promise<object>((resolve) => { submit = resolve; });
+    jest.mocked(fetch).mockReturnValueOnce(ack);
+    mockSend.mockReturnValueOnce(submission);
+    const loads = mockSdkLoaded.mock.calls.length;
+    let returned = false;
+    const result = coldHandler(commandEvent()).then((value) => { returned = true; return value; });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(mockSdkLoaded).toHaveBeenCalledTimes(loads);
+    expect(sentCommands).toHaveLength(0);
+    acknowledge({ ok: true, status: 204 } as Response);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sentCommands).toHaveLength(1);
+    expect(returned).toBe(false);
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('"outcome":"acknowledged"'));
+    submit({});
+    expect(await result).toEqual({ statusCode: 202, body: '' });
+  });
+
+  test.each([400, 401, 404, 429, 500])('rejected ack (%s) never dispatches or retries', async (status) => {
+    jest.mocked(fetch).mockResolvedValueOnce({ ok: false, status } as Response);
+    expect(await handler(commandEvent())).toEqual({ statusCode: 202, body: '' });
+    expect(sentCommands).toHaveLength(0);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('"outcome":"rejected"'));
+  });
+
+  test.each(['network', 'timeout'])('unknown ack (%s) logs no token or URL and never dispatches', async (kind) => {
+    jest.mocked(fetch).mockRejectedValueOnce(new Error(`${kind} https://discord.com/secret-token`));
+    expect(await handler(commandEvent())).toEqual({ statusCode: 202, body: '' });
+    expect(sentCommands).toHaveLength(0);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const logs = JSON.stringify(jest.mocked(console.error).mock.calls);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('"outcome":"unknown"'));
+    expect(logs).not.toContain('secret-token');
+    expect(logs).not.toContain('https://');
+  });
+
+  test.each(['success', 'rejected', 'network'])('invoke failure edits deferred message; PATCH %s still returns 202', async (patch) => {
+    mockSend.mockRejectedValueOnce(new Error('transport secret-token'));
+    if (patch === 'network') jest.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+      .mockRejectedValueOnce(new Error('https://discord.com/secret-token'));
+    else jest.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+      .mockResolvedValueOnce({ ok: patch === 'success', status: patch === 'success' ? 200 : 404 } as Response);
+    expect(await handler(commandEvent())).toEqual({ statusCode: 202, body: '' });
+    expect(sentCommands).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenLastCalledWith(expect.stringContaining('/messages/@original'),
+      expect.objectContaining({ method: 'PATCH', signal: expect.any(AbortSignal),
+        body: JSON.stringify({ content: 'Unable to confirm request submission; check status before retrying.' }) }));
+    expect(JSON.stringify(jest.mocked(console.error).mock.calls)).not.toContain('secret-token');
+  });
+
+  test('callback aborts at two seconds and dispatch remains blocked', async () => {
+    jest.useFakeTimers();
+    const timeout = jest.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    });
+    jest.mocked(fetch).mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => reject(new Error('secret-token')));
+    }));
+    try {
+      const result = handler(commandEvent());
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(await result).toEqual({ statusCode: 202, body: '' });
+      expect(timeout).toHaveBeenCalledWith(2000);
+      expect(sentCommands).toHaveLength(0);
+    } finally { jest.useRealTimers(); }
+  });
+
+  test('SDK require failure after acknowledgement edits the reply and returns 202', async () => {
+    mockSdkFailure = true;
+    jest.resetModules();
+    let isolatedHandler!: typeof handler;
+    try {
+      jest.isolateModules(() => {
+        isolatedHandler = jest.requireActual('../lib/enshrouded/lambda/discord-bot/index').handler;
+      });
+      expect(await isolatedHandler(commandEvent())).toEqual({ statusCode: 202, body: '' });
+      expect(sentCommands).toHaveLength(0);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenLastCalledWith(expect.stringContaining('/messages/@original'),
+        expect.objectContaining({ method: 'PATCH' }));
+      expect(JSON.stringify(jest.mocked(console.error).mock.calls)).not.toContain('secret-token');
+    } finally { mockSdkFailure = false; }
+  });
+
+  test('stalled Invoke and failure PATCH abort within five seconds after acknowledgement', async () => {
+    jest.useFakeTimers();
+    const timeout = jest.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    });
+    mockSend.mockImplementationOnce(({ abortSignal }: { abortSignal: AbortSignal }) => new Promise((_resolve, reject) => {
+      abortSignal.addEventListener('abort', () => reject(new Error('transport secret-token')));
+    }));
+    jest.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+      .mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () => reject(new Error('PATCH secret-token')));
+      }));
+    try {
+      const result = handler(commandEvent());
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(await result).toEqual({ statusCode: 202, body: '' });
+      expect(timeout.mock.calls.map(([ms]) => ms)).toEqual([2000, 3000, 2000]);
+      expect(sentCommands).toHaveLength(1);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(JSON.stringify(jest.mocked(console.error).mock.calls)).not.toContain('secret-token');
+    } finally { jest.useRealTimers(); }
+  });
+
+  test('base64 signature verification still accepts PING', async () => {
+    const event = signedEvent({ type: 1 });
+    expect(await handler({ ...event, body: Buffer.from(event.body).toString('base64'), isBase64Encoded: true }))
+      .toEqual(expect.objectContaining({ statusCode: 200, body: JSON.stringify({ type: 1 }) }));
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test('bad command signature never calls Discord or AWS', async () => {
+    const event = commandEvent();
+    event.headers['X-Signature-Timestamp'] = 'tampered';
+    expect((await handler(event)).statusCode).toBe(401);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(sentCommands).toHaveLength(0);
+  });
+
 });

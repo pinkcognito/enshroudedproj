@@ -382,7 +382,44 @@ from the SSM values above; it is never committed with real values.
 
 ---
 
-## 3. Deploy model
+## 3. Discord status channel
+
+After the channel-status change is merged, its workflow deploy succeeds, and the updated
+slash commands are registered, run `/enshrouded channel` in the text channel you want
+to use. You need **Manage Server** or **Administrator**. Grant the bot **View Channel**,
+**Send Messages**, and **Manage Channels** in that channel. The earlier invite only
+requested viewing and sending, so add Manage Channels through the bot role or the
+channel's permission settings.
+
+The command replies privately and saves that server's destination. It replaces any
+previous destination for that Discord server; other servers keep their own selection.
+Run it again in another ordinary text channel to move notifications.
+
+The bot preserves the channel's base name and adds a `🟢-` prefix when Enshrouded answers
+its query, or `🔴-` when unavailable. It posts messages when the state changes, including
+starting, query-responsive, stopping, offline, or readiness unknown. A running EC2
+instance alone does not qualify for green. Updates normally occur on the next one-minute
+check; Discord rate limits can delay renames, and the worker retries after the cooldown.
+It does not post on every poll or ping channel members.
+
+Command registration is still an explicit operator step and bulk-overwrites the current
+command set. After deploying this change, from the repo root in PowerShell:
+
+```powershell
+$env:DISCORD_APPLICATION_ID = '1561358999863955538'
+node infrastructure/scripts/register-discord-commands.js
+```
+
+The registration script retrieves the token from SSM; do not paste it into this command.
+Global command propagation may delay appearance of the new `channel` subcommand.
+
+Configuration is String JSON in `/enshroudedproj/discord/status-channels/<guildId>`.
+The worker's delivery markers and retry deadlines are in
+`/enshroudedproj/state/status-channel/`. These values contain identifiers and delivery
+metadata, not credentials. Notifications should converge on the next successful check.
+A crash between message delivery and saving its marker can produce a duplicate message.
+
+## 4. Deploy model
 
 - **Never `cdk deploy` or `cdk bootstrap` locally** (except §1.1, which is the one hand-run
   exception and does not deploy app stacks).

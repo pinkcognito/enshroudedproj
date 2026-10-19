@@ -52,6 +52,7 @@ export class DiscordBot extends Construct {
       // Parent lambda/ dir so the zip also carries lambda/shared/.
       code: lambda.Code.fromAsset(path.join(__dirname, 'lambda'), { exclude: ['**/*.d.ts'] }),
       timeout: cdk.Duration.seconds(15),
+      memorySize: 256,
       environment: {
         INSTANCE_ID: props.instance.instanceId,
         DISCORD_PUBLIC_KEY: props.discordPublicKey || '0'.repeat(64),
@@ -60,7 +61,7 @@ export class DiscordBot extends Construct {
       },
     });
 
-    // Async self-invoke (finish-start / finish-status).
+    // Async self-invoke (finish-start / finish-status / finish-channel).
     role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['lambda:InvokeFunction'],
@@ -87,6 +88,13 @@ export class DiscordBot extends Construct {
       }),
     );
     // state/*: runtime coordination (maintenance-mode, last-active, run-state), read/write.
+    // WP-14: configuration writes only; no write access to the bot token namespace.
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:PutParameter'],
+        resources: [ssmParamArn('discord/status-channels/*')],
+      }),
+    );
     role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath', 'ssm:PutParameter'],

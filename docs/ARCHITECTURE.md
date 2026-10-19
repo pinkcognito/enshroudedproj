@@ -203,11 +203,19 @@ EventBridge (1 min) ──> idle-shutdown λ ──SSM RunCommand──> box
    `X-Signature-Timestamp || rawBody` using the application's public key. Invalid → `401`
    (Discord requires a 401, not a 400, or it will refuse to register the endpoint). `PING`
    (type 1) → `{"type":1}`.
-3. The handler immediately returns a **deferred** response (`{"type":5}`) — Discord's ack
-   deadline is 3 s and the real work regularly exceeds it. *(Reference-verified: the UO
-   project measured 3.5–4 s for `StartInstances` + a Discord REST call alone.)*
-4. Before returning, it asynchronously self-invokes itself (or the `boot-watcher` Lambda —
-   same pattern as the reference's `finishStartUo`) with the interaction token.
+3. The handler first acknowledges through Discord's interaction callback API with
+   `{"type":5}`, before loading the AWS SDK or dispatching any work. **VERIFIED in
+   production:** awaiting self-invocation before acknowledgement took 3.22 s, exceeding
+   Discord's 3 s deadline; the subsequent reply edit returned 404. Discord explicitly
+   supports callback acknowledgement for HTTP interactions followed by an empty HTTP 202
+   response ([official protocol](https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-callback)).
+4. Only after a confirmed acknowledgement does it load the AWS SDK and await asynchronous
+   self-invocation with the interaction token. It then returns HTTP 202 with no body.
+   A failed or uncertain acknowledgement prevents dispatch and must not trigger a second
+   acknowledgement. A failed dispatch attempts to edit the acknowledged response with an
+   error; an uncertain submission must not be blindly retried. Every callback-handled exit
+   returns an empty HTTP 202. Never rely on work continuing after Lambda returns. Callback
+   requests have a bounded timeout, and logs must never contain tokens or webhook URLs.
 5. The async invocation checks instance state. If already `running`, it jumps to step 9. If
    `stopping`, it replies "shutting down, try again in a minute" and exits (do not race a
    drain). Otherwise it sets `run-state=starting` and calls `ec2:StartInstances`.
@@ -2419,15 +2427,48 @@ Every remaining WP reads its row from here rather than inventing a scope. **R** 
 | Principal | `server/*` | `discord/*` | `state/*` | Owning WP |
 | --- | --- | --- | --- | --- |
 | EC2 instance role | **R** | **—** (+ explicit Deny) | **—** | WP-03 |
-| `discord-bot` Lambda | **—** *(one exception below)* | **R** | **R/W** | WP-11 |
+| `discord-bot` Lambda | **—** *(one exception below)* | **R**, plus **W** only on `status-channels/*` | **R/W** | WP-11, WP-14 |
 | `boot-watcher` Lambda | — | **R** (to PATCH Discord) | **R/W** | WP-12 |
 | `idle-shutdown` Lambda | — | — | **R/W** | WP-10 |
 | `graceful-stop` Lambda | — | **R** (to post the drain notice) | **R/W** | WP-09 |
-| `status-channel` Lambda | — | **R** | — | WP-14 |
+| `status-channel` Lambda | — | **R** only on `bot-token` and `status-channels` subtree | **R/W** only on `status-channel/*` | WP-14 |
 | GitHub Actions game-deploy role | — | — | **W** on `maintenance-mode` only | WP-06 |
 
 `last-player-seen` needs no new grant: it lives under `state/*`, which `idle-shutdown`
 (writer) and `graceful-stop` (reader) already hold **R/W** on.
+
+**WP-14 channel configuration and delivery state.** A signed, guild-only
+`/enshrouded channel` command, restricted to Manage Server or Administrator, selects
+its current ordinary text channel. The bot must have View Channel, Send Messages and
+Manage Channels there. It verifies the channel's guild through Discord before storing
+String JSON `{guildId, channelId, baseName}` at
+`/enshroudedproj/discord/status-channels/<guildId>`. These identifiers are nonsecret;
+this narrowly scoped write never permits replacing `discord/bot-token`.
+
+The status reconciler runs every minute and on this instance's EC2 state events. It
+describes the configured instance afresh, then queries the public IP once through the
+shared A2S client. A fresh successful query produces a green prefix; unavailable or
+unconfirmed readiness produces red. Messages distinguish starting, stopping, offline
+and unknown. Query responsiveness is the measured property; complete player readiness
+during cold start remains to be validated. Events are wakeups, not authoritative state.
+
+Each guild has one destination, with its existing base channel name preserved. Replacing
+the destination affects only that guild. The worker checks current configuration again
+before delivery and validates the Discord channel's guild. Worker invocations are
+serialized, with a persisted worker-owned **CONTROL** cursor to rotate through guilds
+when one invocation cannot finish the full list. Last successful announcement and rename are separate **FACTS** at
+`/enshroudedproj/state/status-channel/<guildId>/<channelId>`; rate-limit retry deadlines
+there are **CONTROL** variables owned only by this worker. Failed operations do not
+advance success markers. The `global-rate-limit` parameter is a shared **FACT** reporting
+Discord's bot-wide cooldown deadline; registration and delivery both honor and may update
+it from a Discord 429 response. Registration's own route cooldown uses
+`registration/<guildId>` in that subtree and belongs to its command handler. Scheduled reconciliation retries due operations without
+sleeping in Lambda. Convergence depends on successful Discord calls and cooldowns.
+
+SSM state and Discord message delivery are not atomic: a crash after Discord accepts a
+message but before state is persisted can duplicate an announcement. Ordinary unchanged
+polls must not post again. No player names, passwords or mentions are included. The
+worker has no EC2 lifecycle or server-parameter access.
 
 **The one deliberate cross-boundary grant.** `/enshrouded password` must return a group
 password, so the `discord-bot` Lambda needs exactly one `server/*` value. It is granted on
@@ -3313,7 +3354,7 @@ account.
 | **WP-11** | Interactions endpoint: HTTP API, Ed25519 verify (401 on bad signature), PING, deferred ack, async self-invoke. `/enshrouded start` and `/enshrouded status`. Command definitions + the manual registration script. | `lib/enshrouded/discord-bot.ts`, `lambda/discord-bot/{index.js,commands.js}`, `lambda/shared/discord.js`, `scripts/register-discord-commands.js`, `test/discord-commands.test.ts` | WP-03 | Discord accepts the endpoint URL. `/enshrouded start` acks in <3 s. Anti-drift test fails if the handler reads an option `commands.js` does not register. | R — close port of the reference. |
 | **WP-12** | `boot-watcher`: the three readiness gates, progress PATCHes, the final join-info message — **blocked on settling how players actually connect: only UDP 15637 is bound and gameplay runs over Steam P2P/relay (§5.3), so an `ip:15636` join string is probably wrong.** Determine the real join path (Steam server browser by name, Steam friends/invite, or direct IP on 15637) before writing the text; a confidently wrong join message is worse than a vague one — 8-minute give-up naming the failed gate. | `lambda/boot-watcher/index.js` | WP-08, WP-11 | A cold `/enshrouded start` ends with an edited message containing `ip:15636` and the add-server instructions, and the time from command to that message is recorded. A blocked firewall reproduces a gate-3 failure message. | R, with an **A** review of the gate ordering. |
 | **WP-13** | Remaining commands: `/enshrouded stop` (routes to `graceful-stop`, never raw `StopInstances`), `/enshrouded password` (**ephemeral**, `flags: 64`), `/enshrouded update`, `/enshrouded backup`. Permission gating on the admin ones (`ADMINISTRATOR`/`MANAGE_GUILD` bits, checked in the handler as defence in depth, not only in the portal). | updates to `lambda/discord-bot/`, `commands.js` | WP-09, WP-11 | A non-admin invoking `/enshrouded update` is refused by the handler itself. `/enshrouded password` output is ephemeral; grep the repo and CloudWatch logs to confirm no password is ever logged. | R |
-| **WP-14** | Status channel: EventBridge on EC2 state change → rename the Discord channel `enshrouded-online` / `-offline`. | `lib/enshrouded/status-channel.ts`, `lambda/status-channel/index.js` | WP-11 | Channel name tracks the real instance state within a minute of each transition. | R — direct port. |
+| **WP-14** | Admin-only `/enshrouded channel` selects one text channel per guild. Scheduled and instance-event reconciliation posts status transitions and prefixes the preserved channel name with green/red, using fresh EC2 state and A2S responsiveness. Scoped configuration/delivery grants per §6.6.2; independent message/rename progress and persisted rate-limit cooldowns. | `lib/enshrouded/status-channel.ts`, `lambda/status-channel/index.js`, Discord command/helper changes | WP-11, WP-08 | Unchanged polls do not repost; failed probes never claim a stopped instance; authorization, cross-guild validation, partial delivery, pagination and cooldown retry tested. Converges on next successful reconciliation subject to Discord cooldowns. | R with architecture review. |
 
 ### Phase 5 — hardening
 
