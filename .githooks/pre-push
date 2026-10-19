@@ -1,0 +1,42 @@
+#!/bin/sh
+# Refuse any direct push to main. Everything reaches main through a pull request.
+#
+# This exists because a direct push happened. A rule in CLAUDE.md did not prevent
+# it; a hook that exits non-zero does. Branch protection would be the server-side
+# version of this, but it needs GitHub Pro on a private repo (ARCHITECTURE 11.1),
+# so this is the local equivalent.
+#
+# Enabled per clone with:
+#   git config core.hooksPath .githooks
+# Verify with:
+#   git config --get core.hooksPath
+
+protected='main'
+remote_ref_prefix='refs/heads/'
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    "${remote_ref_prefix}${protected}")
+      cat >&2 <<'MSG'
+
+  BLOCKED: direct push to main.
+
+  Everything reaches main through a pull request. Open one instead:
+
+      git switch -c <branch>
+      git push -u origin <branch>
+      gh pr create --base main
+
+  If you are on main with commits already made, move them to a branch:
+
+      git switch -c <branch>          # takes the commits with you
+      git switch main
+      git reset --hard origin/main    # only safe if main has no unpushed work
+
+MSG
+      exit 1
+      ;;
+  esac
+done
+
+exit 0

@@ -11,7 +11,7 @@ Account `334953720182` (us-east-2) also hosts the running UOPrivateServer game s
 - **`cdk bootstrap` is permitted when needed.** CI structurally cannot bootstrap the credentials it runs with, so this is a human/assistant step. Already done: qualifier `enshrd1`, stack `CDKToolkitEnshrouded` (see `docs/RUNBOOK.md` §1.1).
 - **`EnshroudedOidcStack` is the one hand-deployed stack**, and is excluded from `deploy.yml` permanently — it defines the role CI authenticates as, so CI redeploying it can lock CI out of fixing itself (`docs/RUNBOOK.md` §1.6). Review the diff every time.
 - Validate locally with `npm run build`, `npx cdk synth` and `npx cdk diff` — all read-only.
-- **Never commit to `main`; branch fresh per task and open a PR.**
+- **Never push to `main`. Ever.** Every change reaches main through a pull request — including docs-only and one-line commits. Branch *before* making the edit. `.githooks/pre-push` blocks it; enable per clone with `git config core.hooksPath .githooks`, and never bypass with `--no-verify`.
 - **Tag every AWS resource** `project=enshroudedproj`, `repo=pinkcognito/enshroudedproj` (applied at App level in `bin/enshrouded.ts`; do not remove).
 - Stop and ask before anything that could affect a non-`Enshrouded*` resource.
 
