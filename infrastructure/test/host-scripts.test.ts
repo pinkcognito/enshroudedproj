@@ -328,6 +328,7 @@ describe('provision-host.sh', () => {
     const fn = (/install_packages\(\) \{[\s\S]*?\n\}/.exec(script)?.[0] ?? '').replace(/^\s*#.*$/gm, '');
     expect(fn).toMatch(/\blibvulkan1\b/);
     expect(fn).toMatch(/\bwinbind\b/);
+    expect(fn).toMatch(/\blibfreetype6\b/);
     expect(fn).toMatch(/\blib32gcc-s1\b/);
     expect(fn).toMatch(/\blib32stdc\+\+6\b/);
     expect(fn).not.toMatch(/mesa-vulkan-drivers/);
