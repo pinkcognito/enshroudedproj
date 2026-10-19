@@ -13,7 +13,7 @@
     "@eslint/js": "^10.0.1",
     "@types/jest": "^30",
     "@types/node": "^24.10.1",
-    "aws-cdk": "2.1129.0",
+    "aws-cdk": "2.1145.0",
     "eslint": "^10.6.0",
     "jest": "^30",
     "ts-jest": "^29",
