@@ -81,9 +81,13 @@ happens to this architecture under each way WP-07 could come back.
    must then WAIT for the process to exit.** systemd's default first signal is `SIGTERM`
    and its `TimeoutStopSec` default is 90 s; the signal is wrong and the wait is the part
    every known implementation gets subtly wrong. See §4.
-4. **The GE-Proton version is pinned and checksummed.** An unpinned translation layer is
-   the principal risk the user accepted in choosing Linux (§6.1). It must never float.
-   See §6.1.3.
+4. **The GE-Proton version is pinned and checksummed, and the pin tracks the GAME
+   version.** An unpinned translation layer is the principal risk the user accepted in
+   choosing Linux (§6.1); it must never float. But pinning guards against drift, **not
+   against being pinned to the wrong thing** — a Proton version correct for one Enshrouded
+   release can be wrong for the next, which is exactly what the 1.0 release did to our
+   `10-26` pin (§6.1.3a). **Every significant game release is a trigger to re-check the
+   pin against the reference project's.** See §6.1.3.
 5. **A measurement failure never stops the instance.** If player detection is indeterminate,
    the box stays up and an alarm fires. Billing a few extra dollars is recoverable; a
    corrupted world is not. A hard max-uptime cap bounds the downside.
@@ -526,6 +530,21 @@ a faithful port of the implementation we have evidence for rather than a reinven
 
 `TimeoutStopSec=120` now covers `ExecStop` **plus** the subsequent kill, which is why the
 loop is bounded at 110 s rather than 120.
+
+**Confirmed unaffected by the Proton 11-9 bump and the relative-path launch (§6.1.3a) —
+with a caveat.** `stop-game.sh`'s `pkill -INT -f '[e]nshrouded_server\.exe'` pattern is
+unanchored, so it matches a relative launch (`./enshrouded_server.exe`) exactly as it
+matched an absolute one, and it still does **not** match `wineserver` (whose command line
+is just `wineserver`). **The §4.3.1 contract holds.**
+
+The caveat is about evidence, not logic: **Proton 11 changes the process tree.** `umu` is
+now in play (requirement 4 exists precisely to route *around* `umu.exe`), so there may be
+an additional process whose argv contains the exe path and which `pkill -f` would
+therefore also signal — harmless for the signal, but it directly affects the **wait**
+predicate flagged in WP-07 (g4). All of the process-topology reasoning in §5.4 and the
+WP-07 (d2) / (g2) / (g4) observations were framed against **10-26** and must be **re-run
+against 11-9**, not carried over. The contract is sound; its supporting measurements are
+stale.
 
 **Honesty about this reasoning:** it is inference from how Wine and systemd are documented
 to behave, **not an observation**. It could be wrong in either direction — `wineserver`
@@ -993,8 +1012,11 @@ work, and WP-05 should diff its behaviour against ours if the save path misbehav
 An unpinned translation layer is the principal risk the user accepted in choosing Linux.
 Therefore:
 
-- **GE-Proton is pinned to an exact version** (start at `10-26`, matching the reference
-  container's current pin) and **recorded in CDK/config as a constant**, never "latest".
+- **GE-Proton is pinned to an exact version** — currently **`11-9`**
+  (`GE-Proton11-9-x86_64.tar.gz`, 564,697,280 bytes, SHA256
+  `b2cf4a632a70ec321cdb9904fa396a2a45d4061129f9fdc89d8a27ea5ceeb9d6`, from the GitHub
+  release API digest) — **recorded in config as a constant**, never "latest".
+  **Bumped from `10-26` on 2026-10-19; see §6.1.3a for why and what it drags in.**
 - The tarball is **SHA256-checksummed** on download and **mirrored into the project's S3
   bucket**, so a deleted or retagged upstream GitHub release cannot break a rebuild or
   silently substitute different bits.
@@ -1021,6 +1043,106 @@ Therefore:
      Accepted by decision, not by omission.
 - Upgrading Proton is a **deliberate PR** that runs the WP-16 restore drill afterwards —
   never an incidental side effect of a rebuild.
+
+#### 6.1.3a The 10-26 → 11-9 bump, and the failure mode the pin rule did not anticipate
+
+**GE-Proton 10-26 cannot run the Enshrouded 1.0 server.** Observed on the real box:
+`status=255/EXCEPTION` about a second after `fsync: up and running`, with `logs/` empty —
+the exe died before its own logger initialised. The Wine prefix built correctly and the
+depot was fully installed and verified, so this was not an install problem.
+
+**VERIFIED** — `jsknnr/enshrouded-server` commit `11ac003`, 2026-10-15, message fetched
+from the GitHub API:
+
+> "fix: run Enshrouded 1.0 server under GE-Proton 11. The 1.0 server needs SteamUtils011,
+> which GE-Proton 10's lsteamclient lacks, so move to GE-Proton 11-9. GE-Proton 11's
+> proton script loads libvulkan.so.1 at startup, so install libvulkan1. GE-Proton 11's umu
+> mode (UMU_ID set) disables lsteamclient... patch that override out. Launching with an
+> absolute exe path goes through umu.exe, which blocks the server at startup once
+> lsteamclient is enabled. Launch with a relative path so Proton runs the exe directly."
+
+So the one implementation we have evidence for moved **off** the major version we pinned,
+for this exact game version, and did so the same day 1.0 shipped (Steam's API gives the
+base game a release date of 2026-10-15). **Our 10-26 pin was correct for the pre-1.0
+server and was made obsolete by a game release four days later.**
+
+##### The lesson: the pin must track the GAME version
+
+§6.1.3 was written to protect against **drift** — upstream changing bits under us. It did
+that. But it created an exposure it did not name: **being pinned to a version that is
+correct today and wrong after the next game update.** Pinning froze the translation layer
+while the thing it translates kept moving.
+
+The combination that produces this is already in the design: **§7 auto-updates the game on
+every boot, and nothing auto-updates Proton.** §7's second update-failure bullet
+("a patch the pinned GE-Proton cannot run → the save is fine, the binary will not start")
+predicted this precisely. It happened on essentially day one.
+
+Two consequences:
+
+1. **A Proton bump is now a known-recurring maintenance event, not a contingency.** Every
+   significant Enshrouded release is a trigger to check the reference project's pin before
+   trusting ours. Add that check to the §7 update procedure.
+2. **WP-16's bump procedure is needed now, not eventually.** It was scheduled as runbook
+   documentation; the event it documents has already occurred once, so it should be
+   written from this bump while the details are fresh rather than reconstructed later.
+
+##### Proton 11 is not a drop-in — four companions, all VERIFIED from the reference Dockerfile
+
+| # | Requirement | Why |
+| --- | --- | --- |
+| 1 | install `libvulkan1` | Proton 11's `proton` script loads `libvulkan.so.1` at startup. **Loader only** — the reference installs no `mesa-vulkan-drivers`, so the "missing Vulkan ICD" theory is wrong and no driver package is needed. |
+| 2 | `UMU_ID=0` in the environment | Selects non-umu behaviour. |
+| 3 | `sed`-patch the `proton` script to remove `append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")` | umu mode otherwise disables `lsteamclient`, which the 1.0 server needs for `SteamUtils011`. See the ruling below. |
+| 4 | launch with a **relative** exe path after `cd`, never absolute | An absolute path routes through `umu.exe`, which blocks startup once lsteamclient is enabled. |
+
+##### Ruling: how "pinned and verified" survives "then patched"
+
+Requirement 3 modifies a SHA256-verified artifact, which is in real tension with §6.1.3's
+integrity story. The resolution rests on separating two questions the pin conflates:
+
+**The SHA256 answers "did we receive the bits upstream published?" It cannot answer "are
+those bits what we intend to run?"** Patching moves us from *upstream's artifact* to *our
+derived artifact*. That is legitimate — the alternative is running a configuration we know
+to be broken — but the discipline must then extend to the derived artifact rather than
+stop at the input. Five rules:
+
+1. **Verify, then patch. Never patch first.** Patching an unverified tarball would let a
+   substituted archive be transformed into something arbitrary with no baseline to compare
+   against. The order is not stylistic.
+2. **Fail closed on the match.** If the target expression is absent, **abort loudly** —
+   never continue silently. A silently-unapplied patch leaves `lsteamclient` disabled and
+   the server fails *exactly like the original bug*, which is the worst possible
+   diagnostic outcome. The reference's guard is correct and must be kept.
+3. **Assert exactly one match**, not "at least one". `grep -c` must equal 1. Two matches
+   means the upstream script changed shape and our understanding of it is stale — that is
+   a stop-and-think signal, not something to patch through.
+4. **Pin the post-patch hash of the `proton` script** and assert it after patching. The
+   file is fixed within a fixed tarball, so the patched result is deterministic. This is
+   the step that genuinely restores the integrity property: we then know both the input
+   bits and the output bits. It adds one constant per Proton bump, and having to regenerate
+   it is a feature — it forces whoever bumps Proton to look at the patch.
+5. **The patch is a documented deviation, listed here**, never an undocumented local hack.
+   Recording what is patched and why is what lets the *next* bump ask whether it is still
+   needed.
+
+**And prefer environment over patching wherever it is sufficient.** The reference sets
+`UMU_ID=0` *and* patches, which implies the variable alone was not enough — but that is
+inference from their choices, not something we tested. **WP-07 should confirm the patch is
+still required with `UMU_ID=0` set**, because carrying an unnecessary patch to a verified
+binary is pure risk for no benefit. If GE-Proton later fixes umu mode upstream, this
+requirement should disappear rather than be carried forever.
+
+##### Gaps against the known-good build — recorded, unverified as causes
+
+The reference has two things we lack. Neither is confirmed to matter, but both are real
+divergences from a build known to work:
+
+- `~/.steam/sdk64` and `~/.steam/sdk32` symlinks (with `steamservice.so` → `steamclient.so`)
+- the `winbind` package
+
+Close them on the principle that divergence from a known-good build should be deliberate,
+not accidental — but do not record them as fixes for the 255 crash without evidence.
 - **ASSUMED — needs validation (WP-05):** that `proton run` requires
   `STEAM_COMPAT_CLIENT_INSTALL_PATH` and `STEAM_COMPAT_DATA_PATH` to be set. The reference
   entrypoint does not export them, so they are presumably set as Dockerfile `ENV` or
@@ -2479,6 +2601,21 @@ account.
   separately — they are expected to differ substantially (§3.1).
 - **(j) Save-file churn.** Does an idle server with no players stop rewriting the save
   across two autosave cycles? (Qualifies the §5.4 reserve mechanism.)
+- **(k3) Proton 11-9 on Ubuntu 24.04 — untested combination.** The reference runs
+  **Debian 13**; we run **Ubuntu 24.04**. A glibc or library-version difference is
+  possible and nothing has validated 11-9 on 24.04. Record the glibc version on both sides
+  if a failure appears, and confirm `libvulkan1` alone is sufficient (the reference
+  installs **no** `mesa-vulkan-drivers`, so do not add one speculatively).
+- **(k4) Is the `proton` script patch still required?** With `UMU_ID=0` set, test whether
+  removing the `lsteamclient=d` override is actually necessary, or whether the environment
+  variable alone suffices (§6.1.3a). The reference does both, which *implies* the variable
+  is insufficient, but that is inference from their choices rather than a measurement.
+  **Carrying an unnecessary patch to a SHA256-verified binary is pure risk for no
+  benefit**, so this is worth one experiment. Also re-check at every Proton bump: if
+  upstream fixes umu mode, the patch should be deleted rather than carried forever.
+- **(d2/g2/g4 RE-RUN against 11-9.)** Every process-topology observation these items ask
+  for was framed against GE-Proton 10-26. Proton 11 introduces `umu`, so the tree has
+  changed. Re-run them; do not carry the 10-26 answers forward (§4.3.1).
 - **(k2) Fresh encrypted EBS read pattern — convert §8.2's inference to VERIFIED.** On a
   newly created, never-written **encrypted** volume, record `hexdump -C` of the first few
   MiB and whether `wipefs`/`blkid`/`partx` report clean. Repeat on an **unencrypted**
@@ -2524,7 +2661,7 @@ account.
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
 | **WP-15** | Observability: grant the instance role CloudWatch Logs permissions (WP-05 installs and starts the agent but it **cannot publish** until this lands) and ship `enshrouded_server.log` to the log group **`/enshroudedproj/game-log`** — the name WP-05 already configured on the agent, so match it exactly rather than inventing another (**the game deletes the log on every launch**, so off-box shipping is the only way to keep crash forensics); alarms for `SaveVerificationFailed`, `DetectionIndeterminate`, `MaxUptimeCapHit`, `BootWatcherTimeout`; AWS Budgets alarm; all alarms routed to the Discord ops channel. | `lib/enshrouded/observability.ts` | WP-10, WP-14 | Forcing a save-verification failure produces a Discord message within 5 minutes. Last session's log is readable in CloudWatch after a restart. | R |
-| **WP-16** | `docs/RUNBOOK.md` + a **real restore drill, exercised cross-AZ** (§8.1): create a volume from a DLM snapshot in a **different AZ**, overlay the newest `<worldid>*` set from S3, attach to an instance in that AZ, boot, and confirm the world and a built structure are intact. Also do the simpler same-AZ `savegame/`-only restore. Record the exact steps and the elapsed time for both. | `docs/RUNBOOK.md` | WP-04, WP-09 | The drill is performed and documented, not described hypothetically. The cross-AZ elapsed time is recorded as the project's de facto recovery objective. Runbook also covers: **the GE-Proton bump procedure** (the only mitigation for a patch the pinned Proton cannot run, §7); **the warning that adding user data mutated the instance resource, so the first deploy after WP-05 may stop/start or replace it** — harmless for the world because the data volume is retained (§6.3.1), but it will interrupt a running session and should not be a surprise; re-applying the §6.2.1 step-3 Deny after a re-bootstrap; manual stop, clearing a stuck maintenance mode, forcing a game update, and rolling back a bad Keen patch. | **A**-light |
+| **WP-16** | `docs/RUNBOOK.md` + a **real restore drill, exercised cross-AZ** (§8.1): create a volume from a DLM snapshot in a **different AZ**, overlay the newest `<worldid>*` set from S3, attach to an instance in that AZ, boot, and confirm the world and a built structure are intact. Also do the simpler same-AZ `savegame/`-only restore. Record the exact steps and the elapsed time for both. | `docs/RUNBOOK.md` | WP-04, WP-09 | The drill is performed and documented, not described hypothetically. The cross-AZ elapsed time is recorded as the project's de facto recovery objective. Runbook also covers: **the GE-Proton bump procedure — write it from the 10-26 → 11-9 bump (§6.1.3a) while the details are fresh, since the contingency it documents has already occurred once and will recur at every significant game release** (the only mitigation for a patch the pinned Proton cannot run, §7); **the warning that adding user data mutated the instance resource, so the first deploy after WP-05 may stop/start or replace it** — harmless for the world because the data volume is retained (§6.3.1), but it will interrupt a running session and should not be a surprise; re-applying the §6.2.1 step-3 Deny after a re-bootstrap; manual stop, clearing a stuck maintenance mode, forcing a game update, and rolling back a bad Keen patch. | **A**-light |
 | **WP-17** | **Permissions boundary (§6.2.1b).** Author an `EnshroudedPermissionsBoundary` customer-managed policy in the `Allow NotAction: ["organizations:*","account:*"]` + `Deny`-UO-resources shape (a boundary is an intersection, so it must contain Allows), re-bootstrap with `--custom-permissions-boundary`, and confirm every role our stacks create carries it. Covers the runtime-escape threat the deploy-time Deny does not. | `docs/RUNBOOK.md` (boundary section), `infrastructure/policies/permissions-boundary.json` | WP-02, and every WP that creates a role (WP-03, 09–15) | Every role in the deployed stacks shows the boundary in `iam:GetRole`. A `simulate-principal-policy` of the EC2 instance role against the UO instance returns `explicitDeny`. **A full deploy still succeeds** — a too-tight boundary fails `iam:CreateRole` mid-deploy, so the positive control matters more than the negative one here. | **A** — easy to get wrong in a way that wedges deploys. |
 | **WP-20** | **Close the reverse isolation direction (§6.2.3b)** — the UO → Enshrouded gap. Author `UoCannotTouchEnshrouded` (CFN on `stack/Enshrouded*/*` + `stack/CDKToolkitEnshrouded/*`; `ec2:*` conditioned on `aws:ResourceTag/project=enshroudedproj`; `iam:*` on `role/enshrouded-*` and `role/cdk-enshrd1-*`; `ssm:*` on `parameter/enshroudedproj/*`), attach it to `cdk-hnb659fds-deploy-role` and `-cfn-exec-role`, and enable termination protection on `EnshroudedServerStack`. **Cannot be done from this repo** — our own guardrail denies `iam:*` on `cdk-hnb659fds-*` and that must not be relaxed. Hand-run operator step or a UO-repo change, and it **modifies the live production system**, so it needs the user's explicit authorisation. | `infrastructure/policies/uo-cannot-touch-enshrouded.json` (checked in for review only), `docs/RUNBOOK.md` | **Phase 1 deployed and tagged** (a tag-conditioned deny protects nothing before the tagged resources exist), + user authorisation | Simulation in **both** directions: UO roles **denied** on `stack/EnshroudedServerStack/*`, **and still allowed** on `stack/InfrastructureStack/*`. The positive control is the important half — it is what catches a too-broad deny breaking UO's pipeline. Termination protection enabled and recorded in the runbook **as a speed bump, not a control**. | **A** — touches live production IAM; low urgency, high care. |
 

@@ -132,6 +132,12 @@ run_steamcmd() {
 
 wait_ready() {
   for _ in $(seq 1 "$READY_TIMEOUT"); do
+    # Restart=no, so a failed unit stays failed: waiting out the full timeout cannot help.
+    if systemctl is-failed --quiet enshrouded.service; then
+      warn "enshrouded.service has FAILED; aborting the readiness wait early. Last journal lines:"
+      journalctl -u enshrouded -n 30 --no-pager >&2 || true
+      return 1
+    fi
     if systemctl is-active --quiet enshrouded.service \
        && pgrep -f '[e]nshrouded_server\.exe' >/dev/null 2>&1 \
        && ss -H -uln "sport = :${QUERY_PORT}" 2>/dev/null | grep -q .; then
@@ -187,7 +193,7 @@ main() {
   log "starting enshrouded.service"
   systemctl start enshrouded.service
   WE_STOPPED_GAME=0
-  wait_ready || die "game did not become ready within ${READY_TIMEOUT}s (check: journalctl -u enshrouded.service)"
+  wait_ready || die "game did not become ready (unit failed, or not up within ${READY_TIMEOUT}s; see journal above / journalctl -u enshrouded.service)"
   log "deploy complete"
 }
 
