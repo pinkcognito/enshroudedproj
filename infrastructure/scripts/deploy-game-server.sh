@@ -53,7 +53,12 @@ install_template() {
     || { warn "config template is not valid JSON"; return 1; }
   mkdir -p "$(dirname "$TEMPLATE_DEST")"
   tmp="$(mktemp "${TEMPLATE_DEST}.XXXXXX")"
-  cat "$src" > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$TEMPLATE_DEST" || { rm -f "$tmp"; return 1; }
+  # Explicit if, not A && B || C: shellcheck SC2015 correctly flags that form as ambiguous even
+  # where the intent ("on any failure, clean up and fail") happens to be right.
+  if ! { cat "$src" > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$TEMPLATE_DEST"; }; then
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 # fetch_and_render <out>   (the template is whatever install_template put at TEMPLATE_DEST)
