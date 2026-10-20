@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare WP25's deliberately worst-case password shape; preview by default.
+"""Prepare independent 16-character ASCII alphanumeric role passwords.
 
 Preview needs only Python and prints tier lengths, never passwords. Apply needs
 AWS CLI v2 (including configure export-credentials) and normal AWS credentials:
@@ -11,8 +11,8 @@ SecureString and the default SSM key. Passwords stay in Python memory: no secret
 argv, temporary files, plaintext output, persistent hashes, or rollback.
 Writes are not atomic; reconcile all four after any failure before starting.
 No instance start/stop, config rendering, rotation enablement, or DM is performed.
-After preparation an operator must still render/boot, join all four tiers, and
-prove a truncated admin prefix fails (ARCHITECTURE 7.4.6). This is NOT a WP25 pass.
+After preparation an operator must still render/boot and verify all four tiers.
+This helper does not certify the game's password handling.
 """
 
 import argparse
@@ -21,9 +21,8 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
-import re
 import secrets
+import string
 import subprocess
 import sys
 import time
@@ -35,15 +34,14 @@ REGION = "us-east-2"
 INSTANCE_ID = "i-02718657e8fed78b0"
 ROTATION_SWITCH = "/enshroudedproj/state/rotate-on-start"
 FRESHNESS_BOUND_SECONDS = 5.0
-WORD_COUNTS = {"admin": 4, "friend": 3, "guest": 3, "visitor": 3}
+PASSWORD_LENGTH = 16
+PASSWORD_ALPHABET = string.ascii_uppercase + string.ascii_lowercase + string.digits
 PASSWORD_PARAMS = {
     "admin": "/enshroudedproj/server/user-groups/admin-password",
     "friend": "/enshroudedproj/server/user-groups/friend-password",
     "guest": "/enshroudedproj/server/user-groups/guest-password",
     "visitor": "/enshroudedproj/server/user-groups/visitor-password",
 }
-WORDLIST = (Path(__file__).resolve().parents[1] / "infrastructure/lib/enshrouded"
-            / "lambda/discord-bot/eff-large-wordlist.js")
 
 
 class PreparationError(Exception):
@@ -142,33 +140,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def load_nine_letter_words(path=WORDLIST):
-    """Parse the literal array strictly, without evaluating JavaScript or copying it."""
-    source = path.read_text(encoding="utf-8")
-    # Only the existing leading // attribution/comments and exact literal export
-    # syntax are accepted. Any executable expression or unexpected entry fails.
-    literal = re.sub(r"(?m)^\s*//[^\n]*\n?", "", source).strip()
-    match = re.fullmatch(r"module\.exports = Object\.freeze\(\[\s*(.*?)\s*\]\);", literal, re.S)
-    if not match:
-        raise PreparationError("Vendored wordlist export format is unexpected.")
-    entries = match.group(1).splitlines()
-    words = []
-    for entry in entries:
-        word = re.fullmatch(r"\s*'([a-z]+)',\s*", entry)
-        if not word:
-            raise PreparationError("Vendored wordlist entry format is unexpected.")
-        words.append(word.group(1))
-    if len(words) != len(set(words)) or not words or max(map(len, words)) != 9:
-        raise PreparationError("Vendored wordlist uniqueness/maximum length changed.")
-    candidates = tuple(word for word in words if len(word) == 9)
-    if len(candidates) < 4:
-        raise PreparationError("Not enough nine-letter words in the vendored list.")
-    return candidates
-
-
-def prepare_passwords(words):
-    return {tier: "-".join(secrets.choice(words) for _ in range(count))
-            for tier, count in WORD_COUNTS.items()}
+def prepare_passwords():
+    """Draw every character independently for every tier using the system CSPRNG."""
+    return {tier: "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(PASSWORD_LENGTH))
+            for tier in PASSWORD_PARAMS}
 
 
 def check_stopped_and_rotation_off(ec2, ssm):
@@ -238,12 +213,12 @@ def main(argv=None):
     if args.apply and args.instance_id != INSTANCE_ID:
         parser.error("--apply requires --instance-id " + INSTANCE_ID)
     try:
-        passwords = prepare_passwords(load_nine_letter_words())
-        for tier in WORD_COUNTS:
+        passwords = prepare_passwords()
+        for tier in PASSWORD_PARAMS:
             print(f"{tier}: {len(passwords[tier])} characters")
         if args.apply:
             apply_passwords(Aws(args.profile), passwords)
-            print("Prepared four SecureString parameters; WP25 live checks remain outstanding.")
+            print("Prepared four SecureString parameters; live server checks remain outstanding.")
         return 0
     except PreparationError as error:
         print(str(error), file=sys.stderr)

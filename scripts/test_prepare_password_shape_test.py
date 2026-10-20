@@ -34,15 +34,21 @@ def fake_aws():
 
 class ShapePreparationTests(unittest.TestCase):
     def setUp(self):
-        self.passwords = helper.prepare_passwords(helper.load_nine_letter_words())
+        self.passwords = helper.prepare_passwords()
 
-    def test_real_vendored_words_and_exact_shapes(self):
-        words = set(helper.load_nine_letter_words())
-        for tier, count in helper.WORD_COUNTS.items():
-            parts = self.passwords[tier].split("-")
-            self.assertEqual(len(parts), count)
-            self.assertEqual(len(self.passwords[tier]), 39 if tier == "admin" else 29)
-            self.assertTrue(all(len(part) == 9 and part in words for part in parts))
+    def test_all_four_passwords_are_exactly_16_ascii_alphanumeric_characters(self):
+        self.assertEqual(set(self.passwords), {"admin", "friend", "guest", "visitor"})
+        for password in self.passwords.values():
+            self.assertRegex(password, r"\A[A-Za-z0-9]{16}\Z")
+
+    def test_every_character_is_drawn_independently_for_each_tier(self):
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        expected = {"admin": "A" * 16, "friend": "z" * 16,
+                    "guest": "0" * 16, "visitor": "9" * 16}
+        with patch.object(helper.secrets, "choice", side_effect="".join(expected.values())) as choice:
+            self.assertEqual(helper.prepare_passwords(), expected)
+        self.assertEqual(choice.call_count, 64)
+        self.assertTrue(all(call.args == (alphabet,) for call in choice.call_args_list))
 
     def test_preview_is_offline_and_only_lengths(self):
         output = io.StringIO()
@@ -50,16 +56,8 @@ class ShapePreparationTests(unittest.TestCase):
                 patch.object(helper.subprocess, "run", side_effect=AssertionError("CLI forbidden")), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(helper.main([]), 0)
-        self.assertEqual(output.getvalue(), "admin: 39 characters\nfriend: 29 characters\n"
-                         "guest: 29 characters\nvisitor: 29 characters\n")
-
-    def test_wordlist_parser_rejects_executable_entries(self):
-        for source in ("module.exports = Object.freeze([\n  process.exit(),\n]);",
-                       "module.exports = Object.freeze([\n  'abcdefghi',\n]);\nexecute();"):
-            path = Mock()
-            path.read_text.return_value = source
-            with self.assertRaises(helper.PreparationError):
-                helper.load_nine_letter_words(path)
+        self.assertEqual(output.getvalue(), "admin: 16 characters\nfriend: 16 characters\n"
+                         "guest: 16 characters\nvisitor: 16 characters\n")
 
     def test_apply_requires_explicit_pinned_id(self):
         for arguments in (["--apply"], ["--apply", "--instance-id", "i-other"],
