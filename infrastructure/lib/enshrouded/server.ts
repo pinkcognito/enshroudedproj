@@ -89,12 +89,21 @@ export class EnshroudedServer extends Construct {
         resources: [ssmParamArn('discord/*'), ssmParamArn('discord')],
       }),
     );
-    // SecureString reads: decrypt only when the call is made through SSM.
+    // SecureString reads (WP-26): the box reads exactly four SecureStrings, the tier passwords
+    // render-config.sh fetches; server/name, server/slot-count and the other server/ reads are
+    // Strings. Pinned by PARAMETER_ARN (the KEY has no stable ARN, the parameter does). Decrypt
+    // only, never Encrypt: the box does not write SecureStrings.
     this.role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['kms:Decrypt'],
         resources: ['*'],
-        conditions: { StringEquals: { 'kms:ViaService': `ssm.${stack.region}.amazonaws.com` } },
+        conditions: {
+          StringEquals: {
+            'kms:ViaService': `ssm.${stack.region}.amazonaws.com`,
+            'kms:EncryptionContext:PARAMETER_ARN': ['admin', 'friend', 'guest', 'visitor'].map((g) =>
+              ssmParamArn(`server/user-groups/${g}-password`)),
+          },
+        },
       }),
     );
 

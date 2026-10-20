@@ -42,8 +42,16 @@ export class StatusChannel extends Construct {
       resources: [parameter('state/status-channel/*')],
     }));
     role.addToPolicy(new iam.PolicyStatement({
+      // WP-26: the only SecureString this role reads is the bot token (everything else is a
+      // String read with WithDecryption:false). SSM supplies PARAMETER_ARN (full parameter ARN)
+      // as the sole encryption context, so the AWS-managed key's lack of a stable ARN is moot.
       actions: ['kms:Decrypt'], resources: ['*'],
-      conditions: { StringEquals: { 'kms:ViaService': `ssm.${stack.region}.amazonaws.com` } },
+      conditions: {
+        StringEquals: {
+          'kms:ViaService': `ssm.${stack.region}.amazonaws.com`,
+          'kms:EncryptionContext:PARAMETER_ARN': [parameter('discord/bot-token')],
+        },
+      },
     }));
     // DescribeInstances has no resource-level permission support. Always pass INSTANCE_ID.
     role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeInstances'], resources: ['*'] }));
