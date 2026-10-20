@@ -36,10 +36,32 @@ async function describeInstance() {
 // Runs as a separate async invocation so the slow part never blocks Discord's 3s ack
 // deadline (EC2 start alone regularly took 3.5-4s). The initial invocation already
 // delivered a deferred (type 5) callback; we edit it via the interaction token.
+const START_DENIED = "You don't have permission to start the server; ask a server admin.";
+const NO_TIER_NOTE = " You don't hold a password role, so there's nothing for me to send you.";
+
 async function finishStart(event, context) {
   const reply = (content) =>
     editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken, content);
   try {
+    // Stage 1, before ANY side effect (7.5.3): one membership test against commandRoles.start,
+    // nothing else. No EC2 client, no rotation, no state read happens for an unauthorized caller.
+    const { ACCESS_PREFIX, authorizeCommand } = require('./password-access');
+    let mapping;
+    try {
+      if (!require('../shared/status-channel-config').isSnowflake(event.guildId)) throw new Error('invalid-guild');
+      mapping = JSON.parse(await require('./rotation').readParameter(`${ACCESS_PREFIX}/${event.guildId}`));
+    } catch {
+      mapping = null; // absent, unreadable or corrupt: fail closed
+    }
+    const botToken = await require('../shared/discord').getBotToken();
+    const authorized = await authorizeCommand(
+      { guildId: event.guildId, userId: event.userId, roleIds: event.roleIds }, mapping, 'start', { botToken });
+    if (!authorized) {
+      await reply(START_DENIED);
+      return;
+    }
+    // Authorized to start, but holds no password tier: normal and supported (7.5.4).
+    const tierNote = authorized.groups.length ? '' : NO_TIER_NOTE;
     const instance = await describeInstance();
     // Interlock (b) clock starts when the state observation returns; the kill-switch read
     // below deliberately counts against the 5 s bound.
@@ -91,7 +113,7 @@ async function finishStart(event, context) {
       // A successful EC2 start must not become a failed start because Discord failed.
       try {
         await editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken,
-          `Booting the world - this takes a few minutes.${unrotatedNote}`, 2000);
+          `Booting the world - this takes a few minutes.${tierNote}${unrotatedNote}`, 2000);
       } catch {
         console.error('Server start reply failed: network-or-timeout');
       }
@@ -227,8 +249,14 @@ exports.handler = async (event, context) => {
         return require('./help').helpResponse();
       }
       if (subcommand === 'start') {
+        // Free payload inspection only (7.5.3): the mapping lives in SSM and reading it here would
+        // put an AWS round trip ahead of the 3 s ack. The real check is in finishStart.
+        if (!interaction.guild_id || !interaction.member) {
+          return jsonResponse({ type: CALLBACK_TYPE.CHANNEL_MESSAGE, data: { content: START_DENIED, flags: 64 } });
+        }
+        // Not ephemeral: existing contract (the start reply and announcement are public).
         return deferAndInvoke('finish-start', interaction, undefined,
-          { guildId: interaction.guild_id, userId: user?.id });
+          { guildId: interaction.guild_id, userId: user?.id, roleIds: interaction.member.roles });
       }
       if (subcommand === 'status') {
         return deferAndInvoke('finish-status', interaction);

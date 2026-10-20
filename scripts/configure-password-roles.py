@@ -3,6 +3,9 @@
 
 Defaults to preview only. Requires the three roles enshroudedadmin,
 enshroudedfriend, and enshroudedguest; enshroudedvisitor is optional.
+The action roles enshroudedstart, enshroudedstop, enshroudedupdate and enshroudedbackup are
+all optional, and an absent one means that command is DENIED to everyone (ARCHITECTURE 7.5.2).
+Action roles are fully independent of the password tiers: no role implies another.
 Uses the operator's AWS CLI credentials. Never prints the bot token.
 """
 
@@ -13,6 +16,65 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+
+
+TIERS = ("admin", "friend", "guest", "visitor")
+ACTIONS = ("start", "stop", "update", "backup")
+SNOWFLAKE = re.compile(r"[0-9]{17,20}")
+
+
+def find_role(roles, name, guild_id, required):
+    """Return the role id for an exactly-named role, or None when optional and absent."""
+    matches = [role for role in roles if isinstance(role, dict) and role.get("name") == name]
+    if not matches and not required:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError("Create exactly one role named %s in the trusted server, then retry" % name
+                           if required else "More than one role is named %s; keep exactly one, then retry" % name)
+    role = matches[0]
+    role_id = role.get("id", "")
+    if (not isinstance(role_id, str) or not SNOWFLAKE.fullmatch(role_id)
+            or role_id == guild_id or role.get("managed")):
+        raise RuntimeError("Role %s must be an ordinary, assignable Discord role" % name)
+    return role_id
+
+
+def resolve_roles(roles, guild_id):
+    """Resolve tier roles and (optional) action roles. Uniqueness applies to tiers only."""
+    mapping = {}
+    for tier in TIERS:
+        role_id = find_role(roles, "enshrouded" + tier, guild_id, tier != "visitor")
+        if role_id:
+            mapping[tier] = role_id
+    if len(set(mapping.values())) != len(mapping):
+        raise RuntimeError("Each authorization level must use a different role")
+    command_roles = {}
+    for action in ACTIONS:
+        role_id = find_role(roles, "enshrouded" + action, guild_id, False)
+        if role_id:
+            command_roles[action] = role_id
+    return mapping, command_roles
+
+
+def preview_lines(mapping, command_roles):
+    """What the bot will actually do per command. Never blank: blank reads as "open to all"."""
+    lines = []
+    for action in ACTIONS:
+        if action in command_roles:
+            lines.append("%s: allowed only to holders of enshrouded%s (nothing else grants it, not even enshroudedadmin)"
+                         % (action, action))
+        else:
+            lines.append("%s: DENIED to everyone (enshrouded%s not found)" % (action, action))
+    tiers = [tier for tier in TIERS if tier in mapping]
+    lines.append("pw: holders of any of: %s (each sees their own tier and below)" % ", ".join("enshrouded" + t for t in tiers))
+    lines.append("channel: Discord Manage Server / Administrator permission (not role based)")
+    lines.append("status, help: open to everyone")
+    shared = sorted({"%s shares its role with tier %s" % (action, tier)
+                     for action, action_id in command_roles.items() for tier, tier_id in mapping.items()
+                     if action_id == tier_id})
+    for note in shared:
+        lines.append("note: " + note)
+    return lines
 
 
 def main():
@@ -56,27 +118,19 @@ def main():
     if not isinstance(roles, list):
         raise RuntimeError("Discord returned an invalid role list")
 
-    mapping = {}
-    for tier in ("admin", "friend", "guest", "visitor"):
-        name = "enshrouded" + tier
-        matches = [role for role in roles if isinstance(role, dict) and role.get("name") == name]
-        if not matches and tier == "visitor":
-            continue
-        if len(matches) != 1:
-            raise RuntimeError("Create exactly one role named %s in the trusted server, then retry" % name)
-        role = matches[0]
-        role_id = role.get("id", "")
-        if (not isinstance(role_id, str) or not re.fullmatch(r"[0-9]{17,20}", role_id)
-                or role_id == args.guild_id or role.get("managed")):
-            raise RuntimeError("Role %s must be an ordinary, assignable Discord role" % name)
-        mapping[tier] = role_id
-    if len(set(mapping.values())) != len(mapping):
-        raise RuntimeError("Each authorization level must use a different role")
-
-    value = json.dumps({"guildId": args.guild_id, "roles": mapping}, separators=(",", ":"))
+    mapping, command_roles = resolve_roles(roles, args.guild_id)
+    document = {"guildId": args.guild_id, "roles": mapping}
+    if command_roles:
+        document["commandRoles"] = command_roles
+    value = json.dumps(document, separators=(",", ":"))
     parameter = "/enshroudedproj/discord/password-access/" + args.guild_id
     print("Trusted password-access mapping (role IDs only):")
     print(json.dumps(json.loads(value), indent=2))
+    print()
+    print("Effective authorization per command:")
+    for line in preview_lines(mapping, command_roles):
+        print("  " + line)
+    print()
     if not args.apply:
         print("Preview only. Add --apply to write " + parameter)
         return

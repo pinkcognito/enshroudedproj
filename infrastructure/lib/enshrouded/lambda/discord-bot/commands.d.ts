@@ -10,6 +10,7 @@ export interface Command {
   description: string;
   type?: number;
   default_member_permissions?: string;
+  dm_permission?: boolean;
   options?: CommandOption[];
 }
 export const commands: Command[];

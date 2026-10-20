@@ -18,12 +18,20 @@ jest.mock('@aws-sdk/client-lambda', () => ({
   InvokeCommand: class { constructor(public input: unknown) {} },
 }), { virtual: true });
 
+// Authorization (WP-23) is covered in command-auth.test.ts. These tests are about the announcement
+// and count REST/SSM calls exactly, so the live-member gate is stubbed to allow here.
+jest.mock('../lib/enshrouded/lambda/discord-bot/password-access', () => ({
+  ...jest.requireActual('../lib/enshrouded/lambda/discord-bot/password-access'),
+  authorizeCommand: async () => ({ groups: ['visitor'] }),
+}));
+
 const guildId = '123456789012345678', userId = '234567890123456789', channelId = '345678901234567890';
 const configName = `/enshroudedproj/discord/status-channels/${guildId}`;
 const globalName = '/enshroudedproj/state/status-channel/global-rate-limit';
 const instanceId = 'i-enshrouded-test';
 const transition = { InstanceId: instanceId, PreviousState: { Name: 'stopped' }, CurrentState: { Name: 'pending' } };
-const event = { _internal: 'finish-start', interactionToken: 'interaction-secret', guildId, userId };
+const startRole = '901234567890123456';
+const event = { _internal: 'finish-start', interactionToken: 'interaction-secret', guildId, userId, roleIds: [startRole] };
 const channel = { id: channelId, guild_id: guildId, type: 0 };
 const parameters = new Map<string, string>();
 const oldEnv = process.env;
@@ -33,8 +41,8 @@ const response = (body: object, status = 200) => ({ ok: status >= 200 && status 
 const calls = (method: string) => jest.mocked(fetch).mock.calls.filter(([, options]) => options?.method === method);
 // The start path now reads/clears the WP-21 rotation parameters; these tests are about the
 // announcement, so ignore those two names (and only those) when asserting on SSM use.
-const announcementSsm = () => mockSsm.mock.calls.filter(([cmd]) =>
-  !/^\/enshroudedproj\/state\/(rotate-on-start|password-desync)$/.test(cmd.input.Name));
+const announcementSsm = () => mockSsm.mock.calls.filter(([cmd]) => !cmd.input.WithDecryption &&
+  !/^\/enshroudedproj\/(state\/(rotate-on-start|password-desync)|discord\/password-access\/\d+)$/.test(cmd.input.Name));
 const stopped = () => ({ Reservations: [{ Instances: [{ State: { Name: 'stopped' } }] }] });
 const expectBooting = () => {
   expect(calls('PATCH')).toHaveLength(1);
@@ -66,7 +74,7 @@ test('signed identity reaches worker without making start ephemeral; tampering i
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
   process.env.DISCORD_PUBLIC_KEY = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
   const body = JSON.stringify({ id: 'interaction', token: 'interaction-secret', type: 2, guild_id: guildId,
-    member: { user: { id: userId } }, user: { id: channelId },
+    member: { user: { id: userId }, roles: [startRole] }, user: { id: channelId },
     data: { name: 'enshrouded', options: [{ type: 1, name: 'start' }] } });
   const timestamp = '1700000000';
   const headers = { 'x-signature-timestamp': timestamp,
@@ -142,7 +150,12 @@ test.each([{ guild_id: userId }, { id: guildId }, { type: 5 }, { type: 11 }])('l
 });
 
 test.each(['read', 'lookup', 'post'])('notification %s failure preserves boot reply and sanitized logs', async (stage) => {
-  if (stage === 'read') mockSsm.mockRejectedValue(new Error('bot-secret https://discord.com/interaction-secret'));
+  if (stage === 'read') {
+    // Fail only the announcement's reads; the start authorization's own reads still succeed.
+    const send = mockSsm.getMockImplementation();
+    mockSsm.mockImplementation((command, options) => command.input.WithDecryption || /password-access/.test(command.input.Name)
+      ? send?.(command, options) : Promise.reject(new Error('bot-secret https://discord.com/interaction-secret')));
+  }
   else {
     jest.mocked(fetch).mockResolvedValueOnce(response({}));
     if (stage === 'post') jest.mocked(fetch).mockResolvedValueOnce(response(channel));
@@ -166,7 +179,8 @@ test('global cooldown prevents token lookup and all bot REST calls', async () =>
   parameters.set(globalName, JSON.stringify({ retryAt: Date.now() + 60000 }));
   await handler(event);
   expect(fetch).toHaveBeenCalledTimes(1);
-  expect(mockSsm.mock.calls.some(([cmd]) => cmd.input.WithDecryption)).toBe(false);
+  // Exactly one token read: the start authorization's. The announcement made none.
+  expect(mockSsm.mock.calls.filter(([cmd]) => cmd.input.WithDecryption)).toHaveLength(1);
 });
 
 test.each(['lookup', 'post'])('global 429 on %s persists cooldown without retries', async (stage) => {

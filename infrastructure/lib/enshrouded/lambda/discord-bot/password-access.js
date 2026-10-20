@@ -3,18 +3,29 @@ const { isSnowflake } = require('../shared/status-channel-config');
 
 const ACCESS_PREFIX = '/enshroudedproj/discord/password-access';
 const GROUPS = ['admin', 'friend', 'guest', 'visitor'];
+const COMMAND_ACTIONS = ['start', 'stop', 'update', 'backup'];
 
-/** Operator-owned String parameter; this module never writes mappings or reads secrets. */
+/** Operator-owned String parameter; this module never writes mappings or reads secrets.
+ * Uniqueness is enforced within `roles` only (7.5.1): commandRoles may deliberately reuse a tier
+ * role's id or each other's. Unknown keys in either object reject the whole mapping.
+ */
 function parseAccessMapping(parameterName, value) {
   try {
     const mapping = JSON.parse(value);
     if (!mapping || !isSnowflake(mapping.guildId) || parameterName !== `${ACCESS_PREFIX}/${mapping.guildId}` ||
-        Object.keys(mapping).some((key) => !['guildId', 'roles'].includes(key)) ||
+        Object.keys(mapping).some((key) => !['guildId', 'roles', 'commandRoles'].includes(key)) ||
         !mapping.roles || typeof mapping.roles !== 'object' || Array.isArray(mapping.roles)) return null;
     const entries = Object.entries(mapping.roles);
     if (entries.some(([group, id]) => !GROUPS.includes(group) || !isSnowflake(id)) ||
         new Set(entries.map(([, id]) => id)).size !== entries.length) return null;
-    return { guildId: mapping.guildId, roles: Object.fromEntries(entries) };
+    const result = { guildId: mapping.guildId, roles: Object.fromEntries(entries) };
+    if (mapping.commandRoles !== undefined) {
+      if (!mapping.commandRoles || typeof mapping.commandRoles !== 'object' || Array.isArray(mapping.commandRoles)) return null;
+      const commandEntries = Object.entries(mapping.commandRoles);
+      if (commandEntries.some(([action, id]) => !COMMAND_ACTIONS.includes(action) || !isSnowflake(id))) return null;
+      result.commandRoles = Object.fromEntries(commandEntries);
+    }
+    return result;
   } catch {
     return null;
   }
@@ -32,6 +43,42 @@ function headers(botToken) {
   return { Authorization: `Bot ${botToken}`, 'Content-Type': 'application/json', 'User-Agent': DISCORD_USER_AGENT };
 }
 
+/** The single implementation of the intersect-both-observations rule: the signature-verified
+ * roles carried in the request, intersected with a live GET of the member. Returns the role ids
+ * present in BOTH, or null on any failure. Shared by the knowledge path and the action path.
+ */
+async function liveMemberRoles(request, botToken, fetchRequest) {
+  const response = await fetchRequest(`${DISCORD_API}/guilds/${request.guildId}/members/${request.userId}`, {
+    method: 'GET', headers: headers(botToken), signal: AbortSignal.timeout(2000), redirect: 'error',
+  });
+  if (!response.ok) return null;
+  const member = await response.json();
+  if (member?.user?.id !== request.userId || !validRoles(member.roles) ||
+      (member.guild_id !== undefined && member.guild_id !== request.guildId)) return null;
+  return request.roleIds.filter((id) => member.roles.includes(id));
+}
+
+/** Authorization for an ACTION (7.5.2): one membership test against the single role id
+ * commandRoles[action]. No cascade, no admin implication, no fallback, nothing shared with the
+ * tier cascade except the live-member intersection. An absent mapping/commandRoles/key denies.
+ * On success `groups` is the caller's tier cascade (possibly empty) - information for the reply
+ * only; it never influences the decision.
+ */
+async function authorizeCommand(request, mapping, action, { botToken, fetch: fetchRequest = globalThis.fetch } = {}) {
+  try {
+    if (!COMMAND_ACTIONS.includes(action) || !validCaller(request) || typeof botToken !== 'string' || !botToken) return null;
+    const config = parseAccessMapping(`${ACCESS_PREFIX}/${request.guildId}`, JSON.stringify(mapping));
+    const roleId = config?.commandRoles?.[action];
+    if (!roleId || !request.roleIds.includes(roleId)) return null;
+    const live = await liveMemberRoles(request, botToken, fetchRequest);
+    if (!live || !live.includes(roleId)) return null;
+    const highest = GROUPS.findIndex((group) => live.includes(config.roles[group]));
+    return { guildId: request.guildId, userId: request.userId, groups: highest < 0 ? [] : GROUPS.slice(highest) };
+  } catch {
+    return null;
+  }
+}
+
 /** request identifiers/roleIds must come from an already signature-verified guild interaction.
  * No Administrator/ManageGuild bypass. A removed role cannot survive a stale signed request.
  * GET one member requires no privileged member-list intent; any lookup failure denies access.
@@ -41,17 +88,12 @@ async function authorizePasswordAccess(request, mapping, { botToken, fetch: fetc
     if (!validCaller(request) || typeof botToken !== 'string' || !botToken) return null;
     const config = parseAccessMapping(`${ACCESS_PREFIX}/${request.guildId}`, JSON.stringify(mapping));
     if (!config || !GROUPS.some((group) => request.roleIds.includes(config.roles[group]))) return null;
-    const response = await fetchRequest(`${DISCORD_API}/guilds/${request.guildId}/members/${request.userId}`, {
-      method: 'GET', headers: headers(botToken), signal: AbortSignal.timeout(2000), redirect: 'error',
-    });
-    if (!response.ok) return null;
-    const member = await response.json();
-    if (member?.user?.id !== request.userId || !validRoles(member.roles) ||
-        (member.guild_id !== undefined && member.guild_id !== request.guildId)) return null;
-    // Intersect both observations: newly granted roles require a fresh interaction;
-    // signed roles alone never grant access after removal from the live member.
+    const live = await liveMemberRoles(request, botToken, fetchRequest);
+    if (!live) return null;
+    // `live` is the intersection of both observations: newly granted roles require a fresh
+    // interaction; signed roles alone never grant access after removal from the live member.
     const highest = GROUPS.findIndex((group) =>
-      request.roleIds.includes(config.roles[group]) && member.roles.includes(config.roles[group]));
+      live.includes(config.roles[group]));
     return highest < 0 ? null : { guildId: request.guildId, userId: request.userId, groups: GROUPS.slice(highest) };
   } catch {
     // Never propagate raw fetch exceptions, response bodies, bot tokens, or passwords.
@@ -100,4 +142,4 @@ async function sendPasswordDm(request, access, passwords, { botToken, fetch: fet
   }
 }
 
-module.exports = { ACCESS_PREFIX, GROUPS, parseAccessMapping, authorizePasswordAccess, sendPasswordDm };
+module.exports = { ACCESS_PREFIX, GROUPS, COMMAND_ACTIONS, parseAccessMapping, authorizePasswordAccess, authorizeCommand, sendPasswordDm };
