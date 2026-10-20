@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as cdk from 'aws-cdk-lib/core';
 import { Template } from 'aws-cdk-lib/assertions';
 import { EnshroudedServerStack } from '../lib/enshrouded-server-stack';
@@ -177,6 +179,39 @@ describe('SSM namespace scoping (ARCHITECTURE §6.6.4)', () => {
       expect(actionsOf(s)).not.toContain('kms:Encrypt');
       expect(actionsOf(s)).not.toContain('kms:*');
     }
+  });
+
+  // 7.3.4: render-config.sh's PARAM_NAMES and the instance role's PARAMETER_ARN pin are two
+  // INDEPENDENT hardcoded lists that must describe the same set of SecureStrings, and nothing
+  // else makes them agree. This pin sits in the boot-critical path: a password parameter added to
+  // one list and not the other fails the render on EVERY boot with an AccessDenied the in-script
+  // retry cannot clear (it is not transient), and by invariant 1.12 the game then correctly
+  // refuses to start. Two lists that must agree is the shape that drifts, so this assertion -
+  // not care - is what keeps them together.
+  test('render-config.sh PARAM_NAMES and the instance role KMS pin describe the same SecureStrings (7.3.4)', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'render-config.sh'), 'utf8');
+    const block = /^PARAM_NAMES=\(([^)]*)\)/m.exec(sh);
+    expect(block).not.toBeNull();
+    const names = block![1]
+      .split(String.fromCharCode(10))
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+    // Every name the renderer reads must be one we have classified by type. A NEW entry here
+    // fails this, which is the point: that is where the author must decide whether it is a
+    // SecureString and therefore whether the pin above needs it too.
+    const STRING_READS = ['/enshroudedproj/server/name', '/enshroudedproj/server/slot-count'];
+    const SECURE_STRING_READS = ['admin', 'friend', 'guest', 'visitor'].map(
+      (g) => `/enshroudedproj/server/user-groups/${g}-password`,
+    );
+    expect([...names].sort()).toEqual([...STRING_READS, ...SECURE_STRING_READS].sort());
+
+    // Compare parameter NAMES rather than full ARNs, so account/region formatting in the
+    // synthesised template cannot make this pass or fail for the wrong reason.
+    const stmts = kmsStatements(statementsFor('enshrouded-server-instance')).filter((s) => s.Effect === 'Allow');
+    expect(stmts).toHaveLength(1);
+    const pinnedNames = flatList(paramArnCondition(stmts[0])).map((a) => a.replace(/^.*:parameter/, ''));
+    expect(pinnedNames.sort()).toEqual([...SECURE_STRING_READS].sort());
   });
 
   test('exactly one principal writes the password parameters: no role other than discord-bot holds ssm:PutParameter on them (6.6.4 item 9)', () => {

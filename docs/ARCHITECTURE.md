@@ -2621,6 +2621,45 @@ authorized through the function role's identity policy, and an identity-policy c
 *inference* from it plus the existing policy, which is sufficient here and is labelled as
 inference rather than dressed up as a documented mechanism.)
 
+##### The KMS surface is exactly five parameters — which is what makes the per-role pins checkable
+
+**VERIFIED** from the deployed account (`aws ssm describe-parameters`, 2026-10-19): the
+entire project contains **five** `SecureString` parameters and no others —
+`discord/bot-token` plus the four `server/user-groups/*-password`. Everything else, including
+`server/backup-bucket`, `server/data-volume-id`, `server/name`, `server/slot-count`,
+`server/auto-update-on-boot` and all of `state/*`, is a plain `String` and involves no KMS
+call whatsoever.
+
+This matters more than it looks: **a per-role `PARAMETER_ARN` pin is only checkable if the
+set of parameters that need decrypting is known and closed.** Five is that number. It is also
+the fact that retired the builder's open question about whether `backup-bucket` or
+`data-volume-id` might be SecureStrings — a single one hiding among them would have made the
+instance role's pin incomplete and failed at runtime where no test could see it.
+
+**The cost of the pins, stated because it is a new sharp edge and it will bite someone.**
+Before WP-26, adding a SecureString anywhere "just worked" under the broad grant. Now
+**adding a SecureString is a two-part change**: the parameter, *and* the `PARAMETER_ARN` list
+of whichever role reads it. Miss the second half and the read fails with a runtime
+`AccessDenied` that synth and unit tests cannot see. That is the right trade — it fails
+closed, loudly, at the point of use, where the alternative was a silent broad grant — but it
+is only the right trade if it is written down. Runbook item, next to the no-labels rule
+(§7.4.5).
+
+##### The three roles WP-26 pinned, and why the "every role" rewrite earned its keep
+
+| role | pinned `PARAMETER_ARN` list |
+| --- | --- |
+| `enshrouded-status-channel` | `discord/bot-token` |
+| `enshrouded-graceful-stop` | `discord/bot-token` |
+| `enshrouded-server-instance` | the four `server/user-groups/*-password` |
+
+**Three roles were unpinned, not one.** §6.6.4 item 6 and the original WP-26 row both named
+only `status-channel`, because that is the one a human had noticed. `graceful-stop` and
+`server-instance` were found by the rewrite from *"assert these roles"* to *"assert every
+role, with a named exemption list"* — which is the strongest available argument for writing
+that class of assertion as a scan with exemptions rather than as an enumeration. An
+enumeration would have passed, green, with two roles unpinned and nobody looking for them.
+
 ##### The bot's KMS grants as built, for the record
 
 ```
@@ -2678,8 +2717,11 @@ on SSM. Fewer privileges on the most exposed component, for no loss of function.
   (**VERIFIED**, §6.6.2a). What remains true: the **instance role's** `Resource: "*"` +
   `ViaService` grant is not a namespace boundary, and the `ssm:GetParameter` resource scope
   plus the explicit `Deny` on `discord/*` is what bounds it. The new Lambda grants in
-  §6.6.2a do use the encryption-context condition, and a future tightening of the instance
-  role's KMS statement is now a real option rather than a dead end.
+  §6.6.2a do use the encryption-context condition, and **the tightening of the instance
+  role's KMS statement is no longer a future option — WP-26 did it.** Every KMS grant in the
+  stack is now confined by `PARAMETER_ARN` context. The `ssm:GetParameter` resource scope
+  and the explicit `Deny` on `discord/*` remain the primary boundary; the context condition
+  is now a real second one rather than the dead end this bullet originally described.
 
 #### 6.6.4 Test
 
@@ -2702,12 +2744,17 @@ on SSM. Fewer privileges on the most exposed component, for no loss of function.
    ARNs, and `kms:Decrypt`'s is exactly those four **plus `discord/bot-token`** — five, no
    sixth (§6.6.2a). This is what keeps `Resource: "*"` honest.
 
-   **The assertion carries one named exemption, and the list must only ever shrink:**
-   `enshrouded-status-channel`, whose `kms:Decrypt` on `*` is still bounded by `ViaService`
-   plus its `ssm:GetParameter` scope alone. It is tracked as **WP-26**, and when that lands
-   the exemption is deleted and this assertion covers every role with no exceptions. An
-   exemption allowlist that is visible in the test and self-liquidating is honest; omitting
-   the role from the assertion's scope would hide the same gap.
+   **The exemption list is now EMPTY and the mechanism is deleted.** WP-26 pinned all three
+   roles that were exempt (§6.6.2a) and removed `KMS_PIN_EXEMPT_UNTIL_WP26` entirely, so
+   this assertion covers every role with no exceptions. **Do not reintroduce an exemption
+   constant to unblock a future change** — if a new role cannot be pinned, that is a design
+   question for this document, not a list to append to.
+
+   **The assertion also carries a vacuity floor: at least five KMS grants must exist for it
+   to pass.** Without it, "every KMS statement is pinned" is trivially satisfied by a stack
+   that has lost its KMS statements, or by a selector that matches nothing after a refactor —
+   a test that passes by scanning zero items is the exact failure class §11.1 warns about.
+   The floor is what makes the green meaningful.
 7. The `status-channel` role has **no** `server/` SSM resource at all.
 8. The instance role still has no `ssm:PutParameter` and no `kms:Encrypt`.
 9. **No principal other than `discord-bot` holds `ssm:PutParameter` on any of the four
@@ -2777,11 +2824,29 @@ point the dollar is clearly worth it.
    explicit `Deny` on `discord/*`. A CMK adds a *different* layer (key-policy
    authorisation, revocation); it does **not** strengthen the namespace boundary, and
    adopting one later would not let us relax §6.6.2.
-2. **The instance role's `kms:Decrypt` on `Resource: "*"` is a consequence of this
-   decision, not sloppiness.** The AWS-managed key has no stable ARN to scope to, so the
-   `ViaService` condition is the only available narrowing. **Adopting a CMK later would
-   let this be tightened to a specific key ARN** — worth listing as a concrete benefit
-   when the revisit triggers fire.
+2. **~~The instance role's `kms:Decrypt` on `Resource: "*"` is a consequence of this
+   decision, not sloppiness. The AWS-managed key has no stable ARN to scope to, so the
+   `ViaService` condition is the only available narrowing.~~ RETRACTED — 2026-10-19, and
+   this was the belief that kept three roles unpinned.**
+
+   The first sentence conflated **two different ARNs**: the **KMS key** ARN and the
+   **parameter** ARN. Only the first is unstable. The narrowing we actually wanted was
+   always available through `kms:EncryptionContext:PARAMETER_ARN`, which keys off the
+   *parameter* ARN — stable, known at synth time, and completely independent of which key
+   encrypts it. **WP-26 pinned all three remaining roles**, so `Resource: "*"` is now
+   confined by context on every KMS grant in the stack (§6.6.2a, §6.6.4 item 6).
+
+   The same conflation was written into code comments in `graceful-stop.ts` and `server.ts`
+   ("a SecureString under the AWS-managed key (no stable ARN)"); WP-26 corrected those too.
+   **The lesson worth keeping: "we cannot scope this" deserves one more question — *scope
+   it by what?*** Three roles stayed broad for weeks because the answer was assumed to be
+   "by key".
+
+   **What this does to the CMK decision: it survives, and is slightly stronger.** One of the
+   three benefits listed above — tightening `Resource: "*"` — has now been obtained *without*
+   a CMK and without the dollar. The two that remain are the genuinely CMK-only ones: a
+   **key policy** as an authorisation layer independent of IAM, and the **instant revocation
+   kill switch**. The revisit triggers are unchanged.
 
 **Cross-reference obligation:** `.trivyignore.yaml`'s **AWS-0132** suppression must cite
 **§6.6.5** by section number, so the suppression reads as "CMKs were considered
@@ -3139,6 +3204,21 @@ renderer should instead use **`ssm get-parameters --names <hardcoded list> --wit
 
 The renderer records **nothing** about the password values anywhere — not a hash, not a
 length, not a version number stored beside a value. See invariant §1.14.
+
+**WP-26 added a second way for this render to fail, and it is worth knowing about here rather
+than only in §6.6.** The instance role's `kms:Decrypt` is now pinned by
+`kms:EncryptionContext:PARAMETER_ARN` to exactly the four password ARNs. So the render now
+depends on that list being complete: **a fifth password parameter added to
+`render-config.sh`'s hardcoded name list but not to the CDK pin would fail the render on
+every boot**, with an `AccessDenied` the in-script retry cannot clear because it is not
+transient — and by §1.12 the game would then correctly refuse to start. Two independent
+hardcoded lists that must agree is exactly the shape that drifts, so **a test must assert
+that the renderer's parameter list and the instance role's pinned ARN list are the same
+set.** That assertion, not care, is what keeps them together. Net judgement: the pin is worth
+keeping — it is defence in depth against a future widening of the `server/*` SSM Allow, the
+same argument §6.6.3 makes for the explicit `Deny`, and it fails loudly rather than silently.
+But it is the one pin that can take the server down, so it is the one that must be confirmed
+on a real boot (WP-26).
 
 ---
 
@@ -4533,7 +4613,7 @@ cannot substitute for them — see §6.2.1a for why they cannot live in CDK.
 | **WP-24** | Readiness-time password DM in `boot-watcher`: carry `{guildId,userId,roleIds}` through the poll chain, re-authorize live at DM time, read the four SecureStrings then, DM the cascade with the ready message; no DM on give-up. IAM: read on the four ARNs + `kms:Decrypt` with the encryption-context condition. | `lambda/boot-watcher/index.js`, `lib/enshrouded/boot-watcher.ts`, tests | **WP-12**, WP-21 | Readiness failure produces **no DM** (asserted). A role removed during boot produces no DM. The DM content comes from an SSM read, not from the event payload (asserted: no password field exists on the payload type). A DM failure does not fail the start or the readiness PATCH. | **A** |
 | **WP-25** | **Spike, on the real box:** the password shape the game accepts (§7.4.6). Render a config whose passwords are **deliberately assembled at the true worst case — 29 characters for the player tiers, 39 for admin** (§7.4.2a; do **not** rely on a random draw to reach it), start the server, join with each tier. Record the maximum accepted length if the game reveals one. | a §7.4.6 result paragraph + the frozen shape constants (word count, max word length 9, separator) | WP-06 | The server starts and a client joins with each of the four tiers' passwords at full length. **And the truncation check: joining with a truncated prefix of the 39-character admin password must FAIL** — without it the spike proves nothing about silent truncation, which is the quieter and worse of the two failure modes (§7.4.6). If anything fails, WP-21's generator parameters change **before** rotation is enabled, not after. This WP is a **gate on setting `rotate-on-start=true`**. | **A** |
 
-| **WP-26** | Pin `enshrouded-status-channel`'s `kms:Decrypt` to the `discord/bot-token` ARN via `kms:EncryptionContext:PARAMETER_ARN`, and delete the named exemption from §6.6.4 item 6 so that assertion then covers every role. **Verified safe before it is written** — §6.6.2a's CloudTrail evidence shows this role's own bot-token read supplying exactly that context, and shows why its Lambda env-var decrypts are unaffected. | one statement in `lib/enshrouded/status-channel.ts`, one deletion in `test/ssm-scoping.test.ts` | WP-14, WP-21 | §6.6.4 item 6 passes with an **empty** exemption list. `/enshrouded channel` and the status reconciler still work after deploy — confirm against a real reconcile, not only against synth, because the failure mode is a runtime `AccessDenied` on the token read. | R — one line, deliberately **not** folded into WP-21: that WP is at its commit point with a green suite, and this touches a third role it otherwise never goes near. |
+| **WP-26** | Pin `kms:Decrypt` by `kms:EncryptionContext:PARAMETER_ARN` on **all three** remaining unpinned roles — `status-channel` and `graceful-stop` to `discord/bot-token`, `server-instance` to the four password ARNs — delete the `KMS_PIN_EXEMPT_UNTIL_WP26` mechanism entirely, and correct the KMS-ARN-vs-parameter-ARN conflation in the `graceful-stop.ts` and `server.ts` comments (§6.6.5 item 2). The row originally said "one statement in `status-channel.ts`"; the every-role rewrite of §6.6.4 item 6 found the other two (§6.6.2a). | statements in `status-channel.ts`, `graceful-stop.ts`, `server.ts`; `test/ssm-scoping.test.ts` | WP-14, WP-21 | §6.6.4 item 6 passes with an **empty** exemption list **and** its ≥5-grant vacuity floor. Then, because a missing ARN in a pin is invisible to synth and unit tests and surfaces only as a runtime `AccessDenied` on a SecureString read — **three runtime confirmations, none of which synth can substitute for:** (1) **a real boot of the instance**, since `server-instance`'s pin is now in the boot-critical path — an incomplete pin means `enshrouded-config.service` fails and the game refuses to start (§7.3.2), and the in-script retry cannot help because `AccessDenied` is not transient; (2) a real `/enshrouded channel` and a real status reconcile; (3) a real `graceful-stop` drain notification — **and while there, confirm the bot-token read is isolated so that a notification failure cannot abort the drain**, the same isolation the start-path announcement already has. `simulate-principal-policy` per role against the real contexts, plus CloudTrail confirmation of each `Decrypt`, is the evidence to report. | R to write, **A to verify** — it adds a new failure mode to the boot path. |
 
 **Sequencing that matters:** WP-21 may merge before WP-22 and WP-25, but **rotation must
 stay disabled via `state/rotate-on-start` until both have landed.** Rotation enabled without
