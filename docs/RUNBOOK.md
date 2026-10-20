@@ -438,3 +438,53 @@ A crash between message delivery and saving its marker can produce a duplicate m
   restarts the game and disconnects any players.
 - A deploy sets maintenance mode before and clears it after **including on failure**, so an
   aborted deploy cannot leave idle-shutdown permanently disabled.
+
+## 5. Password rollout and startup DMs
+
+After the boot-watcher PR is merged and its infrastructure workflow succeeds,
+`/enshrouded start` queues readiness tracking for a new stopped-to-pending transition.
+The worker confirms EC2/SSM connectivity, the game service and query socket, and a public
+A2S response. It then re-checks the starter's password roles and DMs only the permitted
+tier cascade. Closed DMs or removed roles never expose passwords in the channel or
+prevent the game from starting. Starts made outside Discord do not schedule a starter DM.
+
+**Rotation is separate from DM delivery.** The three-word player and four-word admin
+generator is deployed, but rotation stays off unless
+`/enshroudedproj/state/rotate-on-start` is exactly `true`. `/enshrouded pw` reads the
+existing values; it does not generate replacements. Old alphanumeric values remain
+valid until they are explicitly replaced or a validated rotation runs.
+
+Before enabling automatic rotation, complete ARCHITECTURE §7.4.6 / WP-25. The game must
+accept deliberately constructed 29-character player passwords and a 39-character admin
+password, allow a real client to join at each tier, and reject truncated admin prefixes
+and a same-length admin password with an incorrect final character. Successful host
+startup alone does not establish that passwords are compared without truncation.
+
+First verify the host has WP-22's `enshrouded-config.service`, current template, and
+`render-config.sh`, with the game unit requiring the config service. A merged CDK change
+does not install these host files. If they have not been applied, use the
+`deploy-game-server` workflow while the instance is running, then stop it normally before
+staging test credentials. Do not change the stored passwords while an older host can
+still start directly from a previously rendered config.
+
+From the repository root, preview the deliberately longest password shapes without
+printing any passwords or contacting AWS:
+
+```powershell
+python scripts/prepare-password-shape-test.py
+```
+
+Once the instance is fully stopped, an operator can stage the four test passwords:
+
+```powershell
+python scripts/prepare-password-shape-test.py --apply --instance-id i-02718657e8fed78b0
+```
+
+The helper checks the account, project tag, instance state, and disabled rotation switch.
+It never starts/stops the instance, renders a config, enables rotation, prints passwords,
+or records a test pass. If staging fails partway through, reconcile all four values while
+the instance remains stopped before starting the test. There is no automatic rollback.
+
+Start through Discord after the readiness worker deploys, get the credentials by DM,
+and perform the client checks above. Record the result in ARCHITECTURE §7.4.6 before an
+operator enables the switch. Do not enable rotation merely because the PR was merged.
