@@ -199,6 +199,8 @@ describe('handler: signature verification, PING, deferred ack', () => {
         type: 2,
         id: 'interaction-id',
         token: 'tok',
+        guild_id: '123456789012345678',
+        member: { user: { id: '234567890123456789' }, roles: ['901234567890123456'] },
         data: { name: 'enshrouded', options: [{ type: 1, name: 'start' }] },
       }),
     );
@@ -210,7 +212,8 @@ describe('handler: signature verification, PING, deferred ack', () => {
     expect(sentCommands).toHaveLength(1);
     const input = (sentCommands[0] as { input: { InvocationType: string; Payload: string } }).input;
     expect(input.InvocationType).toBe('Event');
-    expect(JSON.parse(input.Payload)).toEqual({ _internal: 'finish-start', interactionToken: 'tok' });
+    expect(JSON.parse(input.Payload)).toEqual({ _internal: 'finish-start', interactionToken: 'tok',
+      guildId: '123456789012345678', userId: '234567890123456789', roleIds: ['901234567890123456'] });
   });
 
   test('/enshrouded status acks with a deferred response', async () => {
@@ -228,6 +231,7 @@ describe('handler: signature verification, PING, deferred ack', () => {
 
   function commandEvent() {
     return signedEvent({ id: 'interaction-id', type: 2, token: 'secret-token',
+      guild_id: '123456789012345678', member: { user: { id: '234567890123456789' }, roles: [] },
       data: { name: 'enshrouded', options: [{ type: 1, name: 'start' }] } });
   }
 

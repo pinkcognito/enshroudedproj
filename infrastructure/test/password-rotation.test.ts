@@ -52,7 +52,9 @@ const fetchCalls = (method: string) => jest.mocked(fetch).mock.calls.filter(([, 
 const edits = () => fetchCalls('PATCH').map(([, o]) => JSON.parse(o?.body as string).content as string);
 const dms = () => fetchCalls('POST').filter(([u]) => String(u).includes(`/channels/${dmId}/messages`))
   .map(([, o]) => JSON.parse(o?.body as string).content as string);
-const startEvent = { _internal: 'finish-start', interactionToken: 'interaction-secret', guildId, userId };
+const startRole = '901234567890123456';
+const startEvent = { _internal: 'finish-start', interactionToken: 'interaction-secret', guildId, userId,
+  roleIds: [startRole, ...Object.values(roles)] };
 const pwEvent = (roleIds: string[] = Object.values(roles)) =>
   ({ _internal: 'finish-pw', interactionToken: 'interaction-secret', guildId, userId, roleIds });
 
@@ -63,7 +65,7 @@ beforeEach(() => {
   ({ handler } = jest.requireActual('../lib/enshrouded/lambda/discord-bot/index'));
   parameters.clear(); unreadable.clear(); ssmLog.length = 0; order.length = 0;
   parameters.set(`${P}/discord/bot-token`, 'bot-secret');
-  parameters.set(`${P}/discord/password-access/${guildId}`, JSON.stringify({ guildId, roles }));
+  parameters.set(`${P}/discord/password-access/${guildId}`, JSON.stringify({ guildId, roles, commandRoles: { start: startRole } }));
   for (const g of Object.keys(LIVE)) parameters.set(PW(g), LIVE[g as keyof typeof LIVE]);
   mockEc2.mockReset().mockImplementation(async (command: { constructor: { name: string } }) => {
     order.push(command.constructor.name);
@@ -87,7 +89,7 @@ beforeEach(() => {
   failPutOn = undefined;
   jest.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
     const u = String(url);
-    if (u.includes('/guilds/') && u.includes('/members/')) return response({ user: { id: userId }, roles: Object.values(roles) });
+    if (u.includes('/guilds/') && u.includes('/members/')) return response({ user: { id: userId }, roles: [startRole, ...Object.values(roles)] });
     if (u.endsWith('/users/@me/channels')) return response({ id: dmId, type: 1, recipients: [{ id: userId }] });
     if (u.includes('/messages') && init?.method === 'POST') return response({});
     if (u.includes(`/channels/${channelId}`)) return response({ id: channelId, guild_id: guildId, type: 0 });

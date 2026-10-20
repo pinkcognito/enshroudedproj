@@ -214,3 +214,65 @@ describe('password delivery only to the signed caller DM', () => {
 test('GROUPS is privilege-descending: reordering it grants visitors the admin password (§1.16)', () => {
   expect(GROUPS).toEqual(['admin', 'friend', 'guest', 'visitor']);
 });
+
+describe('commandRoles (7.5.1)', () => {
+  const startId = '901234567890123456', stopId = '912345678901234567';
+  const withCommands = (commandRoles: unknown) => ({ guildId, roles, commandRoles });
+
+  test('accepts commandRoles, and each key within it is optional', () => {
+    expect(parseAccessMapping(parameter, JSON.stringify(withCommands({ start: startId, stop: stopId }))))
+      .toEqual(withCommands({ start: startId, stop: stopId }));
+    expect(parseAccessMapping(parameter, JSON.stringify(withCommands({})))).toEqual(withCommands({}));
+    expect(parseAccessMapping(parameter, JSON.stringify(withCommands({ backup: startId, update: stopId }))))
+      .toEqual(withCommands({ backup: startId, update: stopId }));
+  });
+
+  test('uniqueness is enforced within roles only: commandRoles may reuse a tier id, and each other', () => {
+    const value = withCommands({ start: roles.admin, stop: roles.admin, update: roles.admin });
+    expect(parseAccessMapping(parameter, JSON.stringify(value))).toEqual(value);
+    expect(parseAccessMapping(parameter, JSON.stringify(withCommands({ start: startId, stop: startId }))))
+      .toEqual(withCommands({ start: startId, stop: startId }));
+    expect(parseAccessMapping(parameter, JSON.stringify({ guildId, roles: { admin: roles.admin, friend: roles.admin } })))
+      .toBeNull();
+  });
+
+  test.each([null, 'start', [], [startId], { reboot: startId }, { start: 'start' }, { start: 1 },
+    { start: startId + '\n' }, { start: '' }, { start: startId, Start: startId }])(
+    'rejects the whole mapping for invalid commandRoles: %j', (commandRoles) => {
+      expect(parseAccessMapping(parameter, JSON.stringify(withCommands(commandRoles)))).toBeNull();
+    });
+});
+
+describe('authorizeCommand: a single membership test, no cascade, no admin implication', () => {
+  const { authorizeCommand } = jest.requireActual('../lib/enshrouded/lambda/discord-bot/password-access');
+  const startId = '901234567890123456';
+  const config = { guildId, roles, commandRoles: { start: startId } };
+  const live = (roleIds: string[]) => jest.fn().mockResolvedValue(response({ user: { id: userId }, roles: roleIds }));
+
+  test('start-role holder is authorized; groups report the tier cascade for the reply only', async () => {
+    const both = live([startId, roles.friend]);
+    expect(await authorizeCommand(caller([startId, roles.friend]), config, 'start', { botToken, fetch: both }))
+      .toEqual({ guildId, userId, groups: ['friend', 'guest', 'visitor'] });
+    const only = live([startId]);
+    expect(await authorizeCommand(caller([startId]), config, 'start', { botToken, fetch: only }))
+      .toEqual({ guildId, userId, groups: [] });
+  });
+
+  test('every tier role without the start role is denied before any REST call', async () => {
+    const fetch = live(Object.values(roles));
+    expect(await authorizeCommand(caller(Object.values(roles)), config, 'start', { botToken, fetch })).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test('an action whose key is absent is denied to everyone, even holders of other action roles', async () => {
+    const fetch = live([startId]);
+    for (const action of ['stop', 'update', 'backup', 'channel']) {
+      expect(await authorizeCommand(caller([startId]), config, action, { botToken, fetch })).toBeNull();
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test('role removed between the signed payload and the live fetch denies', async () => {
+    expect(await authorizeCommand(caller([startId]), config, 'start', { botToken, fetch: live([]) })).toBeNull();
+  });
+});

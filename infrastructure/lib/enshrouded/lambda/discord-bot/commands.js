@@ -17,6 +17,7 @@ const commands = [
   {
     name: 'enshrouded',
     description: 'Control the Enshrouded server',
+    dm_permission: false, // guild-only: authorization needs member.roles (7.5.2)
     options: [
       {
         type: OPTION_TYPE.SUB_COMMAND,
