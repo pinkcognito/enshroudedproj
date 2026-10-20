@@ -448,43 +448,56 @@ A2S response. It then re-checks the starter's password roles and DMs only the pe
 tier cascade. Closed DMs or removed roles never expose passwords in the channel or
 prevent the game from starting. Starts made outside Discord do not schedule a starter DM.
 
-**Rotation is separate from DM delivery.** The three-word player and four-word admin
-generator is deployed, but rotation stays off unless
-`/enshroudedproj/state/rotate-on-start` is exactly `true`. `/enshrouded pw` reads the
-existing values; it does not generate replacements. Old alphanumeric values remain
-valid until they are explicitly replaced or a validated rotation runs.
+**Current user-directed format:** every role gets an independently generated random
+16-character password using only `A–Z`, `a–z`, and `0–9`, selected with a CSPRNG.
+This supersedes the three-word player/four-word admin design and the old 39/29-character
+WP-25 spike. The new code/helper must be deployed before using this rollout; this text
+does not claim deployment or a successful client test.
 
-Before enabling automatic rotation, complete ARCHITECTURE §7.4.6 / WP-25. The game must
-accept deliberately constructed 29-character player passwords and a 39-character admin
-password, allow a real client to join at each tier, and reject truncated admin prefixes
-and a same-length admin password with an incorrect final character. Successful host
-startup alone does not establish that passwords are compared without truncation.
+**Rotation is separate from DM delivery and remains OFF during validation.**
+`/enshrouded pw` reads the stored values; it does not generate replacements. Rotation
+runs only when `/enshroudedproj/state/rotate-on-start` is exactly `true`; do not enable
+it merely because this PR merges.
+
+**REPORTED, UNCONFIRMED (live user/operator report):** the old admin39 join failed,
+friend29 succeeded, and the admin's 32-character prefix failed. Host comparison reported
+all rendered values equal to live SSM at lengths 39/29/29/29. The reason for the admin
+failure and the game's maximum accepted password length remain unconfirmed. These
+observations do not establish acceptance of the new 16-character values.
 
 First verify the host has WP-22's `enshrouded-config.service`, current template, and
 `render-config.sh`, with the game unit requiring the config service. A merged CDK change
 does not install these host files. If they have not been applied, use the
-`deploy-game-server` workflow while the instance is running, then stop it normally before
-staging test credentials. Do not change the stored passwords while an older host can
-still start directly from a previously rendered config.
+`deploy-game-server` workflow while the instance is running, then stop through the
+normal save-verified path before staging credentials. Do not overwrite passwords under
+a running game or while an older host can start directly from stale config.
 
-From the repository root, preview the deliberately longest password shapes without
-printing any passwords or contacting AWS:
+After the generator/helper update is deployed, preview the existing helper offline:
 
 ```powershell
 python scripts/prepare-password-shape-test.py
 ```
 
-Once the instance is fully stopped, an operator can stage the four test passwords:
+Expect lengths **16/16/16/16**, with no password output. If the helper still shows
+39/29/29/29, it is obsolete: do not apply it. Once the instance is fully stopped, stage
+four independent values with the updated helper:
 
 ```powershell
 python scripts/prepare-password-shape-test.py --apply --instance-id i-02718657e8fed78b0
 ```
 
-The helper checks the account, project tag, instance state, and disabled rotation switch.
-It never starts/stops the instance, renders a config, enables rotation, prints passwords,
-or records a test pass. If staging fails partway through, reconcile all four values while
-the instance remains stopped before starting the test. There is no automatic rollback.
+The helper retains account/instance/tag/switch checks and the five-second stopped-state
+freshness guard immediately before each write. It does not start/stop the instance,
+render config, enable rotation, print passwords, or record a client-test pass. Writes
+are not atomic against competing starts. If staging fails partway, reconcile all four
+values while stopped before starting; there is no automatic rollback.
 
-Start through Discord after the readiness worker deploys, get the credentials by DM,
-and perform the client checks above. Record the result in ARCHITECTURE §7.4.6 before an
-operator enables the switch. Do not enable rotation merely because the PR was merged.
+On the next normal Discord startup, verify host lengths 16/16/16/16 and exact
+rendered-config/live-SSM equality without printing values or hashes. Obtain credentials
+by authorized private DM and confirm a fresh real-client join with the 16-character
+admin credential. Record other tier results only if actually tested. Record the outcome
+in ARCHITECTURE §7.4.6; the abandoned word-password spike is not a prerequisite.
+
+**Still unfinished:** deployment confirmation, the new-format host/client check, and
+rotation activation. Keep rotation OFF until deployment, correct host rendering, and
+the 16-character client check succeed; enabling it afterward is a separate operator step.
