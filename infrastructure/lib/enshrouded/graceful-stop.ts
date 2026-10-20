@@ -101,12 +101,19 @@ export class GracefulStop extends Construct {
         resources: [ssmParamArn('state/*'), ssmParamArn('state')],
       }),
     );
-    // The bot token is a SecureString under the AWS-managed key (no stable ARN); ViaService narrows it.
+    // WP-26: the bot token is the only SecureString this role reads (state/last-player-seen is a
+    // String). The AWS-managed KEY has no stable ARN, but the PARAMETER does, and SSM supplies it
+    // as the PARAMETER_ARN encryption context - so the decrypt is pinned to that one parameter.
     this.role.addToPolicy(
       new iam.PolicyStatement({
         actions: ['kms:Decrypt'],
         resources: ['*'],
-        conditions: { StringEquals: { 'kms:ViaService': `ssm.${stack.region}.amazonaws.com` } },
+        conditions: {
+          StringEquals: {
+            'kms:ViaService': `ssm.${stack.region}.amazonaws.com`,
+            'kms:EncryptionContext:PARAMETER_ARN': [ssmParamArn('discord/bot-token')],
+          },
+        },
       }),
     );
     // PutMetricData has no resource-level permissions; confine it to our namespace.

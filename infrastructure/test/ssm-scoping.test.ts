@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as cdk from 'aws-cdk-lib/core';
 import { Template } from 'aws-cdk-lib/assertions';
 import { EnshroudedServerStack } from '../lib/enshrouded-server-stack';
@@ -132,41 +134,84 @@ describe('SSM namespace scoping (ARCHITECTURE §6.6.4)', () => {
   });
 
   // Item 6, part 2: EVERY role in the stack, not a remembered list, so a fourth principal
-  // cannot arrive unpinned. The exemption list is exact and may only ever SHRINK.
-  // enshrouded-status-channel: kms:Decrypt on * bounded by ViaService only. Removed by WP-26.
-  // All three hold kms:Decrypt on * bounded by ViaService only. WP-26 pins them and empties
-  // this list. Each entry is named so a FOURTH unpinned role cannot arrive quietly, and the
-  // list may only ever SHRINK - never add to it to make a new role pass.
-  //
-  // graceful-stop and server-instance were found BY this assertion. Item 6 previously
-  // enumerated remembered roles, which is exactly how these two stayed invisible.
-  //
-  // They ARE pinnable. graceful-stop.ts says the bot token is "a SecureString under the
-  // AWS-managed key (no stable ARN)", which conflates the KMS KEY arn (AWS-managed, no stable
-  // arn) with the PARAMETER arn. kms:EncryptionContext:PARAMETER_ARN pins the parameter, and
-  // CloudTrail confirms SSM supplies it as the SOLE context key with the full parameter arn
-  // (enshrouded-status-channel, 2026-10-19T22:54:46Z). The premise that blocked pinning is
-  // false, so WP-26 closes a real gap rather than a cosmetic one.
-  const KMS_PIN_EXEMPT_UNTIL_WP26 = [
-    'enshrouded-status-channel',
-    'enshrouded-graceful-stop',
-    'enshrouded-server-instance',
-  ];
-  test('every role in the stack pins its KMS grants with PARAMETER_ARN, except the exact WP-26 exemption list (6.6.4 item 6)', () => {
+  // cannot arrive unpinned. WP-26 is done: there is no exemption list. Do not add one.
+  // (The old graceful-stop.ts comment claimed the AWS-managed key's lack of a stable ARN
+  // prevented pinning. That conflated the KEY arn with the PARAMETER arn; PARAMETER_ARN pins
+  // the parameter, verified from CloudTrail 2026-10-19T22:54:46Z.)
+  test('every role in the stack pins every kms:Encrypt/Decrypt grant with PARAMETER_ARN, no exemptions (6.6.4 item 6)', () => {
     const roleNames = new Map<string, string>();
     for (const [id, r] of Object.entries(template.findResources('AWS::IAM::Role'))) {
       roleNames.set(id, (r.Properties.RoleName as string) ?? id);
     }
     const unpinned = new Set<string>();
+    let kmsGrants = 0;
     for (const policy of Object.values(template.findResources('AWS::IAM::Policy'))) {
       const attached = (policy.Properties.Roles as { Ref: string }[]).map((r) => roleNames.get(r.Ref) ?? r.Ref);
       for (const s of policy.Properties.PolicyDocument.Statement as Statement[]) {
         if (s.Effect !== 'Allow') continue;
         const kms = actionsOf(s).some((a) => a === 'kms:Encrypt' || a === 'kms:Decrypt' || a === 'kms:*' || a === '*');
-        if (kms && paramArnCondition(s) === undefined) attached.forEach((n) => unpinned.add(n));
+        if (!kms) continue;
+        kmsGrants++;
+        if (paramArnCondition(s) === undefined) attached.forEach((n) => unpinned.add(n));
       }
     }
-    expect([...unpinned].sort()).toEqual([...KMS_PIN_EXEMPT_UNTIL_WP26].sort());
+    expect(kmsGrants).toBeGreaterThanOrEqual(5);
+    expect([...unpinned]).toEqual([]);
+  });
+
+  // WP-26: exact pinned sets, each justified from the role's actual SecureString reads.
+  const SECURE_READS: Record<string, string[]> = {
+    // getBotToken only; discord/status-channels/* and state/* are String reads.
+    'enshrouded-status-channel': [BOT_TOKEN_ARN],
+    // getBotToken only; state/last-player-seen is a String.
+    'enshrouded-graceful-stop': [BOT_TOKEN_ARN],
+    // render-config.sh: the four tier passwords; server/name and server/slot-count are Strings.
+    'enshrouded-server-instance': PASSWORD_ARNS,
+  };
+  test.each(Object.keys(SECURE_READS))('%s: kms:Decrypt pinned to exactly its SecureString reads, ViaService kept, no kms:Encrypt (WP-26)', (roleName) => {
+    const stmts = kmsStatements(statementsFor(roleName)).filter((s) => s.Effect === 'Allow');
+    expect(stmts).toHaveLength(1);
+    expect(actionsOf(stmts[0])).toEqual(['kms:Decrypt']);
+    expect(flatList(paramArnCondition(stmts[0]))).toEqual([...SECURE_READS[roleName]].sort());
+    const cond = (stmts[0] as unknown as { Condition: { StringEquals: Record<string, unknown> } }).Condition.StringEquals;
+    expect(cond['kms:ViaService']).toBe('ssm.us-east-2.amazonaws.com');
+    for (const s of statementsFor(roleName)) {
+      expect(actionsOf(s)).not.toContain('kms:Encrypt');
+      expect(actionsOf(s)).not.toContain('kms:*');
+    }
+  });
+
+  // 7.3.4: render-config.sh's PARAM_NAMES and the instance role's PARAMETER_ARN pin are two
+  // INDEPENDENT hardcoded lists that must describe the same set of SecureStrings, and nothing
+  // else makes them agree. This pin sits in the boot-critical path: a password parameter added to
+  // one list and not the other fails the render on EVERY boot with an AccessDenied the in-script
+  // retry cannot clear (it is not transient), and by invariant 1.12 the game then correctly
+  // refuses to start. Two lists that must agree is the shape that drifts, so this assertion -
+  // not care - is what keeps them together.
+  test('render-config.sh PARAM_NAMES and the instance role KMS pin describe the same SecureStrings (7.3.4)', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'render-config.sh'), 'utf8');
+    const block = /^PARAM_NAMES=\(([^)]*)\)/m.exec(sh);
+    expect(block).not.toBeNull();
+    const names = block![1]
+      .split(String.fromCharCode(10))
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+    // Every name the renderer reads must be one we have classified by type. A NEW entry here
+    // fails this, which is the point: that is where the author must decide whether it is a
+    // SecureString and therefore whether the pin above needs it too.
+    const STRING_READS = ['/enshroudedproj/server/name', '/enshroudedproj/server/slot-count'];
+    const SECURE_STRING_READS = ['admin', 'friend', 'guest', 'visitor'].map(
+      (g) => `/enshroudedproj/server/user-groups/${g}-password`,
+    );
+    expect([...names].sort()).toEqual([...STRING_READS, ...SECURE_STRING_READS].sort());
+
+    // Compare parameter NAMES rather than full ARNs, so account/region formatting in the
+    // synthesised template cannot make this pass or fail for the wrong reason.
+    const stmts = kmsStatements(statementsFor('enshrouded-server-instance')).filter((s) => s.Effect === 'Allow');
+    expect(stmts).toHaveLength(1);
+    const pinnedNames = flatList(paramArnCondition(stmts[0])).map((a) => a.replace(/^.*:parameter/, ''));
+    expect(pinnedNames.sort()).toEqual([...SECURE_STRING_READS].sort());
   });
 
   test('exactly one principal writes the password parameters: no role other than discord-bot holds ssm:PutParameter on them (6.6.4 item 9)', () => {

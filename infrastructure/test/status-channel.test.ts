@@ -408,7 +408,7 @@ test('construct synthesizes runtime, scoped IAM, tags, assets and minute/event w
     expect.objectContaining({ Action: 'ssm:GetParametersByPath', Resource: [arn('discord/status-channels'), arn('discord/status-channels/*')] }),
     expect.objectContaining({ Action: 'ssm:GetParameter', Resource: [arn('discord/bot-token'), arn('discord/status-channels/*')] }),
     expect.objectContaining({ Action: ['ssm:GetParameter', 'ssm:PutParameter'], Resource: arn('state/status-channel/*') }),
-    expect.objectContaining({ Action: 'kms:Decrypt', Resource: '*', Condition: { StringEquals: { 'kms:ViaService': 'ssm.us-east-2.amazonaws.com' } } }),
+    expect.objectContaining({ Action: 'kms:Decrypt', Resource: '*', Condition: { StringEquals: { 'kms:ViaService': 'ssm.us-east-2.amazonaws.com', 'kms:EncryptionContext:PARAMETER_ARN': [arn('discord/bot-token')] } } }),
     expect.objectContaining({ Action: 'ec2:DescribeInstances', Resource: '*' }),
   ]));
   expect(statements).toHaveLength(5);
