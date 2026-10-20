@@ -9,7 +9,7 @@ type Statement = {
   Condition?: Record<string, Record<string, unknown>>;
 };
 
-const app = new cdk.App({ context: { discordApplicationId: '123456789012345678' } });
+const app = new cdk.App({ context: { discordApplicationId: '111111111111111111' } });
 cdk.Tags.of(app).add('project', 'enshroudedproj');
 cdk.Tags.of(app).add('repo', 'pinkcognito/enshroudedproj');
 const stack = new EnshroudedServerStack(app, 'EnshroudedServerStack', {
@@ -75,7 +75,7 @@ describe('boot-watcher infrastructure and least privilege', () => {
       Handler: 'boot-watcher/index.handler',
       Environment: { Variables: {
         INSTANCE_ID: stack.resolve(stack.server.instance.instanceId),
-        DISCORD_APPLICATION_ID: process.env.DISCORD_APPLICATION_ID ?? '123456789012345678',
+        DISCORD_APPLICATION_ID: process.env.DISCORD_APPLICATION_ID ?? '111111111111111111',
         BOT_TOKEN_PARAM: '/enshroudedproj/discord/bot-token',
       } },
     });

@@ -57,7 +57,7 @@ beforeEach(() => {
   jest.useFakeTimers({ now: base });
   jest.clearAllMocks();
   process.env.INSTANCE_ID = instanceId;
-  process.env.DISCORD_APPLICATION_ID = '890123456789012345';
+  process.env.DISCORD_APPLICATION_ID = '111111111111111111';
   mockEc2.mockReset().mockResolvedValue(ec2Response());
   mockSsm.mockReset().mockImplementation(async ({ kind }: { kind: string }) => {
     if (kind === 'online') return { InstanceInformationList: [{ InstanceId: instanceId, PingStatus: 'Online' }] };
