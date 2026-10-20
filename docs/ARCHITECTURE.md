@@ -130,7 +130,9 @@ happens to this architecture under each way WP-07 could come back.
     **not** credited against this floor (§7.4.1 shows the arithmetic: rotation does not
     reduce cumulative brute-force risk). **No digest, hash, truncation or fingerprint of a
     password may be written to any parameter, file, log, metric or metric dimension** — at
-    38 bits a digest is an offline-crackable copy of the password itself.
+    38 bits a digest is an offline-crackable copy of the password itself. **The floor
+    outranks every other generator preference**, including any word-length cap: if the two
+    conflict, the cap yields (§7.4.2a).
 15. **Every command with a side effect is authorized against the per-guild role mapping,
     re-checked live against Discord inside the deferred half, before the first side
     effect.** A missing, unparseable or incomplete mapping **denies**; it never fails
@@ -2428,7 +2430,7 @@ boundary** — each one maps to exactly one answer to "who is allowed to see thi
 | `/enshroudedproj/server/user-groups/visitor-password` | **SecureString** | " |
 | `/enshroudedproj/discord/bot-token` | **SecureString** | Bot token |
 | `/enshroudedproj/discord/password-access/<guildId>` | String | **Operator-owned** JSON: `{guildId, roles{admin,friend,guest,visitor}, commandRoles{start,stop,update,backup}}` — Discord role ids, nonsecret. Written only by `scripts/configure-password-roles.py` under operator credentials; **no Lambda writes it** (§7.5.1). |
-| `/enshroudedproj/state/rotate-on-start` | String | `true`/`false`, default `true`. Operator kill switch for rotation (§7.4.5). Lives under `state/` and **not** `server/`, deliberately: §6.6.1's rule is that the prefix is the trust boundary, and the only consumer is a Lambda. Do not "align" it with `server/auto-update-on-boot`, which is there because the *box* reads it. |
+| `/enshroudedproj/state/rotate-on-start` | String | **Rotation runs only when this is the exact string `true`.** Absent, malformed, unreadable or any other value means **do not rotate** — and the parameter is deliberately **not created** by CDK or by seeding, so the shipped state is off until an operator turns it on (§7.4.5). Operator kill switch for rotation. Lives under `state/` and **not** `server/`, deliberately: §6.6.1's rule is that the prefix is the trust boundary, and the only consumer is a Lambda. Do not "align" it with `server/auto-update-on-boot`, which is there because the *box* reads it. |
 | `/enshroudedproj/state/password-desync` | String | `none`, or JSON `{detectedAt, previousState}`. **FACT**, one writer (the rotate path), one meaning: *the last rotation could not be shown to precede the running session's config render.* Set when `StartInstances` returns `PreviousState != 'stopped'` after the four writes; cleared on any rotation whose `PreviousState == 'stopped'`. Consumed only by `/enshrouded pw` (§7.4.4) and an alarm. |
 | `/enshroudedproj/state/maintenance-mode` | String | `true`/`false` |
 | `/enshroudedproj/state/last-active` | String | Epoch ms |
@@ -2578,6 +2580,60 @@ Developer Guide, *AWS KMS encryption for Parameter Store SecureString parameters
   listing exactly the four password ARNs — so a KMS statement that is textually
   `Resource: "*"` is still confined to four named parameters.
 
+**Correction — "both new KMS grants carry the condition" was true but incomplete, and a
+reader would draw the wrong conclusion from it.** The *new* `kms:Encrypt`/`kms:Decrypt`
+statement is pinned by encryption context. The **pre-existing `kms:Decrypt` on `Resource: "*"`
+with only the `ViaService` condition is unchanged and unpinned**, because `discord-bot` still
+needs it to decrypt `discord/bot-token`. So the bot's Decrypt as a whole is bounded by the
+`ssm:GetParameter` resource scope — a genuine bound, but not the one the paragraph above
+implies. Stated rather than left to be inferred.
+
+**Ruling: pin it, inside WP-21.** The bot reads exactly **five** SecureStrings —
+`discord/bot-token` plus the four passwords. Everything else it reads (`password-access/*`,
+`status-channels/*`, all of `state/*`) is a String and involves no KMS call at all. So the
+condition's value list is complete at five ARNs, which is small enough that leaving one
+unpinned `Resource: "*"` statement beside a freshly pinned one would make the pinned one look
+decorative. The test must assert the list equals **exactly those five**, so that a future
+component adding a sixth SecureString read fails loudly at the assertion instead of silently
+widening the grant.
+
+##### The encryption-context pin is now VERIFIED from a live call, not only from documentation
+
+This was the riskiest claim in this subsection — pinning `kms:Decrypt` on `PARAMETER_ARN`
+would break `getBotToken`, and therefore `channel`, `status` **and** `pw`, if a bot-token read
+did not supply that context. **VERIFIED from a CloudTrail event, 2026-10-19T22:54:46Z:**
+principal `enshrouded-status-channel`, a real `Decrypt` reading the real bot token, with
+`PARAMETER_ARN` as the **sole** context key and the value being the **full parameter ARN**
+(`arn:aws:ssm:us-east-2:334953720182:parameter/enshroudedproj/discord/bot-token` — the ARN
+form §6.6.3 warns about getting wrong). The design no longer rests on the documentation alone.
+
+**And the trap the pin could have sprung, recorded because a reasonable reviewer would
+otherwise block the change.** The same CloudTrail output shows other `Decrypt` events for
+that role carrying `keys=['aws:lambda:FunctionArn']` — Lambda environment-variable
+decryption — seconds apart from the `PARAMETER_ARN` one. Seeing that, a reviewer would
+reasonably conclude that pinning Decrypt to `PARAMETER_ARN` must break cold starts.
+
+It does not, and the evidence is already in hand: that role's **only** `kms:Decrypt` grant is
+conditioned on `ViaService=ssm.us-east-2.amazonaws.com`, which could never permit an
+`aws:lambda:FunctionArn` decrypt — **yet the function works today.** So that decrypt is not
+authorized through the function role's identity policy, and an identity-policy condition on
+`PARAMETER_ARN` cannot affect it. (The observation is **VERIFIED**; the conclusion is an
+*inference* from it plus the existing policy, which is sufficient here and is labelled as
+inference rather than dressed up as a documented mechanism.)
+
+##### The bot's KMS grants as built, for the record
+
+```
+ssm:GetParameter  -> the 4 password ARNs
+ssm:PutParameter  -> the 4 password ARNs
+kms:Encrypt  on * -> ViaService=ssm..., PARAMETER_ARN in [4 password ARNs]
+kms:Decrypt  on * -> ViaService=ssm..., PARAMETER_ARN in [bot-token + the 4 passwords]
+```
+
+**Two separate statements, deliberately: `kms:Encrypt` cannot reach the bot token.** Nothing
+in this project needs to encrypt that parameter, and a single merged statement would have
+granted it for free. Keep them split.
+
 **Two principals now hold password read where one held it before.** That is a real
 widening, stated rather than buried. What bounds it: four named ARNs, no prefix, no
 `server/` parameter other than those four, write held by one principal only, and the KMS
@@ -2639,12 +2695,26 @@ on SSM. Fewer privileges on the most exposed component, for no loss of function.
    than those four, and no `discord/` ARN other than the `status-channels/*` subtree.
 5. The `boot-watcher` role has the same four `server/` read ARNs and **no**
    `ssm:PutParameter` on any `server/` ARN.
-6. Every `kms:Encrypt`/`kms:Decrypt` statement that exists to serve a password parameter
-   carries a `kms:EncryptionContext:PARAMETER_ARN` condition whose value list is exactly
-   those four parameter ARNs (§6.6.2a). A KMS statement without the condition fails the
-   test — this is the assertion that keeps `Resource: "*"` honest.
+6. **Every role in the stack** that holds `kms:Encrypt` or `kms:Decrypt` carries a
+   `kms:EncryptionContext:PARAMETER_ARN` condition — asserted across all roles, **not** an
+   enumeration of the ones we happen to remember, so a fourth principal added later cannot
+   arrive unpinned. For `discord-bot`: `kms:Encrypt`'s list is exactly the four password
+   ARNs, and `kms:Decrypt`'s is exactly those four **plus `discord/bot-token`** — five, no
+   sixth (§6.6.2a). This is what keeps `Resource: "*"` honest.
+
+   **The assertion carries one named exemption, and the list must only ever shrink:**
+   `enshrouded-status-channel`, whose `kms:Decrypt` on `*` is still bounded by `ViaService`
+   plus its `ssm:GetParameter` scope alone. It is tracked as **WP-26**, and when that lands
+   the exemption is deleted and this assertion covers every role with no exceptions. An
+   exemption allowlist that is visible in the test and self-liquidating is honest; omitting
+   the role from the assertion's scope would hide the same gap.
 7. The `status-channel` role has **no** `server/` SSM resource at all.
 8. The instance role still has no `ssm:PutParameter` and no `kms:Encrypt`.
+9. **No principal other than `discord-bot` holds `ssm:PutParameter` on any of the four
+   password ARNs.** This replaces the deleted "the password ARN is read-only" assertion,
+   which had to go once the grant became read/write — the property worth keeping was never
+   "nobody writes it" but "exactly one principal writes it". Items 5 and 8 cover the two
+   principals that must not.
 
 Cheap, runs on every PR, and catches re-widening at review time rather than after a
 compromise. Worth it specifically because the failure is invisible: an over-broad grant
@@ -3164,17 +3234,91 @@ tests for one credential.
   test time** and fails below the floor — **the post-filter count**, not a comment and not
   a constant. This single assertion is what stops a later trim of the wordlist (for
   homophones, length, or taste) from silently dropping below the floor.
-- Wordlists are **vendored in-repo** — no network fetch in a credential path — ASCII-only,
-  filtered for spoken ambiguity (no homophones, no pairs differing by one letter) and for
-  length (**≤8 characters**, so three words ≤ 26 and four ≤ 35 characters, which matters for
-  §7.4.6).
+- Wordlists are **vendored in-repo** — no network fetch in a credential path — ASCII-only
+  (`/^[a-z]+$/`), de-duplicated, and filtered for spoken ambiguity as defined in §7.4.2a.
+  **There is no word-length cap** — see §7.4.2a for why the one this section used to
+  mandate was arithmetically impossible, and for the measured string lengths that §7.4.6
+  must test against.
+
+#### 7.4.2a The ≤8-character word cap is RETRACTED — it cannot coexist with the 38-bit floor
+
+**CORRECTION.** An earlier version of §7.4.2 required words of **≤8 characters** and derived
+from it that passwords would be "three words ≤ 26 and four ≤ 35 characters". **Both the
+requirement and the derived figures were wrong**, and WP-25 would have been calibrated from
+them — a spike that passes at 26 characters while production emits 29 leaves the §7.4.6 trap
+fully armed. The cap is withdrawn rather than quietly relaxed.
+
+**Measured directly from the shipped list**
+(`infrastructure/lib/enshrouded/lambda/discord-bot/eff-large-wordlist.js`, 2026-10-19 —
+**VERIFIED** by counting it, not by report):
+
+| | words | 3 words | 4 words | worst-case length |
+| --- | --- | --- | --- | --- |
+| **as shipped** (3–9 chars) | **6,627** | **38.08 bits** | **50.78 bits** | **29 / 39 chars** |
+| capped ≤8 chars | 5,162 | 37.00 bits ✗ | 49.33 bits ✗ | 26 / 35 chars |
+| capped ≤7 chars | 3,540 | 35.37 bits ✗ | 47.16 bits ✗ | 23 / 31 chars |
+
+Length histogram: 3→46, 4→288, 5→687, 6→1111, 7→1408, 8→1622, 9→1465. No duplicates, all
+`[a-z]+`. Floors require ≥6,502 words for 38 bits at three words and ≥5,793 for 50 bits at
+four.
+
+**So the ≤8 cap fails *both* floors, not just the player one.** The proposal to cap at 8 and
+use four words for every tier yields **49.33 bits**, which misses the ≥50-bit admin floor —
+it is not a viable option, and the 6,216-word / 50.4-bit figures it was costed from do not
+match the list (the correct capped count is **5,162**).
+
+**And no change to the ambiguity filter can rescue the cap — this is an arithmetic bound, not
+a tuning problem.** The 8-character pool is 5,162 words. Everything the filters removed from
+EFF-long totals at most ~1,149 words (4 hyphenated + 30 blocklisted + ~1,115
+substitution-pairs), so even restoring **all** of them, and even if every single restored word
+were ≤8 characters, the ceiling is **≈6,311 — still short of the 6,502 needed**. Trading
+spoken clarity for string length therefore buys nothing here, and that option is closed.
+
+**Ruling: keep the list as shipped.** Three words at 38.08 bits, admin four at 50.78 bits,
+worst case **29 characters** for the player tiers and **39 for admin**. The bit floor is the
+invariant (§1.14); the length cap never was one, and it is now recorded as a *measured
+property* of the list rather than a requirement imposed on it.
+
+**The margin is thin, and this is the part to plan for: 38.08 bits is 125 words of
+headroom.** Removing 126 more words breaks invariant §1.14, and the generator test will fail
+loudly when it happens (which is the system working). **The pre-agreed remedy, so nobody
+"solves" it by lowering the floor: move to four words for all four tiers** — 50.78 bits
+across the board, worst case 39 characters everywhere, and the admin special case collapses
+into one shape. That is a deliberate re-run of WP-25's length check, not a quiet edit. The
+floor itself is derived from the risk table in §7.4.1 and is not to be adjusted to make a
+measurement comfortable.
+
+**"No pairs differing by one letter" — defined, because it was undefined and had to be
+interpreted.** It means **substitution only**: pairs `(a, b)` where `|a| = |b|` and the
+Hamming distance is 1 (`cactus`/`cattus`). One word of each such pair is removed.
+**Insertion/deletion pairs are explicitly acceptable and must not be filtered** — `arena`
+and `area` differ in syllable count and rhythm, which is far more audible than a single
+swapped letter, and removing the ~490 such pairs would breach the floor. Equally important:
+**this filter is a usability measure, not a security one.** It does not improve entropy; it
+only shrinks the list, which *costs* entropy. The thing that protects the property we care
+about is the length assertion in the generator test, not the filter.
+
+**The profanity/awkwardness blocklist is 30 words, chosen by keyword search plus reviewer
+judgement — ASSUMED, explicitly not a guarantee.** It is a human-review item, not a
+mechanism. When reviewing it, note the 125-word headroom above: a reviewer who wants to cut
+more than that triggers the four-word remedy rather than a floor change.
+
+**Attribution.** The list is a filtered subset of the EFF long wordlist under **CC BY 3.0
+US**, attributed in the file header, with a test asserting the attribution strings stay
+present. That is adequate compliance — but the header is **one build step away from
+disappearing**: this file is copied into a Lambda asset today, and any future bundling or
+minification would strip comments and silently drop the notice. WP-21 therefore adds a
+repo-level `NOTICE` carrying the same attribution, which survives that change. The project's
+own licensing (there is no `LICENSE` file) is a separate question for the user — §12 Q14 —
+and is not for an implementer to decide unilaterally.
 
 #### 7.4.3 Rotation ordering and the three interlocks
 
 Rotation happens in `finish-start` — the async half of `/enshrouded start` — in this order:
 
 1. **Live authorization re-check** (§7.5.3). No AWS client is constructed before this.
-2. `state/rotate-on-start` is `true` (§7.4.5); otherwise skip to 4.
+2. `state/rotate-on-start` is the exact string `true` (§7.4.5); otherwise skip to 5 — the
+   server still starts, it just starts without rotating.
 3. `DescribeInstances` → state must be **`stopped`**.
 4. Generate four; `PutParameter` ×4 (`Type: SecureString`, `Overwrite: true`, **no
    `KeyId`** — the default key per §6.6.5 — and **no `Tier`** — standard, per §6.6.2a).
@@ -3198,9 +3342,16 @@ rotations, one start, one superseded DM) and one narrow bad case (the loser's wr
 - **Step 3's state check** — necessary, and not sufficient alone: it is a
   time-of-check/time-of-use read.
 - **A 5-second freshness bound on it.** If more than 5 s elapsed between the
-  `DescribeInstances` response and the first `PutParameter`, abandon the rotation and start
-  nothing. One monotonic-clock comparison, trivially unit-testable, and it turns "a box
-  takes longer to boot than a Lambda stalls" from a coincidence into an enforced bound.
+  `DescribeInstances` response and the first `PutParameter`, **abandon the rotation and start
+  unrotated** — do not refuse to start. (An earlier version said "start nothing"; that was the
+  same obsolete premise corrected below, and it is reversed for the same reason: a stale
+  abort writes nothing, so SSM, the rendered config and `pw` all still agree.) Emit the
+  distinct `PasswordRotationStale` metric and name the unrotated state in the reply. One
+  monotonic-clock comparison, trivially unit-testable, and it turns "a box takes longer to
+  boot than a Lambda stalls" from a coincidence into an enforced bound.
+  **Do not add a re-`Describe` retry loop on this path.** The `StartInstances` response —
+  including an `IncorrectInstanceState` error if the box entered `stopping` during the stall —
+  is the authority, and it is the same exposure every `Describe`→`Start` gap already has.
   **ASSUMED — needs validation:** `StartInstances`-to-render is ~30–60 s (§3.1's EC2 Linux
   boot estimate plus `enshrouded-update.service` ahead of the render). The 5 s bound does
   not depend on that figure being right — only on it being much larger.
@@ -3209,6 +3360,20 @@ rotations, one start, one superseded DM) and one narrow bad case (the loser's wr
   raise the alarm, send **no** DM, and tell the caller the server was already starting and
   that `/enshrouded pw` will report whether the credentials can be confirmed.
 
+**`password-desync` clears on ANY start whose `PreviousState` is `stopped` — not only on a
+rotation.** An earlier draft said "cleared on any rotation whose `PreviousState == 'stopped'`",
+which is a latch that never opens: with the kill switch off no rotation ever fires, so a
+single desync would make `/enshrouded pw` refuse **forever**. Clearing on a clean start is
+also independently correct — the box re-renders from SSM at boot whether or not anything
+rotated, so a clean start genuinely ends the condition. Clearing it at `StartInstances`
+rather than at render time is slightly early and is harmless: during `pending`, `pw` reports
+exactly the values the box is about to render (§7.4.4).
+
+**Read `password-desync` before writing `none` to it.** An unconditional put would burn one
+parameter version on every single start, reaching the 100-version ceiling (§7.4.5) on the
+*desync* parameter within a few months of play. Write only when the value is actually
+changing; do not "simplify" this to a bare `PutParameter`.
+
 A DynamoDB conditional write, or reserved concurrency of 1, would make even the benign case
 impossible. Neither is worth it: Parameter Store has no compare-and-swap; reserved
 concurrency on `discord-bot` would throttle the 3-second acknowledgement path (§3.1 step
@@ -3216,10 +3381,85 @@ concurrency on `discord-bot` would throttle the 3-second acknowledgement path (�
 superseded password that `/enshrouded pw` corrects on request. **State what is not
 guaranteed rather than building machinery that pretends it is.**
 
-**A partial rotation is safe and must not be made transactional.** If the invocation dies
-after two of four writes, `StartInstances` is never reached, so there is no session and no
-DM, and the next start rotates all four again. The four passwords have no requirement to
-change together — the box renders whatever SSM holds. Do not add a rollback.
+**A rotation failure does NOT block the start — corrected ruling, 2026-10-19.** An earlier
+version of this section described the no-start outcome (an invocation dying mid-rotation)
+without saying whether a *caught* write failure should also refuse to start, and the first
+implementation read it as mandatory: a write error threw before `StartInstances` and the user
+saw "Failed to start the server". **That is an availability regression with no safety
+benefit, and it is reversed.** Correct behaviour: **start anyway, do not rotate, and make the
+failure impossible to miss.**
+
+Why the safety argument does not survive, stated precisely because it *did* hold when this
+section was first written. The original stance assumed the starter's DM carried the
+Lambda-generated values at request time — under that design a failed write really would have
+DM'd a password that was never stored. **The user's later ruling moved the DM to readiness
+time with a live SSM read (§7.4.4 point 6), which deleted the only consumer that could
+disagree with SSM.** Now every consumer derives from the same source of truth:
+
+| rotation outcome | SSM holds | box renders | `pw` reports | agree? |
+| --- | --- | --- | --- | --- |
+| all four written | new | new | new | yes |
+| **total failure** | old | old | old | **yes** |
+| **partial (2 of 4)** | a mix | that mix | that mix | **yes** |
+| write committed, SDK reported failure | new | new | new | **yes** |
+
+The desync this design must prevent comes from rotating *after* the box has rendered, which
+interlocks (a)–(c) already bound. **A failed rotation cannot produce it.** No path hands
+anyone a credential that does not work, so refusing to start buys nothing — and it costs the
+server being startable at all.
+
+**What a failed rotation does lose is leak containment**, which is this feature's whole
+justification (§7.4.1). It is also, in practice, **the only revocation mechanism we have**:
+there is no other way to invalidate a password already given to someone, so a silently
+failing rotation is a silently failing revocation. That raises the bar on the *signal*, not
+on the start decision — note that refusing to start revokes nothing either; the old
+passwords remain valid in SSM and the server is merely unavailable. Hence:
+
+- **A metric with an alarm behind it (WP-15), not merely a log line.** A log nobody reads is
+  not a signal. Emit distinct names for the two causes — a write failure and a `stale`
+  freshness-bound abort have different fixes.
+- **The reply tells the starter, in that session**, that the server started but the passwords
+  were not rotated. A human in the loop on every occurrence is the strongest part of this.
+- **A failed rotation must NOT set `state/password-desync`.** This is the tempting "fix" and
+  it would be strictly worse than the bug it replaces: `password-desync` means *SSM and the
+  running game may disagree*, a failed rotation provably does not cause that (see the table),
+  and setting it would make `/enshrouded pw` refuse for no reason — a false refusal on the
+  one command the user ruled must never hand out a stale value. Keep the two conditions
+  separate.
+
+**This matters immediately, not eventually.** The first real rotation will be the first
+`kms:Encrypt` this account has ever performed, and the `PARAMETER_ARN` encryption-context
+condition is **VERIFIED from documentation only, never from a live call** (§6.6.2a). So the
+single most likely first outcome of enabling rotation is an `AccessDenied` — which must
+degrade to "started, passwords unchanged, alarm raised", not brick `/enshrouded start`.
+
+**A partial rotation is safe and must not be made transactional.** The four passwords have no
+requirement to change together — the box renders whatever SSM holds. Do not add a rollback.
+
+#### The test that separates "start anyway" from §7.3.2's "refuse to start" — read this before relaxing a third one
+
+Two refuse-to-start rulings in this document have now been reversed (a caught write failure,
+and the `stale` abort), both because they were written while the starter's DM carried
+Lambda-generated values at request time. **A third refusal — §7.3.2, the boot render — looks
+like the same pattern and is NOT. Do not "finish the job" by relaxing it.**
+
+The question to ask is not "did something fail?" but:
+
+> **Does this failure leave SSM, the rendered config, and `/enshrouded pw` all deriving from
+> the same values?**
+
+| failure | consistent? | ruling |
+| --- | --- | --- |
+| rotation write failed (total or partial) | **yes** — nothing or a mix is in SSM, and the box renders exactly that | start unrotated |
+| `stale` freshness abort | **yes** — nothing was written at all | start unrotated |
+| kill switch off or unreadable | **yes** — nothing was written at all | start unrotated |
+| **boot render failed (§7.3.2)** | **NO** — SSM may hold values the on-disk config does not | **refuse to start** |
+
+The render is the only one of the four that can put the *running game* out of step with SSM,
+which is the single thing invariant §1.12 exists to prevent. Everything else merely fails to
+*improve* the credentials; the render failing would make them wrong. Note also that refusing
+there is what keeps the guarantee whole: with no game running, `pw` refuses too (§7.4.4), so
+nothing is handed out at all.
 
 **A rotation with no start is also safe.** If `StartInstances` fails, SSM holds new values
 and the box is still stopped. Nothing is inconsistent, because **the on-disk config is a
@@ -3306,7 +3546,7 @@ but the denial path must not depend on that staying true.)
 | instance state | `pw` does |
 | --- | --- |
 | `running`, `state/password-desync` = `none` | DM the caller's tier cascade: *these are in force now.* |
-| `running`, `password-desync` set | **Refuse.** "I can't confirm the server is using the current passwords — tell an admin; a stop/start resyncs." This is the one case the system cannot assert liveness, so it is the one case that must not hand out a value. |
+| `running`, `password-desync` set — **or malformed, or unreadable** | **Refuse.** "I can't confirm the server is using the current passwords — tell an admin; a stop/start resyncs." This is the one case the system cannot assert liveness, so it is the one case that must not hand out a value. **A parameter it cannot parse or cannot read counts as set**: when the gate cannot evaluate its own evidence it must not pretend it did. The asymmetry is deliberate — a false refusal costs friction, a false allow hands out a credential that may not work, which the user's ruling forbids absolutely. Consequence to accept rather than "fix": an SSM outage makes `pw` refuse. |
 | `pending` | **Report.** Rotation already happened (step 4 precedes step 5), so SSM holds exactly what the booting box will render. Making someone wait and retry is friction for no safety gain, and refusing here would be incoherent with the starter's own DM for the same session. The reply says the server is still starting. |
 | `stopped`, `stopping`, `shutting-down`, `terminated`, unknown | **Refuse**, and point at `/enshrouded start`. |
 
@@ -3359,8 +3599,16 @@ anticipates being fed by this guard.
   needs validation:** that CloudTrail omits the `Value` field from `PutParameter` request
   parameters for a `SecureString`. Not verified; assume it may be recorded, and keep
   CloudTrail read an admin-only privilege. No part of the design depends on either answer.
-- **The kill switch.** `state/rotate-on-start` (default `true`) lets an operator disable
-  rotation **without a deploy** — which matters because rotation sits in the start path: if
+- **The kill switch, and its default is OFF.** Rotation runs **only** when
+  `state/rotate-on-start` is the exact string `true`; absent, malformed, unreadable or any
+  other value means no rotation, and the parameter is deliberately **not created** by CDK or
+  by seeding. **This corrects two earlier statements in this document that said it defaults
+  to `true`** — that would have armed rotation the moment WP-21 merged, before WP-25 has
+  proven the game accepts the generated shape, which is exactly the state §7.4.6 forbids.
+  Turning it on is a **named runbook step gated on WP-25**, not a deploy-time default. A
+  failure to *read* the switch therefore disables rotation rather than blocking the start,
+  consistent with the failure ruling in §7.4.3. It also lets an operator disable rotation
+  **without a deploy** — which matters because rotation sits in the start path: if
   it ever starts failing (KMS, the version limit, a game-acceptance problem), the server
   must remain startable. Same pattern as `server/auto-update-on-boot`. While it is `false`,
   `pw` must not claim values are about to change.
@@ -3391,13 +3639,31 @@ into a deploy with a human watching.
 renders a config the game refuses — a self-inflicted outage on every start, discovered by
 whoever ran `/enshrouded start`.
 
-So, before rotation is enabled: render a config whose four passwords are
-**generator-produced at maximum length** (four words × 8 characters plus hyphens = 35
-characters for admin), confirm the server starts, and confirm a client can actually join
-with each tier's password. Then **the shape is frozen**: word count, word-length cap and
-separator may not change without re-running this check, because from then on every boot
+So, before rotation is enabled, test at **the true worst case, which is 29 characters for a
+player tier and 39 for admin** (§7.4.2a — measured, not derived; an earlier draft said 26
+and 35, and a spike calibrated to those figures would have passed while leaving this trap
+armed). Three requirements, and the third is the one that is easy to omit:
+
+1. **Construct the worst case; do not sample it.** The generator draws uniformly, so a
+   random draw essentially never yields four 9-character words. The spike must *assemble*
+   four 9-character words per password deliberately — `39` characters for admin, `29` for
+   the others — and render a config from them.
+2. **Confirm the server starts** and that a client can actually join with each of the four
+   tiers' passwords.
+3. **Confirm the game does not SILENTLY TRUNCATE.** A refusal is the loud failure §7.1
+   trained us to expect; truncation is the quiet one, and it is worse. If the binary
+   accepted a 39-character password but enforced only its first *n* characters, the config
+   would render, the server would start, everything would look healthy — and the string in
+   the player's DM would not be the string the server checks, which is precisely the
+   invariant §1.12 failure mode, arriving from the game instead of from a stale config. So:
+   **join with the full 39-character password (must succeed) *and* attempt to join with a
+   truncated prefix of it (must FAIL).** Without that second attempt the spike passes
+   without proving anything about truncation.
+
+Then **the shape is frozen** — word count, **maximum word length (9)** and separator — and
+none of the three may change without re-running this check, because from then on every boot
 depends on the game accepting that shape. Record the measured maximum if the game reveals
-one. **Shape stability is the control here** — once one shape is proven, every subsequent
+one. **Shape stability is the control here:** once one shape is proven, every subsequent
 rotation produces the same shape and cannot newly break the server.
 
 ---
@@ -4261,11 +4527,13 @@ cannot substitute for them — see §6.2.1a for why they cannot live in CDK.
 
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
-| **WP-21** | Password generator + rotation in the start path. Vendored wordlists; `crypto.randomInt`; three words (four for admin); rotation ordered per §7.4.3 with all three interlocks; `state/password-desync` FACT; `state/rotate-on-start` kill switch; `/enshrouded pw` converted to defer-then-self-invoke with the §7.4.4 state table; `sendPasswordDm` changed off the synchronous callback; `/enshrouded password` renamed to `pw`. IAM per §6.6.2a including **`kms:Encrypt`** and the `kms:EncryptionContext:PARAMETER_ARN` conditions. | `lambda/discord-bot/password-generator.js` + vendored wordlist, rotation in `lambda/discord-bot/index.js`, edits to `password-access.js`, `commands.js`, `lib/enshrouded/discord-bot.ts`, `test/password-generator.test.ts`, updated `test/ssm-scoping.test.ts` | WP-11, **WP-22**, **WP-25** | **Entropy test computes `words × log2(len(LIST))` from the shipped post-filter list and fails below 38/50 bits** — not a hardcoded constant. Tests: no rotation when state is `running`/`pending`; no rotation when the state check is older than 5 s; `PreviousState != 'stopped'` sets `password-desync` and suppresses the DM; `pw` refuses on every down state and on `password-desync`; `pw` reports on `pending`; four values are distinct and independently drawn; no password appears in any log line, metric or parameter other than the four. Tier precedence is already covered by `test/password-access.test.ts` (§7.5.6); this WP must not weaken it — in particular the **per-group DM-body assertion** stays, because it is the only check independent of the shared `GROUPS` array. §6.6.4's eight synth assertions pass. **Ships with `rotate-on-start=false` until WP-22 and WP-25 land.** | **A** |
+| **WP-21** | Password generator + rotation in the start path. Vendored wordlists; `crypto.randomInt`; three words (four for admin); rotation ordered per §7.4.3 with all three interlocks; `state/password-desync` FACT; `state/rotate-on-start` kill switch; `/enshrouded pw` converted to defer-then-self-invoke with the §7.4.4 state table; `sendPasswordDm` changed off the synchronous callback; `/enshrouded password` renamed to `pw`. IAM per §6.6.2a including **`kms:Encrypt`** and the `kms:EncryptionContext:PARAMETER_ARN` conditions on **every** KMS statement — including pinning the pre-existing bot-token `kms:Decrypt` to the five-ARN list, so no unconditioned `Resource: "*"` statement is left behind (§6.6.2a correction). | `lambda/discord-bot/password-generator.js` + vendored wordlist, repo-level `NOTICE` (CC BY 3.0 US attribution for the EFF list, §7.4.2a), rotation in `lambda/discord-bot/index.js`, edits to `password-access.js`, `commands.js`, `lib/enshrouded/discord-bot.ts`, `test/password-generator.test.ts`, updated `test/ssm-scoping.test.ts` | WP-11, **WP-22**, **WP-25** | **Entropy test computes `words × log2(len(LIST))` from the shipped post-filter list and fails below 38/50 bits** — not a hardcoded constant. Tests: no rotation when state is `running`/`pending`; no rotation when the state check is older than 5 s; `PreviousState != 'stopped'` sets `password-desync` and suppresses the DM; **a desync clears on any start whose `PreviousState` is `stopped`, including one where rotation was disabled** (the latch-forever case, §7.4.3); **writing `none` is skipped when it is already `none`**; `pw` refuses on every down state, on `password-desync`, and on a desync value it cannot parse or read; `pw` reports on `pending`; four values are distinct and independently drawn; **a write failure on any of the four `PutParameter` calls still starts the server** — asserted on the mocked EC2 client, with the metric emitted, the reply naming the unrotated state, and **`password-desync` NOT set** (§7.4.3); **a `stale` freshness abort likewise starts the server unrotated**, under the distinct `PasswordRotationStale` metric, with `password-desync` untouched (the `if (rotated && previous !== 'stopped')` gate makes this structural); an unreadable kill switch starts the server without rotating; **the entropy assertion is computed from the real list (expect 38.08 / 50.78 bits at 6,627 words) and there is no word-length cap (§7.4.2a)**; the attribution test covers the `NOTICE` file as well as the header comment; no password appears in any log line, metric or parameter other than the four. Tier precedence is already covered by `test/password-access.test.ts` (§7.5.6); this WP must not weaken it — in particular the **per-group DM-body assertion** stays, because it is the only check independent of the shared `GROUPS` array. §6.6.4's **nine** synth assertions pass, and the replacement set is checked to be at least as strong as the deleted "password ARN is read-only" assertion — the property to confirm is **exactly one principal holds `PutParameter` on the four password ARNs** (items 5, 8 and 9). **Ships with rotation OFF, by the parameter being absent rather than set to `false`** — nothing creates it, and only a named runbook step gated on WP-25 turns it on (§7.4.5). | **A** |
 | **WP-22** | Boot-time render: new `enshrouded-config.service` per §7.3.1; extract the renderer from `deploy-game-server.sh` into `/usr/local/lib/enshrouded/render-config.sh` (one renderer, one on-box template path); switch to `ssm get-parameters --names`; `Requires=`+`After=` on `enshrouded.service`; in-script bounded retry; extend `verify-systemd.sh`'s filter from three notices to four. | `infrastructure/systemd/enshrouded-config.service`, `scripts/render-config.sh`, edits to `provision-host.sh`, `deploy-game-server.sh`, `enshrouded.service`, `.github/scripts`/`verify-systemd.sh`, unit-grep test | WP-05, WP-06 | **A unit test asserts `Requires=` *and* `After=enshrouded-config.service` are present and `Wants=enshrouded-config.service` is absent** — the anti-silent-no-op assertion. On the real box: an unseeded/empty parameter makes `enshrouded-config` fail and **`enshrouded.service` does not start**; a transient SSM failure is retried and the start still succeeds; a `systemctl restart enshrouded` re-renders; the deploy path still works and its config is not overwritten by a stale on-box template. `verify-systemd.sh` passes with exactly four filtered notices and **no blanket ignore**. | **A** |
 | **WP-23** | Command authorization §7.5: extend `parseAccessMapping` for `commandRoles` (keys ⊆ `start,stop,update,backup`; strict unknown-key rejection kept; uniqueness within `roles` only); gate `start` (and `stop`, for WP-13) in the deferred half before any side effect — **a single membership test against one role id, with no fallback to `roles.admin` and no precedence logic**; §7.5.4 reply cases; `configure-password-roles.py` resolves the action roles and previews effective per-command authorization. | edits to `password-access.js`, `lambda/discord-bot/index.js`, `scripts/configure-password-roles.py`, `test/password-access.test.ts` | WP-11, WP-21 | A member with none of the roles is denied and **no EC2 call and no rotation occurs** (assert on the mocked clients, not just on the reply text). Absent/corrupt/partial mapping denies — one test per shape. **An `enshroudedadmin`-only holder (every tier role, no `commandRoles.start`) is DENIED `start`** — the assertion that pins the user's decoupling decision and fails if an admin fallback is ever reintroduced. **A mapping with `commandRoles` absent entirely denies `start` to everyone**, including the admin. A non-guild interaction denies. A role removed between the signed payload and the live fetch denies. The denial text contains no role name or id. **One new ordered assertion that `GROUPS` is privilege-descending, in a test named for §1.16** — the multi-role and DM-body cases are already covered by `test/password-access.test.ts` and must not be duplicated (§7.5.6). The script's preview, with the action roles absent, prints `DENIED to everyone` for each — not a blank field and not an admin fallback. | R with review |
 | **WP-24** | Readiness-time password DM in `boot-watcher`: carry `{guildId,userId,roleIds}` through the poll chain, re-authorize live at DM time, read the four SecureStrings then, DM the cascade with the ready message; no DM on give-up. IAM: read on the four ARNs + `kms:Decrypt` with the encryption-context condition. | `lambda/boot-watcher/index.js`, `lib/enshrouded/boot-watcher.ts`, tests | **WP-12**, WP-21 | Readiness failure produces **no DM** (asserted). A role removed during boot produces no DM. The DM content comes from an SSM read, not from the event payload (asserted: no password field exists on the payload type). A DM failure does not fail the start or the readiness PATCH. | **A** |
-| **WP-25** | **Spike, on the real box:** the password shape the game accepts (§7.4.6). Render a config with generator-produced passwords at maximum length, start the server, join with each tier. Record the maximum accepted length if the game reveals one. | a §7.4.6 result paragraph + the frozen shape constants | WP-06 | The server starts and a client joins with each of the four tiers' passwords. If it fails, WP-21's generator parameters change **before** rotation is enabled, not after. This WP is a **gate on setting `rotate-on-start=true`**. | **A** |
+| **WP-25** | **Spike, on the real box:** the password shape the game accepts (§7.4.6). Render a config whose passwords are **deliberately assembled at the true worst case — 29 characters for the player tiers, 39 for admin** (§7.4.2a; do **not** rely on a random draw to reach it), start the server, join with each tier. Record the maximum accepted length if the game reveals one. | a §7.4.6 result paragraph + the frozen shape constants (word count, max word length 9, separator) | WP-06 | The server starts and a client joins with each of the four tiers' passwords at full length. **And the truncation check: joining with a truncated prefix of the 39-character admin password must FAIL** — without it the spike proves nothing about silent truncation, which is the quieter and worse of the two failure modes (§7.4.6). If anything fails, WP-21's generator parameters change **before** rotation is enabled, not after. This WP is a **gate on setting `rotate-on-start=true`**. | **A** |
+
+| **WP-26** | Pin `enshrouded-status-channel`'s `kms:Decrypt` to the `discord/bot-token` ARN via `kms:EncryptionContext:PARAMETER_ARN`, and delete the named exemption from §6.6.4 item 6 so that assertion then covers every role. **Verified safe before it is written** — §6.6.2a's CloudTrail evidence shows this role's own bot-token read supplying exactly that context, and shows why its Lambda env-var decrypts are unaffected. | one statement in `lib/enshrouded/status-channel.ts`, one deletion in `test/ssm-scoping.test.ts` | WP-14, WP-21 | §6.6.4 item 6 passes with an **empty** exemption list. `/enshrouded channel` and the status reconciler still work after deploy — confirm against a real reconcile, not only against synth, because the failure mode is a runtime `AccessDenied` on the token read. | R — one line, deliberately **not** folded into WP-21: that WP is at its commit point with a green suite, and this touches a third role it otherwise never goes near. |
 
 **Sequencing that matters:** WP-21 may merge before WP-22 and WP-25, but **rotation must
 stay disabled via `state/rotate-on-start` until both have landed.** Rotation enabled without
@@ -4352,6 +4620,13 @@ Still open. These block or materially change the design, and only the user can a
     UX acceptable** (a 2-hour lease with a one-click "extend" button, §5.6)? Worth a
     provisional answer now, because it is the difference between shipping a degraded
     automatic design and shipping a different, honest one.
+14. **Does this repository need a `LICENSE` file, and under what licence?** There is none
+    today. It does not block anything and it is not an implementer's call to make. It is
+    raised because the project now vendors a third-party asset — the EFF long wordlist
+    under **CC BY 3.0 US** (§7.4.2a) — so the repo carries someone else's licence terms
+    while stating none of its own. The attribution obligation itself is satisfied (file
+    header plus the `NOTICE` that WP-21 adds); this question is only about the project's
+    own terms.
 
 ---
 

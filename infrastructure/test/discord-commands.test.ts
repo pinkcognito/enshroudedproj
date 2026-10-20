@@ -71,10 +71,10 @@ export function findDrift(source: string, cmds: Command[]): string[] {
 }
 
 describe('command definitions', () => {
-  test('/enshrouded is a single command with channel, help, start and status subcommands (type 1)', () => {
+  test('/enshrouded is a single command with channel, help, pw, start and status subcommands (type 1)', () => {
     expect(commandList.map((c) => c.name)).toEqual(['enshrouded']);
     const subs = commandList[0].options ?? [];
-    expect(subs.map((s) => s.name).sort()).toEqual(['channel', 'help', 'start', 'status']);
+    expect(subs.map((s) => s.name).sort()).toEqual(['channel', 'help', 'pw', 'start', 'status']);
     expect(subs.find((s) => s.name === 'channel')?.options ?? []).toEqual([]);
     for (const s of subs) expect(s.type).toBe(1);
   });
@@ -102,7 +102,7 @@ describe('anti-drift: handler vs commands.js', () => {
   test('the handler actually dispatches on something (extractor is not vacuous)', () => {
     const usage = extractHandlerUsage(handlerSource);
     expect(usage.commandNames).toContain('enshrouded');
-    expect([...usage.subcommandNames].sort()).toEqual(['channel', 'help', 'start', 'status']);
+    expect([...usage.subcommandNames].sort()).toEqual(['channel', 'help', 'pw', 'start', 'status']);
   });
 
   test('fails when the handler reads an option commands.js does not register', () => {

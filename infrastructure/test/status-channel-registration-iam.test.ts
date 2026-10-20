@@ -27,7 +27,13 @@ test('bot config write scope is exactly discord/status-channels/*; credentials a
   expect(discordWrites[0].Action).toBe('ssm:PutParameter');
   expect(discordWrites[0].Resource).toEqual({ 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' },
     ':ssm:us-east-2:123456789012:parameter/enshroudedproj/discord/status-channels/*']] });
+  // WP-21 deliberately allows server/ writes ONLY to the four password parameters (rotation,
+  // ARCHITECTURE 6.6.2a); everything else under server/, the bot token and wildcards stay denied.
   for (const statement of writes) {
-    expect(JSON.stringify(statement.Resource)).not.toMatch(/server\/|bot-token|parameter\/enshroudedproj\/\*/);
+    const resource = JSON.stringify(statement.Resource);
+    expect(resource).not.toMatch(/bot-token|parameter\/enshroudedproj\/\*"/);
+    for (const hit of resource.match(/server\/[^"]*/g) ?? []) {
+      expect(hit).toMatch(/^server\/user-groups\/(admin|friend|guest|visitor)-password$/);
+    }
   }
 });

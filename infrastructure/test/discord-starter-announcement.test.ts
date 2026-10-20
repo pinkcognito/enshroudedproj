@@ -31,6 +31,10 @@ let handler: (event: object, context?: object) => Promise<unknown>;
 let announceStarter: (event: object, budget: number) => Promise<void>;
 const response = (body: object, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body }) as Response;
 const calls = (method: string) => jest.mocked(fetch).mock.calls.filter(([, options]) => options?.method === method);
+// The start path now reads/clears the WP-21 rotation parameters; these tests are about the
+// announcement, so ignore those two names (and only those) when asserting on SSM use.
+const announcementSsm = () => mockSsm.mock.calls.filter(([cmd]) =>
+  !/^\/enshroudedproj\/state\/(rotate-on-start|password-desync)$/.test(cmd.input.Name));
 const stopped = () => ({ Reservations: [{ Instances: [{ State: { Name: 'stopped' } }] }] });
 const expectBooting = () => {
   expect(calls('PATCH')).toHaveLength(1);
@@ -85,7 +89,7 @@ test('successful transition replies first then posts to verified same-guild chan
   expect(JSON.parse(calls('POST')[0][1]?.body as string)).toEqual({
     content: `\u{1f680} Server start requested by <@${userId}>.`, allowed_mentions: { parse: [] },
   });
-  const signals = mockSsm.mock.calls.filter(([cmd]) => !cmd.input.WithDecryption).map(([, options]) => options.abortSignal);
+  const signals = announcementSsm().filter(([cmd]) => !cmd.input.WithDecryption).map(([, options]) => options.abortSignal);
   expect(signals.every((signal) => signal === jest.mocked(fetch).mock.calls[1][1]?.signal)).toBe(true);
   expect(calls('POST')[0][1]?.signal).toBe(signals[0]);
 });
@@ -94,14 +98,14 @@ test.each(['running', 'pending', 'stopping'])('already %s never starts or announ
   mockEc2.mockReset().mockResolvedValue({ Reservations: [{ Instances: [{ State: { Name: state } }] }] });
   await handler(event);
   expect(mockEc2).toHaveBeenCalledTimes(1);
-  expect(mockSsm).not.toHaveBeenCalled();
+  expect(announcementSsm()).toHaveLength(0);
   expect(calls('POST')).toHaveLength(0);
 });
 
 test('start failure never announces', async () => {
   mockEc2.mockReset().mockResolvedValueOnce(stopped()).mockRejectedValueOnce(new Error('start rejected'));
   await handler(event);
-  expect(mockSsm).not.toHaveBeenCalled();
+  expect(announcementSsm()).toHaveLength(0);
   expect(calls('POST')).toHaveLength(0);
   expect(JSON.parse(calls('PATCH')[0][1]?.body as string).content).toContain('Failed to start');
 });
@@ -113,14 +117,14 @@ test.each([{}, { StartingInstances: [] },
 ])('unconfirmed, concurrent or retried transition skips attribution: %j', async (result) => {
   mockEc2.mockReset().mockResolvedValueOnce(stopped()).mockResolvedValueOnce(result);
   await handler(event);
-  expect(mockSsm).not.toHaveBeenCalled();
+  expect(announcementSsm()).toHaveLength(0);
   expect(calls('POST')).toHaveLength(0);
   expectBooting();
 });
 
 test.each([{ guildId: undefined }, { guildId: 'bad' }, { userId: undefined }, { userId: '<@everyone>' }])('invalid identity skips: %j', async (overrides) => {
   await handler({ ...event, ...overrides });
-  expect(mockSsm).not.toHaveBeenCalled();
+  expect(announcementSsm()).toHaveLength(0);
   expectBooting();
 });
 
@@ -202,6 +206,6 @@ test.each(['token', 'channel'])('shared total budget bounds stalled %s and preve
 
 test('exhausted remaining Lambda time skips notification after reply', async () => {
   await handler(event, { getRemainingTimeInMillis: () => 400 });
-  expect(mockSsm).not.toHaveBeenCalled();
+  expect(announcementSsm()).toHaveLength(0);
   expectBooting();
 });

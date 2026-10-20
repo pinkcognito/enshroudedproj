@@ -9,6 +9,7 @@ function helpResponse() {
       content: [
         '**Enshrouded commands**',
         '`/enshrouded start` — Start the server. Booting the world takes a few minutes.',
+        '`/enshrouded pw` — DM you the server passwords your role allows. Only works while the server is up or starting; passwords change on every start.',
         '`/enshrouded status` — Check whether the server instance is up or down.',
         '`/enshrouded channel` — Choose the current text channel for status posts and its green/red name. Requires Manage Server or Administrator. The bot needs View Channel, Send Messages, and Manage Channels here.',
         '`/enshrouded help` — Show this help privately to you.',

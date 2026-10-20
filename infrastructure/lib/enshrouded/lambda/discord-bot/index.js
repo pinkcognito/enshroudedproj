@@ -41,6 +41,9 @@ async function finishStart(event, context) {
     editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken, content);
   try {
     const instance = await describeInstance();
+    // Interlock (b) clock starts when the state observation returns; the kill-switch read
+    // below deliberately counts against the 5 s bound.
+    const observedAt = performance.now();
     const state = instance?.State?.Name;
     if (state === 'running') {
       await reply('The server is already running.');
@@ -49,18 +52,50 @@ async function finishStart(event, context) {
     } else if (state === 'stopping' || state === 'shutting-down') {
       await reply('The server is shutting down. Try again in a minute.');
     } else if (state === 'stopped') {
+      const rotation = require('./rotation');
+      let rotated = false;
+      let unrotatedNote = '';
+      if (await rotation.rotationEnabled()) {
+        let outcome;
+        try {
+          outcome = await rotation.rotatePasswords(observedAt);
+        } catch (err) {
+          // A caught write failure must NOT block the start (7.4.3): SSM, the box and pw all
+          // derive from SSM, so they agree whatever was written. It must also NOT set
+          // password-desync - a failed rotation cannot make SSM and the game disagree.
+          console.error(`Password rotation failed: ${err?.name ?? 'error'}`);
+          rotation.emitMetric('PasswordRotationWriteFailed');
+          outcome = 'failed';
+        }
+        if (outcome === 'stale') {
+          // Freshness abort: start UNROTATED (7.4.3). No re-Describe loop - the StartInstances
+          // response is the authority. rotated stays false, so interlock (c) cannot fire.
+          rotation.emitMetric('PasswordRotationStale');
+        }
+        rotated = outcome === 'rotated';
+        if (outcome === 'failed' || outcome === 'stale') unrotatedNote = ' WARNING: the passwords were NOT rotated for this session - the previous passwords are still in force. Tell an admin.';
+      }
       const { StartInstancesCommand } = require('@aws-sdk/client-ec2');
       const result = await ec2().send(new StartInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
+      const ours = result.StartingInstances?.find((item) => item.InstanceId === process.env.INSTANCE_ID);
+      const previous = ours?.PreviousState?.Name;
+      // Interlock (c): we rotated into somebody else's boot.
+      if (rotated && previous !== 'stopped') {
+        try { await rotation.recordDesync(previous); } catch { console.error('Recording password desync failed'); }
+        await reply('The server was already starting. Run `/enshrouded pw` to see whether the credentials can be confirmed.');
+        return;
+      }
+      if (previous === 'stopped') {
+        try { await rotation.clearDesyncIfSet(); } catch { console.error('Clearing password desync failed'); }
+      }
       // A successful EC2 start must not become a failed start because Discord failed.
       try {
         await editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken,
-          'Booting the world - this takes a few minutes.', 2000);
+          `Booting the world - this takes a few minutes.${unrotatedNote}`, 2000);
       } catch {
         console.error('Server start reply failed: network-or-timeout');
       }
-      const started = result.StartingInstances?.some((item) =>
-        item.InstanceId === process.env.INSTANCE_ID &&
-        item.PreviousState?.Name === 'stopped' && item.CurrentState?.Name === 'pending');
+      const started = previous === 'stopped' && ours?.CurrentState?.Name === 'pending';
       if (started) {
         try {
           const budgetMs = Math.min(3500, (context?.getRemainingTimeInMillis?.() ?? 4000) - 500);
@@ -73,7 +108,8 @@ async function finishStart(event, context) {
       await reply(`The server is in an unexpected state (${state ?? 'unknown'}).`);
     }
   } catch (err) {
-    console.error('finishStart failed:', err);
+    // Name only: this path can follow a SecureString write, so never log the error object.
+    console.error(`finishStart failed: ${err?.name ?? 'error'}`);
     await reply('Failed to start the server, check CloudWatch logs.');
   }
 }
@@ -100,8 +136,8 @@ async function finishStatus(event) {
 }
 
 // Deliver the acknowledgement before SDK loading or the awaited async invocation.
-async function deferAndInvoke(internal, interaction, channelRequest, starter) {
-  if (!(await deferInteraction(interaction.id, interaction.token, channelRequest ? { ephemeral: true } : undefined))) {
+async function deferAndInvoke(internal, interaction, channelRequest, starter, ephemeral = Boolean(channelRequest)) {
+  if (!(await deferInteraction(interaction.id, interaction.token, ephemeral ? { ephemeral: true } : undefined))) {
     return { statusCode: 202, body: '' };
   }
   try {
@@ -137,6 +173,9 @@ exports.handler = async (event, context) => {
   }
   if (event && event._internal === 'finish-status') {
     return finishStatus(event);
+  }
+  if (event && event._internal === 'finish-pw') {
+    return require('./password-command').finishPw(event, { describeInstance });
   }
   if (event && event._internal === 'finish-channel') {
     return require('./channel').finishChannel(event);
@@ -183,7 +222,7 @@ exports.handler = async (event, context) => {
     );
 
     if (commandName === 'enshrouded') {
-      // WP-13 adds stop/password/update/backup as further branches here (and in commands.js).
+      // WP-13 adds stop/update/backup as further branches here (and in commands.js).
       if (subcommand === 'help') {
         return require('./help').helpResponse();
       }
@@ -193,6 +232,11 @@ exports.handler = async (event, context) => {
       }
       if (subcommand === 'status') {
         return deferAndInvoke('finish-status', interaction);
+      }
+      if (subcommand === 'pw') {
+        // Ephemeral defer; the payload carries snowflakes and role ids only, never a secret.
+        return deferAndInvoke('finish-pw', interaction, undefined,
+          { guildId: interaction.guild_id, userId: user?.id, roleIds: interaction.member?.roles }, true);
       }
       if (subcommand === 'channel') {
         const request = {

@@ -11,7 +11,7 @@
 
 const { OPTION_TYPE } = require('../shared/discord');
 
-// One top-level command with subcommands (type 1 options). WP-13 adds stop, password,
+// One top-level command with subcommands (type 1 options). WP-13 adds stop,
 // update and backup by appending entries to `options` and branches in index.js.
 const commands = [
   {
@@ -27,6 +27,11 @@ const commands = [
         type: OPTION_TYPE.SUB_COMMAND,
         name: 'help',
         description: 'Show commands, permissions, and how server status works',
+      },
+      {
+        type: OPTION_TYPE.SUB_COMMAND,
+        name: 'pw',
+        description: 'DM you the server passwords for your role (only while the server is up)',
       },
       {
         type: OPTION_TYPE.SUB_COMMAND,
