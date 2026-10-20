@@ -118,6 +118,54 @@ test('start failure never announces', async () => {
   expect(JSON.parse(calls('PATCH')[0][1]?.body as string).content).toContain('Failed to start');
 });
 
+test('a confirmed new start queues readiness with identity but no passwords', async () => {
+  process.env.BOOT_WATCHER_FUNCTION_NAME = 'enshrouded-boot-watcher';
+  mockEc2.mockReset().mockResolvedValueOnce(stopped()).mockResolvedValueOnce({ StartingInstances: [transition] })
+    .mockResolvedValueOnce({ Reservations: [{ Instances: [{ InstanceId: instanceId,
+      State: { Name: 'pending' }, LaunchTime: new Date() }] }] });
+  const before = Date.now();
+  await handler(event);
+  expect(mockInvoke).toHaveBeenCalledTimes(1);
+  const input = mockInvoke.mock.calls[0][0].input;
+  expect(input.FunctionName).toBe('enshrouded-boot-watcher');
+  expect(input.InvocationType).toBe('Event');
+  const payload = JSON.parse(input.Payload);
+  expect(payload).toMatchObject({ guildId, userId, roleIds: [startRole], interactionToken: 'interaction-secret' });
+  expect(payload.startedAt).toBeGreaterThanOrEqual(before);
+  expect(Object.keys(payload).sort()).toEqual(['expectedLaunchTime', 'guildId', 'interactionToken', 'roleIds', 'startedAt', 'userId']);
+  expectBooting();
+});
+
+test('readiness dispatch failure cannot turn a successful start into a failure', async () => {
+  process.env.BOOT_WATCHER_FUNCTION_NAME = 'enshrouded-boot-watcher';
+  mockEc2.mockReset().mockResolvedValueOnce(stopped()).mockResolvedValueOnce({ StartingInstances: [transition] })
+    .mockResolvedValueOnce({ Reservations: [{ Instances: [{ InstanceId: instanceId,
+      State: { Name: 'pending' }, LaunchTime: new Date() }] }] });
+  mockInvoke.mockRejectedValueOnce(new Error('secret-containing-request'));
+  await handler(event);
+  expectBooting();
+  expect(console.error).toHaveBeenCalledWith('Boot readiness dispatch failed: invocation-failed');
+  expect(JSON.stringify(jest.mocked(console.error).mock.calls)).not.toContain('secret-containing-request');
+  expect(JSON.parse(calls('PATCH')[0][1]?.body as string).content).toContain('submission could not be confirmed');
+});
+
+test('an ambiguous post-start launch declines tracking and gives a private fallback', async () => {
+  process.env.BOOT_WATCHER_FUNCTION_NAME = 'enshrouded-boot-watcher';
+  mockEc2.mockReset().mockResolvedValueOnce(stopped()).mockResolvedValueOnce({ StartingInstances: [transition] })
+    .mockResolvedValueOnce({ Reservations: [{ Instances: [{ InstanceId: instanceId,
+      State: { Name: 'pending' }, LaunchTime: new Date(Date.now() - 60000) }] }] });
+  await handler(event);
+  expect(mockInvoke).not.toHaveBeenCalled();
+  expect(JSON.parse(calls('PATCH')[0][1]?.body as string).content).toContain('Readiness tracking is unavailable');
+});
+
+test('already running never queues automatic password delivery', async () => {
+  process.env.BOOT_WATCHER_FUNCTION_NAME = 'enshrouded-boot-watcher';
+  mockEc2.mockReset().mockResolvedValueOnce({ Reservations: [{ Instances: [{ State: { Name: 'running' } }] }] });
+  await handler(event);
+  expect(mockInvoke).not.toHaveBeenCalled();
+});
+
 test.each([{}, { StartingInstances: [] },
   { StartingInstances: [{ ...transition, InstanceId: 'i-other' }] },
   { StartingInstances: [{ ...transition, PreviousState: { Name: 'pending' } }] },

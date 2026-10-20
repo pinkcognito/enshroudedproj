@@ -7,6 +7,7 @@ import { GameDeploy } from './enshrouded/game-deploy';
 import { GracefulStop } from './enshrouded/graceful-stop';
 import { IdleShutdown } from './enshrouded/idle-shutdown';
 import { StatusChannel } from './enshrouded/status-channel';
+import { BootWatcher } from './enshrouded/boot-watcher';
 
 export class EnshroudedServerStack extends cdk.Stack {
   public readonly server: EnshroudedServer;
@@ -16,6 +17,7 @@ export class EnshroudedServerStack extends cdk.Stack {
   public readonly gracefulStop: GracefulStop;
   public readonly idleShutdown: IdleShutdown;
   public readonly statusChannel: StatusChannel;
+  public readonly bootWatcher: BootWatcher;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -30,6 +32,12 @@ export class EnshroudedServerStack extends cdk.Stack {
       discordPublicKey: process.env.DISCORD_PUBLIC_KEY ?? this.node.tryGetContext('discordPublicKey'),
       discordApplicationId: process.env.DISCORD_APPLICATION_ID ?? this.node.tryGetContext('discordApplicationId'),
     });
+    this.bootWatcher = new BootWatcher(this, 'BootWatcher', {
+      instance: this.server.instance,
+      discordApplicationId: process.env.DISCORD_APPLICATION_ID ?? this.node.tryGetContext('discordApplicationId'),
+    });
+    this.discordBot.function.addEnvironment('BOOT_WATCHER_FUNCTION_NAME', this.bootWatcher.function.functionName);
+    this.bootWatcher.function.grantInvoke(this.discordBot.function);
     this.gameDeploy = new GameDeploy(this, 'GameDeploy', {
       instance: this.server.instance,
       bucket: this.worldStorage.bucket,

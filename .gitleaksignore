@@ -1,0 +1,5 @@
+# Synthetic, public Discord application IDs in the original boot-watcher test fixtures.
+# These exact historical findings are false positives, not credentials. The fixtures
+# now use an obvious repeated-digit ID; future findings remain subject to scanning.
+684e8606989c62a3f53f662106ad7faee7dd10d2:infrastructure/test/boot-watcher-iam.test.ts:discord-client-id:12
+684e8606989c62a3f53f662106ad7faee7dd10d2:infrastructure/test/boot-watcher.test.ts:discord-client-id:60

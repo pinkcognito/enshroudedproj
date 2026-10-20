@@ -165,7 +165,7 @@ graph TB
     subgraph "EnshroudedServerStack"
       APIGW[HTTP API<br/>POST /interactions]
       BOT["discord-bot Lambda<br/>Ed25519 verify + deferred ack"]
-      WATCH["boot-watcher Lambda<br/>async self-invoke, polls readiness,<br/>PATCHes the Discord message"]
+      WATCH["boot-watcher Lambda<br/>one bounded invocation, polls readiness,<br/>PATCHes the Discord message"]
       IDLE["idle-shutdown Lambda<br/>EventBridge rate 1 min"]
       STOP["graceful-stop Lambda<br/>drain + save + verify + StopInstances"]
       STATUS["status-channel Lambda<br/>EC2 state-change -> channel rename"]
@@ -216,7 +216,7 @@ ASCII fallback of the critical path:
 Discord ──POST──> API GW ──> discord-bot λ ──(defer in <3s)──> Discord
                                  │
                                  ├── ec2:StartInstances
-                                 └── async self-invoke ──> boot-watcher λ
+                                 └── async invoke ───────> boot-watcher λ
                                                              │ poll: EC2 running?
                                                              │ poll: SSM ping Online?
                                                              │ poll: unit active + /proc/net/udp has 15637?
@@ -276,7 +276,7 @@ configured 10-minute idle threshold and 15-minute startup grace period.
    (§7.4.3, §7.5):** (a) live role re-check against Discord; (b) only if authorized, and
    only if the state check said `stopped` **less than 5 s ago**, generate and write the
    four passwords; (c) `StartInstances`; (d) confirm `PreviousState == 'stopped'`;
-   (e) DM the starter the passwords for their tier; (f) the existing channel
+   (e) dispatch the readiness watcher; (f) the existing channel
    announcement. Authorization precedes **every** side effect, rotation included —
    rotation invalidates every distributed password, so it is itself a privileged act. An
    unauthorized caller must not reach the EC2 client at all.
@@ -296,7 +296,8 @@ configured 10-minute idle threshold and 15-minute startup grace period.
 7. **Readiness gate 1:** poll `ec2:DescribeInstances` until `running`, then
    `ssm:DescribeInstanceInformation` until `PingStatus=Online`. SSM agent registration is
    what makes every later on-box check possible, so this gate comes first.
-8. On first SSM contact, the box's boot path has already run, driven by systemd ordering:
+8. **RETRACTED 2026-10-19:** first SSM contact does not establish that game startup or
+   config render has completed. Check the later gates explicitly. The intended boot path is:
    the data volume is mounted at `/srv/enshrouded`, `enshrouded-update.service`
    (`Type=oneshot`, `Before=enshrouded.service`) has optionally run
    `steamcmd +@sSteamCmdForcePlatformType windows +app_update 2278520`,
@@ -330,14 +331,17 @@ configured 10-minute idle threshold and 15-minute startup grace period.
    *listening*, not that the world has finished loading. If WP-07 finds a gap between
    "socket bound" and "actually joinable", gate 3 covers it — which is exactly why gate 3
    and not gate 2 is authoritative.
-10. **Readiness gate 3 (authoritative):** the Lambda sends an `A2S_INFO` datagram from
+10. **Readiness gate 3 (authoritative for the watcher):** the Lambda sends an `A2S_INFO` datagram from
     itself to `<public-ip>:15637` over the internet. This is the only check that proves the
-    *player-visible* path works end-to-end — security group, host firewall, and the
-    process's actual bind. A green gate 2 with a red gate 3 means a firewall or bind
-    problem, and the message says exactly that.
-11. PATCH the original reply with the join info: server name, `"<public-ip>:15636"`, and
-    "Enshrouded → Play → Servers → Add Server". **The password is never posted here** —
-    `/enshrouded password` replies ephemerally (`flags: 64`) instead.
+    public query path answers. **RETRACTED 2026-10-19:** this does not prove gameplay,
+    client authentication, or a particular cause when it fails. Report "public query not
+    responding", not a definitive firewall diagnosis. **ASSUMED — needs validation:**
+    a successful query predicts a successful real-client join; the client test remains open.
+11. PATCH the original reply with instructions to select the server in the
+    dedicated-server list; do not guess or interpolate a name. **RETRACTED 2026-10-19:** the prescribed `:15636` direct-join
+    endpoint and "Add Server" instructions lacked client evidence; do not ship them.
+    Send passwords only by DM after readiness, using §7.4.4; `/enshrouded pw` is the
+    existing deferred, ephemeral request for the same private DM delivery.
 12. `boot-watcher` gives up after 8 minutes, PATCHes a failure message naming the gate that
     did not go green, and raises a CloudWatch alarm. It does **not** stop the instance (a
     human may want to debug it) — but the max-uptime cap in §5.5 still applies.
@@ -348,6 +352,77 @@ Windows Server, so the Linux decision improves this user-visible number as a sid
 Needs measurement in WP-07 (i). Note Proton may initialise a Wine prefix on *first* run,
 making the very first boot substantially slower than steady state — the prefix lives on
 the retained data volume so this is a one-time cost, but WP-07 should record both numbers.
+
+#### 3.1.1 WP-12/WP-24 implementation contract (2026-10-19)
+
+Design decision: one asynchronous watcher invocation, 510-second Lambda timeout,
+256 MiB, `retryAttempts=0`, `maxEventAge=10 minutes`; poll every 10 seconds with
+bounded calls. No self-invocation, new coordination parameter, or durable starter record.
+**VERIFIED ([AWS recursion protection](https://docs.aws.amazon.com/lambda/latest/dg/invocation-recursion.html))**:
+Lambda can terminate a recursive request chain at approximately 16 invocations. The earlier
+15–30-second self-invoke-chain proposal is withdrawn; it could end before eight minutes.
+**VERIFIED ([AWS asynchronous delivery](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-error-handling.html))**:
+duplicate delivery remains possible even without function errors. This design makes DM
+delivery best effort, not exactly once; disabling retries is not deduplication.
+
+- Dispatch only for our confirmed `stopped -> pending` start response.
+  Do not attach a new starter DM to `already running` or `already pending` replies.
+- Payload: `{guildId,userId,roleIds,interactionToken,startedAt,expectedLaunchTime}`.
+  `startedAt` is epoch milliseconds; `expectedLaunchTime` is a canonical ISO timestamp.
+  Set `startedAt` immediately before `StartInstances`, not when the watcher dequeues.
+  Before dispatch, the caller captures a finite post-start `LaunchTime` for our exact
+  instance in pending/running state, within five seconds of `startedAt`, newer than its
+  pre-start launch when available. Ambiguous capture declines tracking. Instance ID
+  comes exclusively from configured `INSTANCE_ID`.
+  No passwords, bot token, raw config, or event logging.
+- Validate finite timestamps and identity fields. An event older than eight minutes, or
+  implausibly future-dated (over five seconds), cannot probe or DM. The absolute readiness
+  deadline is `startedAt + 480000`; queue delay consumes it. Reserve the remaining Lambda
+  budget for terminal PATCH/DM; no unbounded SDK retries, fetch, SSM polling, or sleep.
+- Require every finite observed `LaunchTime` to equal `expectedLaunchTime` exactly.
+  Missing evidence cannot advance readiness; a different launch or a
+  stopping/stopped/terminated state aborts delivery. **RETRACTED 2026-10-19:** first-seen
+  binding with a broad time window could adopt a replacement boot after queue delay.
+  The five-second caller capture allowance is a chosen attribution tolerance, not a
+  worker rebinding window or measured evidence.
+- Terminal delivery has a separate bounded budget inside the Lambda timeout: an expired
+  readiness deadline forbids further probing or DM but still permits the failure PATCH.
+  The caller reports tracking as queued/unavailable/unconfirmed; a failed or ambiguous
+  invocation must not leave only the normal booting response. Never blindly retry it.
+- Ordered checks: EC2 running and bound launch; SSM Online for exactly our instance;
+  one bounded read-only host command; public `shared/a2s.queryInfo` on the current public
+  address, UDP 15637. Match the deploy predicate: active unit, game-process presence,
+  UDP query socket. Logs are optional progress only, never a readiness gate. A malformed,
+  missing, timed-out, or failed observation is unknown, never success or zero players.
+  Use the existing SSM polling patterns, including transient `InvocationDoesNotExist`;
+  they are private implementations, not an already-exported shared helper. Do not import
+  the graceful-stop handler or accidentally expose its stop dependency.
+- Before terminal delivery, re-describe and require running with the identical bound
+  launch. PATCH readiness first; then independently fetch live password authorization
+  using the existing signed/live role intersection, check `desyncActive()` (failure denies),
+  read only authorized groups from live SSM, recheck the bound running launch, and DM.
+  No start-role fallback; keep `GROUPS` descending. No-tier/removed-role/desync/read failure
+  means no password DM. Public readiness may still succeed.
+- Every PATCH has an explicit timeout and checks its boolean result: the shared helper
+  returns false on HTTP errors. PATCH failure must not suppress authorized DM; DM failure
+  must not undo readiness. Give-up PATCH names the unresolved gate, emits a failure metric,
+  and sends no DM. Emit sanitized outcomes and elapsed time, never raw host stdout/stderr.
+  The §3.1 alarm requirement needs an actual alarm consumer; a metric alone is not an alarm.
+- Watcher IAM: exact-instance RunCommand plus the named shell document; required read-only
+  describe/invocation APIs; access-mapping/desync reads; four password ARN reads and token
+  read. KMS decrypt context lists exactly those five SecureString ARNs. No SSM writes,
+  KMS encrypt, EC2 start/stop, or watcher self-invoke grant. Require the watcher role and
+  function in tests: remove the old `if absent return` vacuous acceptance.
+- Tests must prove late queued/stale launch rejection, deadline exhaustion, no SSM before
+  Online, no public query before host success, failed measurements never ready, changed
+  launch before DM rejection, removed roles/desync no DM, fresh SSM values (not payload),
+  and independent PATCH/DM failures. A positive query is automated readiness acceptance;
+  actual client join and WP-25 are separate, unfinished host/client acceptance.
+
+**Known doc contradiction retained explicitly:** §7.4.4 allows `/pw` during `pending`.
+Its simultaneous absolute claim that no password can reach a DM before a confirmed running
+server is therefore retracted. The starter DM requires readiness; `pending` `/pw` remains
+the documented future-credentials exception. Do not change that policy incidentally here.
 
 ### 3.2 Flow B — idle → save → stop
 
@@ -3588,7 +3663,7 @@ Rulings on the six open points:
    interaction message, and already gives up after 8 minutes naming the failed gate. The DM
    is one more thing it does when gate 3 goes green. The `status-channel` reconciler keeps
    its no-passwords contract.
-2. **Starter identity travels in the self-invoke payload** — `{guildId, userId, roleIds}`,
+2. **Starter identity travels in the watcher invocation payload** — `{guildId, userId, roleIds}`,
    alongside the interaction token that already travels that way. Confirmed, in preference
    to persisting a starter parameter: a persisted starter needs cleanup and introduces a
    stale-starter case for no gain. The payload carries snowflakes and role ids, which are
@@ -3614,7 +3689,7 @@ Rulings on the six open points:
 6. **The DM reads live SSM; it does not carry the generated values.** Two independent
    reasons: it then reports what the box's own render read rather than what the Lambda
    intended — which is the entire point of waiting for readiness — and it keeps plaintext
-   out of Lambda invocation payloads that persist across an 8-minute poll chain
+   out of the watcher invocation payload during its bounded readiness wait
    (§6.6.2a). Consequence: the generated plaintext exists only inside the generating
    invocation, long enough for four `PutParameter` calls.
 
@@ -3726,8 +3801,10 @@ armed). Three requirements, and the third is the one that is easy to omit:
 
 1. **Construct the worst case; do not sample it.** The generator draws uniformly, so a
    random draw essentially never yields four 9-character words. The spike must *assemble*
-   four 9-character words per password deliberately — `39` characters for admin, `29` for
-   the others — and render a config from them.
+   four 9-character words for admin and three for each other tier — `39` and `29`
+   characters respectively. **CORRECTED 2026-10-19:** the earlier instruction said four
+   words per password, contradicting its own player-tier lengths. Render a config from
+   these deliberately constructed values.
 2. **Confirm the server starts** and that a client can actually join with each of the four
    tiers' passwords.
 3. **Confirm the game does not SILENTLY TRUNCATE.** A refusal is the loud failure §7.1
@@ -3745,6 +3822,65 @@ none of the three may change without re-running this check, because from then on
 depends on the game accepting that shape. Record the measured maximum if the game reveals
 one. **Shape stability is the control here:** once one shape is proven, every subsequent
 rotation produces the same shape and cannot newly break the server.
+
+##### WP-25 operator flow — proposal, not an implemented or executed tool
+
+Builder interface: `scripts/password-shape-spike.py` (Python). No new AWS resources.
+Default/`--plan` is read-only and prints the exact target, preconditions, and checklist.
+`--stage`, `--verify-host`, `--record-client`, and `--restore` are separate explicit modes;
+none sets `state/rotate-on-start`, and none calls StopInstances. Staging is a controlled
+test fixture for §7.4.6, not activation of production rotation or a generator rewrite.
+
+1. **Plan:** require account `334953720182`, region `us-east-2`, the configured Enshrouded
+   instance and project tags; reject the protected UO instance. Require rotation disabled
+   (absent or exact `false`); unreadable/other values block staging. Show four target
+   parameter names, current version numbers, intended lengths 39/29/29/29, and whether the
+   instance is stopped. Never print values, hashes, prefixes, suffixes, or raw SDK errors.
+2. **Stage:** only after the existing save-verified stop has completed and the instance is
+   `stopped`; the script must not stop a running game to make that true. Establish an
+   operator-controlled window with no competing Discord/manual starts. Preserve the four
+   previous SSM version numbers in a secret-free local manifest, then write independent,
+   deliberately maximum-length word fixtures to the existing four SecureStrings. No
+   passwords in CLI arguments, process environment, manifests, logs, or new parameters.
+   Recheck stopped state with the existing five-second freshness bound before writes,
+   and check again afterward. A competing start/partial failure makes the result unsafe:
+   stop staging, report the condition, never roll back against a running game. These checks
+   detect races; they are not an atomic lock against an out-of-band start.
+3. **Start:** operator uses the normal authorized start path with rotation still off.
+   Readiness and the automatic tier DM are tested independently of fixture construction.
+   Failure leaves rotation disabled. The script never starts/stops/restarts the game as a
+   hidden side effect of `--stage` or `--verify-host`.
+4. **Verify host:** read-only SSM command checks the current boot, active service and socket,
+   and compares each rendered password with the corresponding live SSM value entirely
+   inside the host process. Output only per-tier `{length, matchesSsm}` booleans/counts;
+   no config dump, secrets, digests, or raw journal. Require the exact 39/29/29/29 lengths
+   and all equality checks; perform public A2S separately. Record observed boot identity,
+   parameter versions, server build, pinned Proton version, timings and sanitized results.
+   This is host acceptance only. **ASSUMED — needs validation:** these fixtures permit
+   real-client authentication; host checks cannot answer that question.
+5. **Client checklist:** deliver credentials only through the authorized private DM path.
+   The user performs a fresh connection with each full visitor/guest/friend/admin password
+   and reports four outcomes, tied to this boot and fixture versions. Test admin prefix
+   lengths 38 and 29 (must reject), plus a 39-character value differing only in its final
+   character (must reject). The same-length wrong-tail case guards against a length check
+   masking truncation. Do not paste credentials into reports or capture entry screenshots.
+   **ASSUMED — needs validation:** the client performs fresh authentication for each
+   attempt; a cached/reconnected session does not count. This finite test supports the
+   frozen shape; it does not establish the game's universal maximum accepted length.
+6. **Record:** `--record-client` records operator-reported pass/fail/not-run and provenance,
+   never manufactures a pass from an active service, query response, DM success, or missing
+   error. Label human observations **REPORTED, UNCONFIRMED** until reviewable evidence is
+   available; do not call them URL-verified. Missing any required join/rejection leaves
+   WP-25 and activation unfinished. Record no password material.
+7. **Restore if needed:** only after another save-verified stop, retrieve prior values by
+   the manifest's SSM versions and overwrite the same four parameters while stopped, with
+   the same freshness/race checks. Missing prior versions block restoration; never guess.
+   A normal subsequent boot re-renders. No rollback or fixture replacement under a live
+   game, and no kill-switch activation by this tool, even after every test passes.
+
+The rotation-enablement step remains a separate reviewed operator action after all WP-25
+results exist. Current acceptance status: **unfinished; actual four-tier client joins and
+negative authentication attempts remain user input.**
 
 ---
 
@@ -4580,7 +4716,7 @@ account.
 | WP | Scope | Creates | Depends on | Acceptance | Effort |
 | --- | --- | --- | --- | --- | --- |
 | **WP-11** | Interactions endpoint: HTTP API, Ed25519 verify (401 on bad signature), PING, deferred ack, async self-invoke. `/enshrouded start` and `/enshrouded status`. Command definitions + the manual registration script. | `lib/enshrouded/discord-bot.ts`, `lambda/discord-bot/{index.js,commands.js}`, `lambda/shared/discord.js`, `scripts/register-discord-commands.js`, `test/discord-commands.test.ts` | WP-03 | Discord accepts the endpoint URL. `/enshrouded start` acks in <3 s. Anti-drift test fails if the handler reads an option `commands.js` does not register. | R — close port of the reference. |
-| **WP-12** | `boot-watcher`: the three readiness gates, progress PATCHes, the final join-info message — **blocked on settling how players actually connect: only UDP 15637 is bound and gameplay runs over Steam P2P/relay (§5.3), so an `ip:15636` join string is probably wrong.** Determine the real join path (Steam server browser by name, Steam friends/invite, or direct IP on 15637) before writing the text; a confidently wrong join message is worse than a vague one — 8-minute give-up naming the failed gate. | `lambda/boot-watcher/index.js` | WP-08, WP-11 | A cold `/enshrouded start` ends with an edited message containing `ip:15636` and the add-server instructions, and the time from command to that message is recorded. A blocked firewall reproduces a gate-3 failure message. | R, with an **A** review of the gate ordering. |
+| **WP-12** | One bounded boot-watcher invocation, three readiness gates, progress/final PATCH, and eight-minute give-up per §3.1.1. Dedicated-server-list guidance by observed name; direct endpoint remains unvalidated. **RETRACTED:** prior acceptance required `ip:15636` despite explicitly questioning it. | `lambda/boot-watcher/index.js`, `lib/enshrouded/boot-watcher.ts`, tests | WP-08, WP-11 | Cold start produces an edited ready message after all gates; record elapsed time. Simulated public-query failure produces gate-3 give-up without DM or stopping the instance. Require function/role presence and boot/deadline failure cases (§3.1.1). Actual client join remains separate acceptance, not inferred from A2S. | R, with an **A** review of gate ordering and live acceptance. |
 | **WP-13** | Remaining commands: `/enshrouded stop` (routes to `graceful-stop`, never raw `StopInstances`), `/enshrouded password` (**ephemeral**, `flags: 64`), `/enshrouded update`, `/enshrouded backup`. Permission gating on the admin ones (`ADMINISTRATOR`/`MANAGE_GUILD` bits, checked in the handler as defence in depth, not only in the portal). | updates to `lambda/discord-bot/`, `commands.js` | WP-09, WP-11 | A non-admin invoking `/enshrouded update` is refused by the handler itself. `/enshrouded password` output is ephemeral; grep the repo and CloudWatch logs to confirm no password is ever logged. | R |
 | **WP-14** | Admin-only `/enshrouded channel` selects one text channel per guild. Scheduled and instance-event reconciliation posts status transitions and prefixes the preserved channel name with green/red, using fresh EC2 state and A2S responsiveness. Scoped configuration/delivery grants per §6.6.2; independent message/rename progress and persisted rate-limit cooldowns. | `lib/enshrouded/status-channel.ts`, `lambda/status-channel/index.js`, Discord command/helper changes | WP-11, WP-08 | Unchanged polls do not repost; failed probes never claim a stopped instance; authorization, cross-guild validation, partial delivery, pagination and cooldown retry tested. Converges on next successful reconciliation subject to Discord cooldowns. | R with architecture review. |
 
@@ -4610,7 +4746,7 @@ cannot substitute for them — see §6.2.1a for why they cannot live in CDK.
 | **WP-21** | Password generator + rotation in the start path. Vendored wordlists; `crypto.randomInt`; three words (four for admin); rotation ordered per §7.4.3 with all three interlocks; `state/password-desync` FACT; `state/rotate-on-start` kill switch; `/enshrouded pw` converted to defer-then-self-invoke with the §7.4.4 state table; `sendPasswordDm` changed off the synchronous callback; `/enshrouded password` renamed to `pw`. IAM per §6.6.2a including **`kms:Encrypt`** and the `kms:EncryptionContext:PARAMETER_ARN` conditions on **every** KMS statement — including pinning the pre-existing bot-token `kms:Decrypt` to the five-ARN list, so no unconditioned `Resource: "*"` statement is left behind (§6.6.2a correction). | `lambda/discord-bot/password-generator.js` + vendored wordlist, repo-level `NOTICE` (CC BY 3.0 US attribution for the EFF list, §7.4.2a), rotation in `lambda/discord-bot/index.js`, edits to `password-access.js`, `commands.js`, `lib/enshrouded/discord-bot.ts`, `test/password-generator.test.ts`, updated `test/ssm-scoping.test.ts` | WP-11, **WP-22**, **WP-25** | **Entropy test computes `words × log2(len(LIST))` from the shipped post-filter list and fails below 38/50 bits** — not a hardcoded constant. Tests: no rotation when state is `running`/`pending`; no rotation when the state check is older than 5 s; `PreviousState != 'stopped'` sets `password-desync` and suppresses the DM; **a desync clears on any start whose `PreviousState` is `stopped`, including one where rotation was disabled** (the latch-forever case, §7.4.3); **writing `none` is skipped when it is already `none`**; `pw` refuses on every down state, on `password-desync`, and on a desync value it cannot parse or read; `pw` reports on `pending`; four values are distinct and independently drawn; **a write failure on any of the four `PutParameter` calls still starts the server** — asserted on the mocked EC2 client, with the metric emitted, the reply naming the unrotated state, and **`password-desync` NOT set** (§7.4.3); **a `stale` freshness abort likewise starts the server unrotated**, under the distinct `PasswordRotationStale` metric, with `password-desync` untouched (the `if (rotated && previous !== 'stopped')` gate makes this structural); an unreadable kill switch starts the server without rotating; **the entropy assertion is computed from the real list (expect 38.08 / 50.78 bits at 6,627 words) and there is no word-length cap (§7.4.2a)**; the attribution test covers the `NOTICE` file as well as the header comment; no password appears in any log line, metric or parameter other than the four. Tier precedence is already covered by `test/password-access.test.ts` (§7.5.6); this WP must not weaken it — in particular the **per-group DM-body assertion** stays, because it is the only check independent of the shared `GROUPS` array. §6.6.4's **nine** synth assertions pass, and the replacement set is checked to be at least as strong as the deleted "password ARN is read-only" assertion — the property to confirm is **exactly one principal holds `PutParameter` on the four password ARNs** (items 5, 8 and 9). **Ships with rotation OFF, by the parameter being absent rather than set to `false`** — nothing creates it, and only a named runbook step gated on WP-25 turns it on (§7.4.5). | **A** |
 | **WP-22** | Boot-time render: new `enshrouded-config.service` per §7.3.1; extract the renderer from `deploy-game-server.sh` into `/usr/local/lib/enshrouded/render-config.sh` (one renderer, one on-box template path); switch to `ssm get-parameters --names`; `Requires=`+`After=` on `enshrouded.service`; in-script bounded retry; extend `verify-systemd.sh`'s filter from three notices to four. | `infrastructure/systemd/enshrouded-config.service`, `scripts/render-config.sh`, edits to `provision-host.sh`, `deploy-game-server.sh`, `enshrouded.service`, `.github/scripts`/`verify-systemd.sh`, unit-grep test | WP-05, WP-06 | **A unit test asserts `Requires=` *and* `After=enshrouded-config.service` are present and `Wants=enshrouded-config.service` is absent** — the anti-silent-no-op assertion. On the real box: an unseeded/empty parameter makes `enshrouded-config` fail and **`enshrouded.service` does not start**; a transient SSM failure is retried and the start still succeeds; a `systemctl restart enshrouded` re-renders; the deploy path still works and its config is not overwritten by a stale on-box template. `verify-systemd.sh` passes with exactly four filtered notices and **no blanket ignore**. | **A** |
 | **WP-23** | Command authorization §7.5: extend `parseAccessMapping` for `commandRoles` (keys ⊆ `start,stop,update,backup`; strict unknown-key rejection kept; uniqueness within `roles` only); gate `start` (and `stop`, for WP-13) in the deferred half before any side effect — **a single membership test against one role id, with no fallback to `roles.admin` and no precedence logic**; §7.5.4 reply cases; `configure-password-roles.py` resolves the action roles and previews effective per-command authorization. | edits to `password-access.js`, `lambda/discord-bot/index.js`, `scripts/configure-password-roles.py`, `test/password-access.test.ts` | WP-11, WP-21 | A member with none of the roles is denied and **no EC2 call and no rotation occurs** (assert on the mocked clients, not just on the reply text). Absent/corrupt/partial mapping denies — one test per shape. **An `enshroudedadmin`-only holder (every tier role, no `commandRoles.start`) is DENIED `start`** — the assertion that pins the user's decoupling decision and fails if an admin fallback is ever reintroduced. **A mapping with `commandRoles` absent entirely denies `start` to everyone**, including the admin. A non-guild interaction denies. A role removed between the signed payload and the live fetch denies. The denial text contains no role name or id. **One new ordered assertion that `GROUPS` is privilege-descending, in a test named for §1.16** — the multi-role and DM-body cases are already covered by `test/password-access.test.ts` and must not be duplicated (§7.5.6). The script's preview, with the action roles absent, prints `DENIED to everyone` for each — not a blank field and not an admin fallback. | R with review |
-| **WP-24** | Readiness-time password DM in `boot-watcher`: carry `{guildId,userId,roleIds}` through the poll chain, re-authorize live at DM time, read the four SecureStrings then, DM the cascade with the ready message; no DM on give-up. IAM: read on the four ARNs + `kms:Decrypt` with the encryption-context condition. | `lambda/boot-watcher/index.js`, `lib/enshrouded/boot-watcher.ts`, tests | **WP-12**, WP-21 | Readiness failure produces **no DM** (asserted). A role removed during boot produces no DM. The DM content comes from an SSM read, not from the event payload (asserted: no password field exists on the payload type). A DM failure does not fail the start or the readiness PATCH. | **A** |
+| **WP-24** | Readiness-time password DM in `boot-watcher`: carry `{guildId,userId,roleIds}` in the bounded invocation, re-authorize live at DM time, read the four SecureStrings then, DM the cascade with the ready message; no DM on give-up. IAM: read on the four ARNs + `kms:Decrypt` with the encryption-context condition. | `lambda/boot-watcher/index.js`, `lib/enshrouded/boot-watcher.ts`, tests | **WP-12**, WP-21 | Readiness failure produces **no DM** (asserted). A role removed during boot produces no DM. The DM content comes from an SSM read, not from the event payload (asserted: no password field exists on the payload type). A DM failure does not fail the start or the readiness PATCH. | **A** |
 | **WP-25** | **Spike, on the real box:** the password shape the game accepts (§7.4.6). Render a config whose passwords are **deliberately assembled at the true worst case — 29 characters for the player tiers, 39 for admin** (§7.4.2a; do **not** rely on a random draw to reach it), start the server, join with each tier. Record the maximum accepted length if the game reveals one. | a §7.4.6 result paragraph + the frozen shape constants (word count, max word length 9, separator) | WP-06 | The server starts and a client joins with each of the four tiers' passwords at full length. **And the truncation check: joining with a truncated prefix of the 39-character admin password must FAIL** — without it the spike proves nothing about silent truncation, which is the quieter and worse of the two failure modes (§7.4.6). If anything fails, WP-21's generator parameters change **before** rotation is enabled, not after. This WP is a **gate on setting `rotate-on-start=true`**. | **A** |
 
 | **WP-26** | Pin `kms:Decrypt` by `kms:EncryptionContext:PARAMETER_ARN` on **all three** remaining unpinned roles — `status-channel` and `graceful-stop` to `discord/bot-token`, `server-instance` to the four password ARNs — delete the `KMS_PIN_EXEMPT_UNTIL_WP26` mechanism entirely, and correct the KMS-ARN-vs-parameter-ARN conflation in the `graceful-stop.ts` and `server.ts` comments (§6.6.5 item 2). The row originally said "one statement in `status-channel.ts`"; the every-role rewrite of §6.6.4 item 6 found the other two (§6.6.2a). | statements in `status-channel.ts`, `graceful-stop.ts`, `server.ts`; `test/ssm-scoping.test.ts` | WP-14, WP-21 | §6.6.4 item 6 passes with an **empty** exemption list **and** its ≥5-grant vacuity floor. Then, because a missing ARN in a pin is invisible to synth and unit tests and surfaces only as a runtime `AccessDenied` on a SecureString read — **three runtime confirmations, none of which synth can substitute for:** (1) **a real boot of the instance**, since `server-instance`'s pin is now in the boot-critical path — an incomplete pin means `enshrouded-config.service` fails and the game refuses to start (§7.3.2), and the in-script retry cannot help because `AccessDenied` is not transient; (2) a real `/enshrouded channel` and a real status reconcile; (3) a real `graceful-stop` drain notification — **and while there, confirm the bot-token read is isolated so that a notification failure cannot abort the drain**, the same isolation the start-path announcement already has. `simulate-principal-policy` per role against the real contexts, plus CloudTrail confirmation of each `Decrypt`, is the evidence to report. | R to write, **A to verify** — it adds a new failure mode to the boot path. |

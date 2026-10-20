@@ -33,6 +33,43 @@ async function describeInstance() {
   return res.Reservations?.[0]?.Instances?.[0];
 }
 
+// Queue only identifiers and the interaction token; passwords are read after readiness.
+async function watchBoot(event, instance, startedAt, context) {
+  if (!process.env.BOOT_WATCHER_FUNCTION_NAME) return 'unavailable';
+  let submitted = false;
+  try {
+    const budget = Math.min(2000, (context?.getRemainingTimeInMillis?.() ?? 2500) - 500);
+    if (budget <= 0) throw new Error('time-budget');
+    const signal = AbortSignal.timeout(budget);
+    const { DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
+    const described = await ec2().send(new DescribeInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }),
+      { abortSignal: signal });
+    const current = described.Reservations?.flatMap((r) => r.Instances || [])
+      .find((item) => item.InstanceId === process.env.INSTANCE_ID);
+    const launch = new Date(current?.LaunchTime).getTime();
+    const priorLaunch = new Date(instance.LaunchTime).getTime();
+    if (!['running', 'pending'].includes(current?.State?.Name) || !Number.isFinite(launch) ||
+        Math.abs(launch - startedAt) > 5000 || (Number.isFinite(priorLaunch) && launch <= priorLaunch)) {
+      return 'unavailable';
+    }
+    const { InvokeCommand } = require('@aws-sdk/client-lambda');
+    submitted = true;
+    await lambda().send(new InvokeCommand({
+      FunctionName: process.env.BOOT_WATCHER_FUNCTION_NAME,
+      InvocationType: 'Event',
+      Payload: JSON.stringify({
+        guildId: event.guildId, userId: event.userId, roleIds: event.roleIds,
+        interactionToken: event.interactionToken, startedAt,
+        expectedLaunchTime: new Date(launch).toISOString(),
+      }),
+    }), { abortSignal: signal });
+    return 'queued';
+  } catch {
+    console.error('Boot readiness dispatch failed: invocation-failed');
+    return submitted ? 'unconfirmed' : 'unavailable';
+  }
+}
+
 // Runs as a separate async invocation so the slow part never blocks Discord's 3s ack
 // deadline (EC2 start alone regularly took 3.5-4s). The initial invocation already
 // delivered a deferred (type 5) callback; we edit it via the interaction token.
@@ -98,6 +135,7 @@ async function finishStart(event, context) {
         if (outcome === 'failed' || outcome === 'stale') unrotatedNote = ' WARNING: the passwords were NOT rotated for this session - the previous passwords are still in force. Tell an admin.';
       }
       const { StartInstancesCommand } = require('@aws-sdk/client-ec2');
+      const startRequestedAt = Date.now();
       const result = await ec2().send(new StartInstancesCommand({ InstanceIds: [process.env.INSTANCE_ID] }));
       const ours = result.StartingInstances?.find((item) => item.InstanceId === process.env.INSTANCE_ID);
       const previous = ours?.PreviousState?.Name;
@@ -110,14 +148,18 @@ async function finishStart(event, context) {
       if (previous === 'stopped') {
         try { await rotation.clearDesyncIfSet(); } catch { console.error('Clearing password desync failed'); }
       }
+      const started = previous === 'stopped' && ours?.CurrentState?.Name === 'pending';
+      const tracking = started ? await watchBoot(event, instance, startRequestedAt, context) : 'unavailable';
+      const trackingNote = tracking === 'queued' ? '' : tracking === 'unconfirmed'
+        ? ' Readiness tracking submission could not be confirmed. Use `/enshrouded status` and `/enshrouded pw` if no DM arrives.'
+        : ' Readiness tracking is unavailable. Use `/enshrouded status` and `/enshrouded pw` once the game is ready.';
       // A successful EC2 start must not become a failed start because Discord failed.
       try {
         await editOriginalResponse(process.env.DISCORD_APPLICATION_ID, event.interactionToken,
-          `Booting the world - this takes a few minutes.${tierNote}${unrotatedNote}`, 2000);
+          `Booting the world - this takes a few minutes.${tierNote}${unrotatedNote}${trackingNote}`, 2000);
       } catch {
         console.error('Server start reply failed: network-or-timeout');
       }
-      const started = previous === 'stopped' && ours?.CurrentState?.Name === 'pending';
       if (started) {
         try {
           const budgetMs = Math.min(3500, (context?.getRemainingTimeInMillis?.() ?? 4000) - 500);
