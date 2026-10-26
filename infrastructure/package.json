@@ -13,16 +13,16 @@
     "@eslint/js": "^10.0.1",
     "@types/jest": "^30",
     "@types/node": "^24.10.1",
-    "aws-cdk": "2.1129.0",
+    "aws-cdk": "2.1146.1",
     "eslint": "^10.6.0",
     "jest": "^30",
     "ts-jest": "^29",
     "ts-node": "^10.9.2",
     "typescript": "~5.9.3",
-    "typescript-eslint": "^8.62.1"
+    "typescript-eslint": "^8.72.0"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.260.0",
+    "aws-cdk-lib": "^2.274.0",
     "constructs": "^10.5.0"
   }
 }
